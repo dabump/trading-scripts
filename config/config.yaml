@@ -1,0 +1,55 @@
+# Tunable strategy parameters. See docs/operations.md for the canonical table of
+# these keys and which design doc each one comes from.
+#
+# Values marked PROPOSED were not finalized in the docs; they were filled in
+# during implementation so the agent could run, and are listed in
+# docs/decisions.md as pending your review. Change them freely.
+
+screening:
+  max_float_shares: 10000000        # docs/strategy.md §2
+  min_intraday_pct: 10.0            # docs/strategy.md §2
+  min_volume_multiple: 5.0          # docs/strategy.md §2
+  avg_volume_lookback_days: 20      # PROPOSED (docs left the lookback undecided)
+  universe_size: 50                 # PROPOSED: how many movers to pull per scan
+  # "none" fails the float criterion closed, so nothing qualifies. Switch to
+  # "alpaca" only once the float data source open item is actually resolved.
+  float_provider: none
+
+risk:
+  position_size_pct: 10.0           # docs/risk.md
+  max_concurrent_positions: 5       # docs/risk.md
+  stop_loss_pct: 10.0               # docs/risk.md
+  allow_same_day_reentry: false     # PROPOSED (docs left same-day re-entry undecided)
+
+exit:
+  profit_target_pct: 15.0           # PROPOSED (docs left this undecided)
+  trailing_stop_pct: 5.0            # PROPOSED (docs left this undecided)
+  macd_fast: 5                      # docs/strategy.md §4
+  macd_slow: 10                     # docs/strategy.md §4
+  macd_signal: 3                    # docs/strategy.md §4
+  macd_interval_minutes: 15         # docs/strategy.md §4
+  eod_exit_offset_minutes: 30       # docs/strategy.md §4
+
+timing:
+  sentiment_poll_interval: 10m      # docs/strategy.md §1
+  sentiment_window: 1h              # docs/strategy.md §1
+  screener_scan_interval: 1m        # docs/strategy.md §2
+  position_poll_interval: 15s       # PROPOSED: how often open positions are re-checked
+
+sentiment:
+  # IWM is included because the strategy trades small caps; SPY/QQQ alone would
+  # describe a different slice of the market than the one being traded.
+  symbols: ["SPY", "QQQ", "IWM"]
+  bearish_avg_pct: -0.8             # PROPOSED (docs left the thresholds undecided)
+  require_all_negative: true        # PROPOSED
+
+execution:
+  order_type: market                # PROPOSED (docs left order type undecided)
+  limit_slip_pct: 0.5               # only used when order_type is limit
+
+web:
+  listen_addr: ":8080"
+  poll_interval: 12s                # docs/web-ui.md: ~10-15s
+
+storage:
+  database_path: data/agent.db      # docs/operations.md

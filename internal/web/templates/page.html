@@ -1,0 +1,323 @@
+{{define "page"}}<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Agent · Status</title>
+<style>
+:root {
+  --bg: #0b0f14;
+  --panel: #121820;
+  --panel-2: #172029;
+  --line: #22303c;
+  --text: #e4ecf3;
+  --muted: #8b9cad;
+  --good: #3fd08a;
+  --bad: #ff6b6b;
+  --warn: #f5b942;
+  --idle: #7d8fa1;
+  --accent: #5ab0ff;
+  --radius: 12px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1180px; margin: 0 auto; padding: 24px 16px 64px; }
+
+header.top {
+  display: flex; flex-wrap: wrap; gap: 16px; align-items: center;
+  justify-content: space-between; margin-bottom: 24px;
+}
+.brand { display: flex; align-items: baseline; gap: 12px; }
+.brand h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+.brand .sub { color: var(--muted); font-size: 13px; }
+.badges { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 7px 13px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  border: 1px solid var(--line); background: var(--panel);
+  white-space: nowrap;
+}
+.badge .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.badge.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, var(--line)); }
+.badge.good .dot { background: var(--good); }
+.badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+.badge.bad .dot { background: var(--bad); }
+.badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+.badge.warn .dot { background: var(--warn); }
+.badge.idle { color: var(--idle); }
+.badge.idle .dot { background: var(--idle); }
+.badge .icon { font-size: 12px; }
+
+.paper-tag {
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  padding: 4px 9px; border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.grid { display: grid; gap: 16px; }
+.grid.two { grid-template-columns: 1fr 1fr; }
+@media (max-width: 860px) { .grid.two { grid-template-columns: 1fr; } }
+
+section.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); overflow: hidden;
+}
+.card > h2 {
+  margin: 0; padding: 14px 18px; font-size: 13px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+  border-bottom: 1px solid var(--line); background: var(--panel-2);
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+}
+.card > h2 .meta { text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 12px; }
+.card .body { padding: 16px 18px; }
+
+.note { color: var(--muted); font-size: 13px; margin: 0; }
+.alert {
+  margin: 0 0 14px; padding: 11px 14px; border-radius: 8px; font-size: 13px;
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent);
+  color: var(--bad);
+}
+.alert.soft {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+  color: var(--warn);
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th {
+  text-align: left; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); font-weight: 600; padding: 10px 12px;
+  border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+td { padding: 11px 12px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sym { font-weight: 650; letter-spacing: .02em; }
+.good { color: var(--good); }
+.bad { color: var(--bad); }
+.warn { color: var(--warn); }
+.idle { color: var(--idle); }
+.muted { color: var(--muted); }
+
+.crit { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.crit .mark { font-size: 11px; }
+.crit.pass { color: var(--good); }
+.crit.fail { color: var(--bad); }
+
+.pill {
+  font-size: 11px; padding: 3px 8px; border-radius: 5px; white-space: nowrap;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
+.pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); }
+.pill.armed { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+
+.legend { display: grid; gap: 8px; }
+.legend .row { display: flex; gap: 12px; align-items: baseline; font-size: 13px; }
+.legend .row.active { color: var(--text); }
+.legend .row:not(.active) { opacity: .62; }
+.legend .name { font-weight: 650; min-width: 148px; font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px; }
+
+.totals { display: flex; flex-wrap: wrap; gap: 20px; align-items: baseline;
+  padding: 14px 18px; border-top: 1px solid var(--line); background: var(--panel-2); }
+.totals .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); display: block; margin-bottom: 2px; }
+.totals .value { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, Menlo, monospace; }
+
+footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px;
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="content">{{template "content" .}}</div>
+  <footer class="foot">
+    <span>Read-only status page. The agent makes its decisions independently of this view.</span>
+    <span>Refreshing every {{.PollSeconds}}s</span>
+  </footer>
+</div>
+<script>
+// Re-fetches the rendered fragment and swaps it in, so the markup is produced in
+// exactly one place (the Go template) rather than duplicated in JS.
+const POLL_MS = {{.PollSeconds}} * 1000;
+async function refresh() {
+  try {
+    const res = await fetch('fragment', { headers: { 'Accept': 'text/html' } });
+    if (!res.ok) return;
+    document.getElementById('content').innerHTML = await res.text();
+  } catch (e) { /* a transient failure just leaves the last good render up */ }
+}
+setInterval(refresh, POLL_MS);
+</script>
+</body>
+</html>{{end}}
+
+{{define "content"}}
+<header class="top">
+  <div class="brand">
+    <h1>Trading Agent</h1>
+    <span class="sub">{{.SessionDate}} · {{.SessionText}}{{if .EarlyClose}} · early close{{end}}</span>
+  </div>
+  <div class="badges">
+    {{if .PaperMode}}<span class="paper-tag">paper</span>{{else}}<span class="paper-tag" style="color:var(--bad);border-color:var(--bad)">live</span>{{end}}
+    <span class="badge {{if .MarketOpen}}good{{else}}bad{{end}}">
+      <span class="dot"></span>Exchange {{.MarketLabel}}
+    </span>
+    <span class="badge {{.StateTone}}">
+      <span class="icon">{{.StateIcon}}</span>{{.State}}
+    </span>
+  </div>
+</header>
+
+{{if .ErrorMessage}}
+<div class="alert"><strong>▲ Fault:</strong> {{.ErrorMessage}}</div>
+{{end}}
+{{if .HaltReason}}
+<div class="alert soft"><strong>■ Halted for the session:</strong> {{.HaltReason}}</div>
+{{end}}
+{{if .FloatNote}}
+<div class="alert soft"><strong>Screening cannot qualify anything:</strong> {{.FloatNote}}</div>
+{{end}}
+
+<div class="grid two" style="margin-bottom:16px">
+  <section class="card">
+    <h2>Agent state <span class="meta">{{.StateMeaning}}</span></h2>
+    <div class="body legend">
+      {{range .Legend}}
+      <div class="row {{if .IsActive}}active{{end}}">
+        <span class="name {{.Tone}}">{{.Icon}} {{.State}}</span>
+        <span class="muted">{{.Meaning}}</span>
+      </div>
+      {{end}}
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Sentiment gate <span class="meta"><span class="{{.GateTone}}">{{.GateVerdict}}</span></span></h2>
+    {{if .Sentiment}}
+    <table>
+      <thead><tr><th>Time</th>{{range .SentimentLabels}}<th class="num">{{.}}</th>{{end}}<th>Reading</th></tr></thead>
+      <tbody>
+        {{range .Sentiment}}
+        <tr>
+          <td class="num muted">{{.Time}}</td>
+          {{range .Values}}<td class="num">{{.}}</td>{{end}}
+          <td class="{{.Tone}}">{{.Classification}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="body"><p class="note">No sentiment readings yet for this session.</p></div>
+    {{end}}
+  </section>
+</div>
+
+<section class="card" style="margin-bottom:16px">
+  <h2>Open positions <span class="meta">{{.ExposureText}}</span></h2>
+  {{if .Positions}}
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th class="num">Shares</th><th class="num">Entry</th>
+        <th class="num">Current</th><th class="num">Peak</th>
+        <th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Positions}}
+      <tr>
+        <td class="sym">{{.Symbol}}</td>
+        <td class="num">{{.Shares}}</td>
+        <td class="num muted">{{.Entry}}</td>
+        <td class="num">{{.Current}}</td>
+        <td class="num muted">{{.Peak}}</td>
+        <td class="num {{.Tone}}">{{.PnLDollars}}</td>
+        <td class="num {{.Tone}}">{{.PnLPct}}</td>
+        <td>{{if .TrailArmed}}<span class="pill armed">trailing armed</span>{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="body"><p class="note">{{.PositionsNote}}</p></div>
+  {{end}}
+</section>
+
+<section class="card" {{if .ShowEOD}}style="margin-bottom:16px"{{end}}>
+  <h2>Screening
+    <span class="meta">{{if .ScreenTakenAt}}last pass {{.ScreenTakenAt}} ET{{end}}</span>
+  </h2>
+  {{if .ScreenRows}}
+  <table>
+    <thead>
+      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num">{{.}}</th>{{end}}<th>Verdict</th></tr>
+    </thead>
+    <tbody>
+      {{range .ScreenRows}}
+      <tr>
+        <td class="sym">{{.Symbol}}</td>
+        {{range .Cells}}
+        <td class="num">
+          <span class="crit {{if .Pass}}pass{{else}}fail{{end}}">
+            <span class="mark">{{if .Pass}}✓{{else}}✕{{end}}</span>{{.Display}}
+          </span>
+        </td>
+        {{end}}
+        <td>{{if .Qualifies}}<span class="pill good">Qualifies</span>{{else}}<span class="muted">{{.Verdict}}</span>{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <div class="body"><p class="note">{{.ScreenNote}}</p></div>
+  {{end}}
+</section>
+
+{{if .ShowEOD}}
+<section class="card">
+  <h2>End of day <span class="meta">{{.SessionDate}} session</span></h2>
+  {{if .EODRows}}
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th class="num">Shares</th><th class="num">Opened</th>
+        <th class="num">Closed</th><th class="num">P&amp;L %</th><th>Exit</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .EODRows}}
+      <tr>
+        <td class="sym">{{.Symbol}}</td>
+        <td class="num">{{.Shares}}</td>
+        <td class="num muted">{{.Open}}</td>
+        <td class="num">{{.Close}}</td>
+        <td class="num {{.Tone}}">{{.PnLPct}}</td>
+        <td class="muted">{{.Reason}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  <div class="totals">
+    <div><span class="label">Net P&amp;L</span><span class="value {{.EODNetTone}}">{{.EODNetPnL}}</span></div>
+    <div><span class="label">Result</span><span class="value">{{.EODWinLoss}}</span></div>
+  </div>
+  {{else}}
+  <div class="body"><p class="note">No positions were closed in this session.</p></div>
+  {{end}}
+</section>
+{{end}}
+{{end}}

@@ -22,8 +22,11 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 | `MARKET_CLOSED` | Gray | Outside exchange hours. Daemon idle, waiting for next open. |
 | `SENTIMENT_CHECK` | Amber | Market open, within the first hour. Polling every 10 minutes. No trades placed. |
 | `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates and may hold open positions. |
+| `EOD_WINDOW` | Amber | Final 30 minutes before the close. Flattening open positions; no new entries. |
 | `HALTED_BEARISH` | Red | First-hour sentiment came back overwhelmingly bearish. No trades for the rest of the session; waiting for next trading day. |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
+
+`EOD_WINDOW` was added during implementation. The original five states had no way to describe the window between the forced-exit mark and the close: the market is still open, so `MARKET_CLOSED` would be untrue, and `SCREENING` would imply entries were still possible. Rather than misreport either, the window got its own state.
 
 `ERROR` must be visually distinguishable from `HALTED_BEARISH` beyond color alone (e.g. a different icon or label text) since both are red but mean very different things — one is a deliberate risk decision, the other is a fault.
 

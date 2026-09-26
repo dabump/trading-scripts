@@ -1,6 +1,6 @@
 # Strategy
 
-**Status:** design only. Values marked "not yet finalized" need explicit numbers agreed before `screener`/`strategy` are implemented — treat them as the next open decision, not as something to invent while coding.
+**Status:** implemented. Values below marked **PROPOSED** were not settled in design; they were filled in during implementation so the agent could run and are awaiting review (see [`decisions.md`](./decisions.md)). All of them live in `config/config.yaml` — change them there, and update this doc to match.
 
 ## 1. Sentiment gate (first hour)
 
@@ -9,13 +9,16 @@
 - At the end of the hour, classify the session as **overwhelmingly bearish** or **not overwhelmingly bearish**:
   - Overwhelmingly bearish → hand off to `risk`'s daily kill switch; no further trades today.
   - Anything else (clearly bullish *or* neutral/ambiguous) → proceed to screening for the rest of the day. Only a clear bearish reading halts trading — a neutral/unclear reading is treated the same as bullish, not the same as bearish.
-- **Not yet finalized:** the exact signal(s) and thresholds that produce this classification (e.g. broad-market ETF/futures direction and magnitude, breadth, VIX movement — `market-heat.sh`'s old heuristic in `archived/` is a reference point for the *kind* of signal, not a source of trusted numbers).
+- **Classification rule (PROPOSED):** the session is overwhelmingly bearish when the average intraday change across SPY, QQQ and IWM is at or below **−0.8%** *and* none of the three is positive. Anything else proceeds. IWM is in the basket deliberately: the strategy trades small caps, so a small-cap index belongs in the read of the tape, not just SPY and QQQ.
+- If the daemon starts *after* the first hour, no readings exist and the gate cannot be judged. It halts for the day rather than trading without the safety check ever having run.
 
 ## 2. Screening (small-cap momentum candidates)
 
 Screening only starts once the sentiment gate has passed (i.e. after the first hour) — there is no background screening during the no-trade hour.
 
-**Candidate universe:** before any of the four criteria below can be checked, the screener needs a source list of tickers to check them against — scanning the entire US market ticker-by-ticker isn't practical. Check Alpaca's screener/most-actives data first (some Alpaca plans expose a market-movers/most-active endpoint); if it doesn't give enough of the market to be useful, this needs a dedicated screener API (e.g. one that supports server-side filtering by float, % change, and volume directly, rather than pulling a broad list and filtering client-side). **Not yet confirmed** — tracked as an open item in [`decisions.md`](./decisions.md); don't silently build against an assumed endpoint.
+**Candidate universe:** the screener pulls the top gainers from Alpaca's market-movers endpoint (`universe_size`, default 50). Only gainers are considered — the strategy buys strength and never shorts. **Whether this endpoint is available on the account's Alpaca plan, and whether 50 movers is enough of the market, is still unverified** (open item in [`decisions.md`](./decisions.md)).
+
+**Evaluation order:** the intraday-move criterion is checked first from the movers snapshot, and only symbols that clear it get the per-symbol float, news and average-volume lookups. At a one-minute cadence, enriching every mover would multiply API calls for names already disqualified on the cheapest criterion. Symbols that fail the move gate still appear on the status page, with the un-fetched criteria shown as unevaluated.
 
 **Re-scan frequency:** every 1 minute once the sentiment gate has opened. This is deliberately much tighter than the first hour's 10-minute sentiment-poll cadence, chosen because a low-float momentum setup can fully develop and finish within minutes — a slower interval risks discovering candidates only after the move that made them interesting is already over.
 
@@ -24,11 +27,13 @@ A candidate must pass **all four** of the following (AND, not scored/weighted �
 1. **Float** — fewer than 10,000,000 shares available to trade. This uses free float / shares available, not total market cap.
 2. **News catalyst** — at least one news headline for the ticker within the current trading day (presence check only; no sentiment/NLP scoring — the price/volume move itself is what confirms the catalyst is moving the stock, the headline just confirms one exists).
 3. **Price move** — already up ≥10% intraday.
-4. **Volume** — ≥5x average volume.
+4. **Volume** — ≥5x average volume, where "average" is the mean of the previous **20** sessions (PROPOSED), *excluding today*. Today's partial volume is the number being compared against the average, so folding it in would dilute the very spike the criterion looks for.
 
 All four thresholds live in `config/config.yaml` as tunable values, not hardcoded, since they'll likely need adjusting after paper-trading results come in.
 
-**Open data-source question:** float and news-headline data are not standard Alpaca market-data-bar fields. Before implementing `screener`, confirm whether Alpaca's API surface (news endpoint, asset/reference data) covers both; if not, a single additional fundamentals/news provider needs to be added for whichever it doesn't cover. Don't silently pick a provider while coding — this is tracked as an open item in [`decisions.md`](./decisions.md).
+**Float data is not wired up, so nothing can currently qualify.** Alpaca's API does not expose share float, and which provider to add is still open. The implemented behaviour is to **fail the criterion closed**: an unverifiable float is treated as a failure, never as a skip, because silently dropping a documented entry requirement is the worse outcome. `float_provider` therefore only accepts `none`, and the status page states plainly that no candidate can qualify. News headlines *are* available (Alpaca's news endpoint) and are counted per symbol for the current session.
+
+**Tie-break (PROPOSED):** when more candidates qualify than there are free position slots, they are ranked by relative volume, highest first. It is the criterion that best separates a genuine, liquid move from a thin drift.
 
 ## 3. Entry
 
@@ -39,12 +44,16 @@ All four thresholds live in `config/config.yaml` as tunable values, not hardcode
 
 A position exits on whichever of these triggers first:
 
-1. **Profit target + trailing stop** — take profit once up some %, then trail a stop below the peak. **Not yet finalized** (exact target % and trail %).
+1. **Profit target + trailing stop (PROPOSED: +15% target, 5% trail)** — the trailing stop *arms* once the peak reaches the profit target, then exits if price falls the trail percentage below the high-water mark. Before it arms, the hard stop-loss is the only floor. Once armed it stays armed, even if price falls back below the target.
 2. **Hard stop-loss** at −10% (this one is settled — see [`risk.md`](./risk.md)).
-3. **MACD bearish crossover on the 15-minute chart** — exit when the MACD line crosses below its signal line. Uses periods fast=5, slow=10, signal=3, computed on the current day's candles from market open only (no multi-day lookback). Originally specified on the 30-minute chart, but that meant the slow EMA(10) needed 10×30min = 5 hours of same-day data before it could compute at all — since trading only runs from ~10:30am to the 3:30pm forced exit (a 5-hour window), MACD would have been usable only in roughly the last hour of the day. Moving to 15-minute candles halves that to 2.5 hours, so it becomes usable from around midday. **This is a mitigation, not a full fix** — a position opened and exited before ~12:30pm still can't trigger this exit; it only ever protects positions that are still open by midday. Accepted as a known limitation rather than switching to multi-day lookback or dropping the exit entirely.
+3. **MACD bearish crossover on the 15-minute chart** — exit when the MACD line crosses below its signal line. Uses periods fast=5, slow=10, signal=3, computed on the current day's candles from market open only (no multi-day lookback). Originally specified on the 30-minute chart, but that meant the slow EMA(10) needed 10×30min = 5 hours of same-day data before it could compute at all — since trading only runs from ~10:30am to the 3:30pm forced exit (a 5-hour window), MACD would have been usable only in roughly the last hour of the day. Moving to 15-minute candles shortens that. **Corrected during implementation:** the true warm-up is `slow + signal` = 13 candles, not 10 — the slow EMA is seeded with a simple average and the signal line is itself an EMA of the MACD line, and detecting a *crossing* needs the previous bar too. At 15 minutes that is 3h15m of session data, so the trigger first becomes available around 12:45pm ET, not the 2.5 hours originally estimated. **This is a mitigation, not a full fix** — a position opened and exited before then can never trigger this exit; it only protects positions still open in the afternoon. Accepted as a known limitation rather than switching to multi-day lookback or dropping the exit entirely.
 4. **Forced end-of-day exit** at 30 minutes before market close, regardless of P&L — settled, no exceptions.
 
 All four are checked continuously once a position is open; whichever fires first closes it.
+
+## Same-day re-entry
+
+A symbol with a position opened today is not bought again for the rest of the session, even after it closes (PROPOSED; `allow_same_day_reentry: false`). This avoids repeatedly buying back into a low-float name that already stopped out. Enforced from the store rather than memory, so it survives a restart.
 
 ## Explicitly out of scope for v1
 

@@ -1,6 +1,6 @@
 # Operations
 
-**Status:** design only.
+**Status:** implemented.
 
 ## Running modes
 
@@ -28,36 +28,57 @@ Do not silently pick one of these while implementing — surface it for an expli
 
 Tunable strategy parameters live here, not hardcoded — distinct from secrets, which go through env vars (below). This list should stay in sync with the values decided in `strategy.md`/`risk.md`; if you change a number in code without updating this list (or vice versa), one of the two has gone stale.
 
-| Key | Current value | Source |
+| Key | Value | Notes |
 |---|---|---|
-| Max float (shares) | 10,000,000 | `strategy.md` §2 |
-| Min intraday price move | ≥10% | `strategy.md` §2 |
-| Min volume multiple | ≥5x average volume | `strategy.md` §2 |
-| Average-volume lookback period | **not yet finalized** | `strategy.md` §2 |
-| Position size | 10% of portfolio per trade | `risk.md` |
-| Max concurrent positions | 5 | `risk.md` |
-| Per-trade hard stop-loss | −10% | `risk.md` |
-| Profit target % | **not yet finalized** | `strategy.md` §4 |
-| Trailing stop % | **not yet finalized** | `strategy.md` §4 |
-| MACD periods (fast/slow/signal) | 5 / 10 / 3 | `strategy.md` §4 |
-| MACD candle interval | 15 minutes | `strategy.md` §4 |
-| Forced EOD exit offset | 30 min before close | `strategy.md` §4 |
-| First-hour sentiment poll interval | 10 minutes | `strategy.md` §1 |
-| Screener re-scan interval | 1 minute | `strategy.md` §2 |
-| Sentiment classification thresholds (what counts as "overwhelmingly bearish") | **not yet finalized** | `strategy.md` §1 |
+| `screening.max_float_shares` | 10,000,000 | `strategy.md` §2 |
+| `screening.min_intraday_pct` | 10.0 | `strategy.md` §2 |
+| `screening.min_volume_multiple` | 5.0 | `strategy.md` §2 |
+| `screening.avg_volume_lookback_days` | 20 | **PROPOSED** — excludes today |
+| `screening.universe_size` | 50 | **PROPOSED** — movers pulled per scan |
+| `screening.float_provider` | `none` | Only `none` is accepted; no float source exists yet, so the criterion fails closed and nothing qualifies |
+| `risk.position_size_pct` | 10.0 | `risk.md` |
+| `risk.max_concurrent_positions` | 5 | `risk.md`; validated so sizing × concurrency cannot exceed 100% |
+| `risk.stop_loss_pct` | 10.0 | `risk.md` |
+| `risk.allow_same_day_reentry` | `false` | **PROPOSED** |
+| `exit.profit_target_pct` | 15.0 | **PROPOSED** — arms the trailing stop |
+| `exit.trailing_stop_pct` | 5.0 | **PROPOSED** |
+| `exit.macd_fast` / `macd_slow` / `macd_signal` | 5 / 10 / 3 | `strategy.md` §4 |
+| `exit.macd_interval_minutes` | 15 | `strategy.md` §4; warm-up is slow+signal = 13 bars ≈ 3h15m |
+| `exit.eod_exit_offset_minutes` | 30 | `strategy.md` §4 |
+| `timing.sentiment_poll_interval` | 10m | `strategy.md` §1 |
+| `timing.sentiment_window` | 1h | `strategy.md` §1 |
+| `timing.screener_scan_interval` | 1m | `strategy.md` §2 |
+| `timing.position_poll_interval` | 15s | **PROPOSED** — how often open positions are re-marked |
+| `sentiment.symbols` | SPY, QQQ, IWM | IWM included because the strategy trades small caps |
+| `sentiment.bearish_avg_pct` | −0.8 | **PROPOSED** — must be negative |
+| `sentiment.require_all_negative` | `true` | **PROPOSED** |
+| `execution.order_type` | `market` | **PROPOSED** — guarantees fills but can slip on low-float names |
+| `execution.limit_slip_pct` | 0.5 | Only used when `order_type: limit` |
+| `web.listen_addr` | `:8080` | |
+| `web.poll_interval` | 12s | `web-ui.md` (~10–15s) |
+| `storage.database_path` | `data/agent.db` | Created on start; gitignored |
+
+Invalid configurations are rejected at startup rather than mid-session: unknown
+keys, a non-negative bearish threshold, MACD fast ≥ slow, and total exposure over
+100% all fail fast, because discovering them with real positions open is the
+expensive way to find out.
 
 ## Persistence
 
 - SQLite, single file under `data/` (gitignored — this holds real trade history, not something to check in).
-- Schema changes go through `migrations/` rather than ad-hoc `ALTER TABLE` in application code, so the schema's history stays reviewable.
-- The daemon must be able to restart mid-day and resume from whatever `store` has — open positions, today's sentiment readings, and where in the daily loop it left off — without re-entering positions it already holds or re-running the first-hour sentiment poll from scratch.
+- Schema changes go through `internal/store/migrations/` rather than ad-hoc `ALTER TABLE` in application code, so the schema's history stays reviewable. They are embedded in the binary and applied idempotently on open; they live inside the package rather than at the repo root because `go:embed` cannot reach outside its own directory and the deployment target is a single self-contained binary.
+- The daemon restarts mid-day and resumes from whatever `store` has: open positions, today's sentiment readings (the 10-minute cadence is derived from them, so a restart neither double-polls nor skips), the session's gate verdict, and which symbols have already been traded today.
+- On startup `engine.Reconcile` treats the broker as the authority — adopting positions the store does not know about, closing ones the broker no longer holds as `RECONCILED`, and resolving orders that were submitted but never confirmed.
 
 ## Observability (v1 scope)
 
-- The status web page (reading from `store`) and local log output are the only observability in v1.
+- The status web page (reading from `store`) and structured log output (`log/slog`, to stderr) are the only observability in v1. `/api/status` returns the same state as JSON, which is what makes a running daemon checkable without scraping HTML.
+- Refusals that repeat every scan (a symbol already held, or already traded today) log at debug level; everything else that skips a candidate logs at info. At a one-minute cadence the routine ones would otherwise bury the log in hundreds of identical lines.
 - No external alerting (Slack, email, etc.) yet. If/when that's wanted, the natural hook points are: position opened/closed, daily kill switch triggered, and unhandled errors — but don't build this speculatively ahead of it being asked for.
 
 ## Deployment
 
-- Single Go binary, run as a long-lived process (not invoked repeatedly via cron) so it can hold the daily loop state and serve the web page continuously.
+- Single Go binary (CGO-free, so it is portable and needs no SQLite system library), run as a long-lived process rather than invoked repeatedly via cron, so it can hold the daily loop state and serve the web page continuously.
+- `go run ./cmd/agent -offline` runs the whole loop against a seeded fake broker with compressed session timings — no credentials, no network, no orders. This is how to see the daemon work end to end before an Alpaca account exists.
+- Starting against the live endpoint additionally requires `-allow-live-trading`; the base URL alone is not enough, given the unresolved PDT constraint above.
 - Where/how it's hosted (local machine, a VPS, a cloud VM) hasn't been decided yet — revisit once the binary exists and paper trading is being run somewhere for real.

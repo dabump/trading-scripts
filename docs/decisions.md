@@ -72,19 +72,69 @@ A full read-through of the spec surfaced several gaps. Resolutions below; unreso
 |---|---|
 | Screener re-scans the candidate universe every 1 minute once the sentiment gate opens | User's choice over reusing the 10-minute sentiment-poll cadence or a full streaming/continuous approach — tight enough to catch fast-developing low-float moves without needing a real-time data stream. |
 
+## 2026-09-26 — Implementation
+
+Built in Go against the design above. Decisions marked **claude-proposed** filled
+gaps the design left open so the agent could run; they are working defaults in
+`config/config.yaml`, not settled positions, and are the first thing to review.
+
+### Values filled in (claude-proposed, awaiting review)
+
+| Value | Chosen | Reasoning |
+|---|---|---|
+| Profit target / trailing stop | +15% / 5% | Plausible for a low-float momentum day-trade; no backtest supports these numbers. |
+| Average-volume lookback | 20 sessions, excluding today | 20 is the conventional window. Today is excluded because today's volume is the number being compared against the average. |
+| Sentiment classification | Avg of SPY/QQQ/IWM ≤ −0.8% **and** none positive | Needed a concrete rule to implement the gate at all. IWM is in the basket because the strategy trades small caps, so a small-cap index belongs in the read. |
+| Order type | Market | Guarantees the exits actually happen, which matters more than slippage while paper trading. The low-float slippage risk noted in the design is real and unaddressed. |
+| Tie-break when candidates exceed free slots | Highest relative volume first | Best separates a genuine liquid move from a thin drift. |
+| Same-day re-entry | Disabled | Avoids repeatedly buying back into a name that already stopped out. |
+| Universe size | Top 50 movers per scan | Bounded API cost at a one-minute cadence. |
+| Position re-mark interval | 15s | Exit rules need a reasonably fresh price without hammering the API. |
+
+### Gaps closed during implementation
+
+| Decision | Rationale |
+|---|---|
+| Market holidays and early closes come from Alpaca's calendar endpoint, not a hardcoded list | A hardcoded holiday table silently rots every year. This also resolved the holiday/early-close open item properly. |
+| Restart reconciliation implemented: broker positions are the authority | Closes the flagged crash-between-submit-and-confirm hole. Adopts unknown broker positions, closes vanished local ones as `RECONCILED`, resolves unconfirmed orders. |
+| New `RECONCILED` exit reason, distinct from the four strategy exits | So the end-of-day summary never attributes an operational disappearance to a strategy rule. |
+| New `EOD_WINDOW` agent state (a sixth) | The five documented states could not describe the window between the forced-exit mark and the close without either claiming the market was closed or implying entries were still possible. |
+| Float fails **closed** when unavailable | An unverifiable float is a failed criterion, never a skipped one; the alternative silently drops a documented entry requirement. `float_provider` accepts only `none`, so today nothing can qualify — and the status page says so. |
+| Starting after the first hour halts the day | With no sentiment readings the gate cannot be judged, and trading without the safety check having run was never the intent. |
+| Live trading needs `-allow-live-trading` in addition to the live base URL | The PDT constraint is unresolved; a base-URL typo should not be able to start real trading. |
+| Config is validated at startup, including exposure > 100% | These failures are much cheaper before positions are open than during a session. |
+
+### Corrections to the design
+
+| Correction | Detail |
+|---|---|
+| MACD warm-up is 13 bars (≈3h15m), not 10 (2.5h) | The slow EMA is seeded with a simple average, the signal line is an EMA *of* the MACD line, and detecting a crossing needs the previous bar: warm-up is `slow + signal`. The trigger first becomes available around 12:45pm ET, so the dead zone the 15-minute switch was meant to shrink is larger than estimated. `strategy.md` §4 updated. |
+| Price thresholds needed an epsilon | Thresholds are products like `peak*0.95`; `6.00*0.95` evaluates to 5.699999999999999, so a price of exactly 5.70 failed an "at or below 5% off the peak" test. Found by a test that expected the documented boundary behaviour. Comparisons now treat an exact-threshold price as triggering. |
+| Migrations live in `internal/store/migrations/`, not the repo root | `go:embed` cannot reach outside its package, and the single-binary deployment decision outranks the directory's location. |
+
+### Verification performed
+
+`go build`, `go vet` and `gofmt` clean; full test suite passes (config, scheduler,
+strategy/MACD, risk, sentiment, screener, store, broker, engine, web — including a
+simulated full trading day and both restart-reconciliation directions). The daemon
+was then run for real via `-offline`: it progressed `SENTIMENT_CHECK` → gate
+`PROCEED` → `SCREENING` → entry sized at exactly 10% of the portfolio →
+`EOD_WINDOW` forced exit, with the status page and `/api/status` reflecting each
+step; restarting it on the existing database re-applied no migrations, kept prior
+rows, and logged no errors.
+
+**Not verified:** every Alpaca endpoint path and payload shape. No credentials were
+available, so the client was tested against a stub server that returns
+Alpaca-shaped JSON. The first real paper-trading run is the actual verification of
+the endpoints themselves.
+
 ## Open items (not yet decided)
 
-- **Float and news-headline data source** — Alpaca's core market data is price/volume bars; whether its API also covers float (shares available) and news headlines needs to be checked before implementing `screener`. If it doesn't cover one or both, a single additional fundamentals/news provider needs to be chosen (`docs/strategy.md`).
-- **Screening candidate universe** — whether Alpaca's most-actives/screener data is sufficient, or a dedicated screener API is needed (`docs/strategy.md`).
+- **Float data source — the blocker.** Alpaca does not expose share float, so the float criterion fails closed and **no candidate can currently qualify for entry**. A provider has to be chosen and implemented before the agent can trade at all. News headlines are covered by Alpaca's news endpoint and are working.
+- **Screening candidate universe** — the movers endpoint is implemented, but whether it is available on this Alpaca plan and whether the top 50 gainers cover enough of the market is unverified against a real account (`docs/strategy.md`).
 - **PDT rule resolution before going live** — fund above $25k, reduce trade frequency, or switch to a cash account; none chosen yet (`docs/operations.md`).
-- Exact profit-target % and trailing-stop % for early exit (`docs/strategy.md`).
-- Exact signal/thresholds used to classify first-hour sentiment as overwhelmingly bearish vs. not (`docs/strategy.md`).
-- Whether a portfolio-level daily drawdown limit is needed alongside the per-trade stop-loss (`docs/risk.md`).
+- Review the claude-proposed values above — especially the profit target, trailing stop and sentiment thresholds, none of which rest on evidence.
+- Whether market orders are acceptable for low-float entries, or entries should use limit orders (the config supports both; `market` is the current default).
+- Whether a portfolio-level daily drawdown limit is needed alongside the per-trade stop-loss (`docs/risk.md`). Still not implemented.
 - Hosting/deployment target for the running daemon (`docs/operations.md`).
 - Whether the status page needs a browsable multi-day session history (currently scoped to today-only) (`docs/web-ui.md`).
-- **Order type (market vs. limit)** for entries and exits — not yet specified; low-float stocks can gap badly on market orders (`docs/strategy.md`).
-- **Average-volume lookback period** for the "≥5x average volume" screening criterion — not yet specified (`docs/strategy.md`).
-- **Tie-break rule** when more qualifying candidates appear than open position slots remain (`docs/strategy.md`).
-- **Restart reconciliation** — no defined behavior for an order submitted to Alpaca but not yet confirmed filled when the daemon crashes/restarts; risk of a duplicate order or an untracked real position (`docs/operations.md`).
-- **Market holidays / early-close days** — `scheduler`'s market-hours handling doesn't yet account for these (`docs/architecture.md`).
-- **Same-day re-entry rule** — no stated policy on whether a ticker that already stopped out once can be re-screened and re-bought later the same day (`docs/strategy.md`).

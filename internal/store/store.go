@@ -1,0 +1,437 @@
+// Package store is the SQLite persistence layer. The daemon must survive a
+// restart mid-session, so anything the trading loop would otherwise hold only in
+// memory lives here.
+package store
+
+import (
+	"database/sql"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite" // pure-Go driver: keeps the build CGO-free
+
+	"github.com/martincoetzee/trading-agent/internal/domain"
+)
+
+//go:embed all:migrations
+var migrationsFS embed.FS
+
+// ErrDuplicateOpenPosition is returned when a second open position in the same
+// symbol is attempted.
+var ErrDuplicateOpenPosition = errors.New("a position in this symbol is already open")
+
+type Store struct {
+	db *sql.DB
+}
+
+// Open opens (creating if needed) the database at path and applies migrations.
+func Open(path string) (*Store, error) {
+	// _txlock=immediate avoids SQLITE_BUSY surprises when the web handler reads
+	// while the trading loop writes.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	// A single writer keeps WAL contention predictable; reads still go through the
+	// same pool but are short.
+	db.SetMaxOpenConns(1)
+
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) migrate() error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return fmt.Errorf("create migrations table: %w", err)
+	}
+
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return fmt.Errorf("read migrations: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name = ?`, name).
+			Scan(&count); err != nil {
+			return fmt.Errorf("check migration %s: %w", name, err)
+		}
+		if count > 0 {
+			continue
+		}
+
+		body, err := migrationsFS.ReadFile(filepath.Join("migrations", name))
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(string(body)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)`,
+			name, nowUTC()); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func nowUTC() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func parseTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// SessionRecord is the per-day state the gate and kill switch depend on.
+type SessionRecord struct {
+	Date       string
+	Verdict    domain.Verdict
+	Halted     bool
+	HaltReason string
+}
+
+// Session returns the record for a date, creating a pending one if absent.
+func (s *Store) Session(date string) (SessionRecord, error) {
+	if _, err := s.db.Exec(
+		`INSERT INTO sessions (session_date, verdict, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(session_date) DO NOTHING`,
+		date, string(domain.VerdictPending), nowUTC()); err != nil {
+		return SessionRecord{}, fmt.Errorf("ensure session: %w", err)
+	}
+
+	var rec SessionRecord
+	var halted int
+	err := s.db.QueryRow(
+		`SELECT session_date, verdict, halted, halt_reason FROM sessions WHERE session_date = ?`, date).
+		Scan(&rec.Date, &rec.Verdict, &halted, &rec.HaltReason)
+	if err != nil {
+		return SessionRecord{}, fmt.Errorf("load session: %w", err)
+	}
+	rec.Halted = halted == 1
+	return rec, nil
+}
+
+// SetVerdict records the gate outcome, halting the session when bearish.
+func (s *Store) SetVerdict(date string, v domain.Verdict, haltReason string) error {
+	halted := 0
+	if v == domain.VerdictBearish {
+		halted = 1
+	} else {
+		haltReason = ""
+	}
+	_, err := s.db.Exec(
+		`UPDATE sessions SET verdict = ?, halted = ?, halt_reason = ?, updated_at = ?
+		 WHERE session_date = ?`,
+		string(v), halted, haltReason, nowUTC(), date)
+	if err != nil {
+		return fmt.Errorf("set verdict: %w", err)
+	}
+	return nil
+}
+
+// AddSentimentReading appends one first-hour poll.
+func (s *Store) AddSentimentReading(r domain.SentimentReading) error {
+	payload, err := json.Marshal(r.Percentages)
+	if err != nil {
+		return fmt.Errorf("encode percentages: %w", err)
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO sentiment_readings (session_date, taken_at, classification, percentages)
+		 VALUES (?, ?, ?, ?)`,
+		r.SessionDate, formatTime(r.TakenAt), string(r.Classification), string(payload))
+	if err != nil {
+		return fmt.Errorf("insert sentiment reading: %w", err)
+	}
+	return nil
+}
+
+// SentimentReadings returns a session's readings, oldest first.
+func (s *Store) SentimentReadings(date string) ([]domain.SentimentReading, error) {
+	rows, err := s.db.Query(
+		`SELECT session_date, taken_at, classification, percentages
+		 FROM sentiment_readings WHERE session_date = ? ORDER BY taken_at`, date)
+	if err != nil {
+		return nil, fmt.Errorf("query sentiment readings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.SentimentReading
+	for rows.Next() {
+		var r domain.SentimentReading
+		var takenAt, payload string
+		if err := rows.Scan(&r.SessionDate, &takenAt, &r.Classification, &payload); err != nil {
+			return nil, err
+		}
+		r.TakenAt = parseTime(takenAt)
+		if err := json.Unmarshal([]byte(payload), &r.Percentages); err != nil {
+			return nil, fmt.Errorf("decode percentages: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// InsertPosition records a newly opened position.
+func (s *Store) InsertPosition(p domain.Position) (int64, error) {
+	peak := p.PeakPrice
+	if peak < p.EntryPrice {
+		peak = p.EntryPrice
+	}
+	// last_price is seeded to the entry price so the status page shows a sensible
+	// mark for a position opened between two trading-loop ticks.
+	res, err := s.db.Exec(
+		`INSERT INTO positions
+		 (session_date, symbol, shares, entry_price, entry_time, peak_price, last_price, trail_armed, is_open)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+		p.SessionDate, p.Symbol, p.Shares, p.EntryPrice, formatTime(p.EntryTime),
+		peak, p.EntryPrice, boolToInt(p.TrailArmed))
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return 0, fmt.Errorf("%w: %s", ErrDuplicateOpenPosition, p.Symbol)
+		}
+		return 0, fmt.Errorf("insert position: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// UpdateMark records the latest observed price, raises the high-water mark, and
+// latches the trailing stop. The peak and the armed flag only ever move up, so a
+// stale or out-of-order tick cannot undo them.
+func (s *Store) UpdateMark(id int64, lastPrice, peak float64, trailArmed bool) error {
+	_, err := s.db.Exec(
+		`UPDATE positions
+		 SET last_price = ?, peak_price = MAX(peak_price, ?), trail_armed = MAX(trail_armed, ?)
+		 WHERE id = ?`, lastPrice, peak, boolToInt(trailArmed), id)
+	if err != nil {
+		return fmt.Errorf("update mark: %w", err)
+	}
+	return nil
+}
+
+// ClosePosition marks a position closed with its realized outcome.
+func (s *Store) ClosePosition(id int64, exitPrice float64, exitTime time.Time, reason domain.ExitReason) error {
+	_, err := s.db.Exec(
+		`UPDATE positions SET is_open = 0, exit_price = ?, exit_time = ?, exit_reason = ?
+		 WHERE id = ? AND is_open = 1`,
+		exitPrice, formatTime(exitTime), string(reason), id)
+	if err != nil {
+		return fmt.Errorf("close position: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
+	defer rows.Close()
+	var out []domain.Position
+	for rows.Next() {
+		var p domain.Position
+		var entryTime, exitTime string
+		var trailArmed, isOpen int
+		if err := rows.Scan(&p.ID, &p.SessionDate, &p.Symbol, &p.Shares, &p.EntryPrice,
+			&entryTime, &p.PeakPrice, &p.LastPrice, &trailArmed, &isOpen, &p.ExitPrice,
+			&exitTime, &p.ExitReason); err != nil {
+			return nil, err
+		}
+		p.EntryTime = parseTime(entryTime)
+		p.ExitTime = parseTime(exitTime)
+		p.TrailArmed = trailArmed == 1
+		p.Open = isOpen == 1
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+const positionColumns = `id, session_date, symbol, shares, entry_price, entry_time,
+	peak_price, last_price, trail_armed, is_open, exit_price, exit_time, exit_reason`
+
+// OpenPositions returns every currently-held position, regardless of session.
+func (s *Store) OpenPositions() ([]domain.Position, error) {
+	rows, err := s.db.Query(`SELECT ` + positionColumns + ` FROM positions WHERE is_open = 1 ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("query open positions: %w", err)
+	}
+	return s.scanPositions(rows)
+}
+
+// SessionPositions returns all positions opened on a date, open or closed.
+func (s *Store) SessionPositions(date string) ([]domain.Position, error) {
+	rows, err := s.db.Query(`SELECT `+positionColumns+
+		` FROM positions WHERE session_date = ? ORDER BY id`, date)
+	if err != nil {
+		return nil, fmt.Errorf("query session positions: %w", err)
+	}
+	return s.scanPositions(rows)
+}
+
+// SaveScreenSnapshot stores the latest screening pass for the web page.
+func (s *Store) SaveScreenSnapshot(date string, takenAt time.Time, evals []domain.Evaluation) error {
+	payload, err := json.Marshal(evals)
+	if err != nil {
+		return fmt.Errorf("encode evaluations: %w", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO screen_snapshots (session_date, taken_at, payload) VALUES (?, ?, ?)`,
+		date, formatTime(takenAt), string(payload)); err != nil {
+		return fmt.Errorf("insert screen snapshot: %w", err)
+	}
+	// Only the newest pass is displayed, and a 1-minute scan cadence would
+	// otherwise accumulate ~390 rows a day for no reader.
+	_, err = s.db.Exec(
+		`DELETE FROM screen_snapshots WHERE session_date = ? AND taken_at < ?`,
+		date, formatTime(takenAt))
+	if err != nil {
+		return fmt.Errorf("prune screen snapshots: %w", err)
+	}
+	return nil
+}
+
+// LatestScreenSnapshot returns the most recent screening pass for a date.
+func (s *Store) LatestScreenSnapshot(date string) ([]domain.Evaluation, time.Time, error) {
+	var payload, takenAt string
+	err := s.db.QueryRow(
+		`SELECT payload, taken_at FROM screen_snapshots WHERE session_date = ?
+		 ORDER BY taken_at DESC LIMIT 1`, date).Scan(&payload, &takenAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, time.Time{}, nil
+	}
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("query screen snapshot: %w", err)
+	}
+	var evals []domain.Evaluation
+	if err := json.Unmarshal([]byte(payload), &evals); err != nil {
+		return nil, time.Time{}, fmt.Errorf("decode evaluations: %w", err)
+	}
+	return evals, parseTime(takenAt), nil
+}
+
+// OrderRecord tracks a submitted order so a crash mid-submission is recoverable.
+type OrderRecord struct {
+	ClientOrderID string
+	SessionDate   string
+	Symbol        string
+	Side          string
+	Shares        int
+	SubmittedAt   time.Time
+	Status        string
+	BrokerOrderID string
+}
+
+// RecordOrder writes an order's intent before it is sent to the broker.
+func (s *Store) RecordOrder(r OrderRecord) error {
+	_, err := s.db.Exec(
+		`INSERT INTO orders
+		 (client_order_id, session_date, symbol, side, shares, submitted_at, status, broker_order_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ClientOrderID, r.SessionDate, r.Symbol, r.Side, r.Shares,
+		formatTime(r.SubmittedAt), r.Status, r.BrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("record order: %w", err)
+	}
+	return nil
+}
+
+// UpdateOrderStatus records what the broker said about an order.
+func (s *Store) UpdateOrderStatus(clientOrderID, status, brokerOrderID string) error {
+	_, err := s.db.Exec(
+		`UPDATE orders SET status = ?, broker_order_id = ? WHERE client_order_id = ?`,
+		status, brokerOrderID, clientOrderID)
+	if err != nil {
+		return fmt.Errorf("update order status: %w", err)
+	}
+	return nil
+}
+
+// UnresolvedOrders returns orders that were recorded but never confirmed, which
+// is what restart reconciliation has to investigate.
+func (s *Store) UnresolvedOrders() ([]OrderRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT client_order_id, session_date, symbol, side, shares, submitted_at, status, broker_order_id
+		 FROM orders WHERE status = 'submitted' ORDER BY submitted_at`)
+	if err != nil {
+		return nil, fmt.Errorf("query unresolved orders: %w", err)
+	}
+	defer rows.Close()
+
+	var out []OrderRecord
+	for rows.Next() {
+		var r OrderRecord
+		var submittedAt string
+		if err := rows.Scan(&r.ClientOrderID, &r.SessionDate, &r.Symbol, &r.Side,
+			&r.Shares, &submittedAt, &r.Status, &r.BrokerOrderID); err != nil {
+			return nil, err
+		}
+		r.SubmittedAt = parseTime(submittedAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SymbolsTradedOn lists every symbol with a position opened on a date, used to
+// enforce the same-day re-entry rule across restarts.
+func (s *Store) SymbolsTradedOn(date string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT symbol FROM positions WHERE session_date = ?`, date)
+	if err != nil {
+		return nil, fmt.Errorf("query traded symbols: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		out[sym] = true
+	}
+	return out, rows.Err()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}

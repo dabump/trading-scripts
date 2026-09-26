@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/martincoetzee/trading-agent/internal/audit"
 	"github.com/martincoetzee/trading-agent/internal/broker"
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
@@ -27,8 +29,10 @@ type Deps struct {
 	Store   *store.Store
 	Data    broker.MarketData
 	Trading broker.Trading
-	Floats  broker.FloatProvider
 	Logger  *slog.Logger
+	// Audit records decisions and actions durably. A nil recorder is tolerated so a
+	// misconfiguration can never panic a daemon holding open positions.
+	Audit audit.Recorder
 	// Now is injectable so a test can drive a whole trading day deterministically.
 	Now func() time.Time
 }
@@ -38,8 +42,8 @@ type Engine struct {
 	store   *store.Store
 	data    broker.MarketData
 	trading broker.Trading
-	floats  broker.FloatProvider
 	log     *slog.Logger
+	audit   audit.Recorder
 	now     func() time.Time
 
 	mu           sync.RWMutex
@@ -48,6 +52,20 @@ type Engine struct {
 	session      scheduler.Session
 	sessionKnown bool
 	lastScan     time.Time
+
+	// The tradable universe barely changes within a day, so it is fetched once per
+	// session rather than on every one-minute scan.
+	universe     []string
+	universeDate string
+	// lastAuditedFault de-duplicates a repeating fault so the trail is not swamped.
+	lastAuditedFault string
+	// auditedSkips remembers the last skip reason audited per symbol, so a reason
+	// that recurs on every scan — being at the position cap, most of all — is
+	// recorded once rather than several hundred times a day.
+	auditedSkips     map[string]string
+	auditedSkipsDate string
+
+	manual manualGuards
 }
 
 func New(d Deps) *Engine {
@@ -59,13 +77,14 @@ func New(d Deps) *Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	floats := d.Floats
-	if floats == nil {
-		floats = broker.NoFloatProvider{}
+	recorder := d.Audit
+	if recorder == nil {
+		recorder = audit.Discard{}
 	}
 	return &Engine{
 		cfg: d.Config, store: d.Store, data: d.Data, trading: d.Trading,
-		floats: floats, log: logger, now: now, state: domain.StateMarketClosed,
+		log: logger, audit: recorder, now: now, state: domain.StateMarketClosed,
+		auditedSkips: map[string]string{},
 	}
 }
 
@@ -90,17 +109,77 @@ func (e *Engine) setState(s domain.AgentState) {
 	e.state = s
 	if s != domain.StateError {
 		e.lastError = ""
+		// Recovery resets the de-duplication, so a fault that comes back later is
+		// recorded again rather than being swallowed as a repeat.
+		e.lastAuditedFault = ""
 	}
+}
+
+// record writes an audit event.
+//
+// A failed audit write is logged but does not fault the agent or abort the tick:
+// the daemon may be holding open positions, and abandoning their exits to preserve
+// a record would be the wrong trade. The error is logged at error level so the gap
+// is visible rather than silent.
+func (e *Engine) record(kind audit.Kind, symbol, summary string, detail map[string]any) {
+	ev := audit.Event{
+		At:          e.now(),
+		SessionDate: scheduler.SessionDate(e.now()),
+		Kind:        kind,
+		Symbol:      symbol,
+		Summary:     summary,
+		Detail:      detail,
+	}
+	if err := e.audit.Record(ev); err != nil {
+		e.log.Error("audit write failed; this decision is not in the trail",
+			"kind", kind, "symbol", symbol, "err", err)
+	}
+}
+
+// recordSkip audits a candidate that qualified but was not bought, at most once per
+// symbol-and-reason per session.
+//
+// The reasons that matter recur: once the position cap is reached, every remaining
+// qualifier is turned away on every scan for the rest of the day. Recording each
+// occurrence would bury the trail, and recording none would lose the fact that a
+// qualifying candidate was passed over at all.
+func (e *Engine) recordSkip(symbol, reason string, detail map[string]any) {
+	date := scheduler.SessionDate(e.now())
+
+	e.mu.Lock()
+	if e.auditedSkipsDate != date {
+		e.auditedSkips = map[string]string{}
+		e.auditedSkipsDate = date
+	}
+	already := e.auditedSkips[symbol] == reason
+	e.auditedSkips[symbol] = reason
+	e.mu.Unlock()
+
+	if already {
+		return
+	}
+	e.record(audit.EntrySkipped, symbol, "not entered: "+reason, detail)
 }
 
 // fail puts the agent into ERROR, which docs/web-ui.md requires be shown
 // distinctly from a deliberate bearish halt.
 func (e *Engine) fail(op string, err error) {
 	e.log.Error("engine error", "op", op, "err", err)
+
+	message := fmt.Sprintf("%s: %v", op, err)
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	repeat := e.lastAuditedFault == message
+	e.lastAuditedFault = message
 	e.state = domain.StateError
-	e.lastError = fmt.Sprintf("%s: %v", op, err)
+	e.lastError = message
+	e.mu.Unlock()
+
+	// A persistent upstream outage would otherwise write a fault every tick and
+	// bury the trail; only a change of fault is worth recording.
+	if !repeat {
+		e.record(audit.Fault, "", message, map[string]any{"op": op})
+	}
 }
 
 // Run ticks until the context is cancelled. The tick interval is the shortest of
@@ -170,6 +249,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		}
 		e.log.Warn("adopting broker position absent from local state",
 			"symbol", sym, "shares", bp.Shares, "avg_entry", bp.AvgEntry)
+		e.record(audit.Reconciled, sym,
+			fmt.Sprintf("adopted a broker position of %d shares the local record did not know about", bp.Shares),
+			map[string]any{"action": "adopted", "shares": bp.Shares, "avg_entry": bp.AvgEntry})
 		if _, err := e.store.InsertPosition(domain.Position{
 			SessionDate: date, Symbol: sym, Shares: bp.Shares,
 			EntryPrice: bp.AvgEntry, EntryTime: now, PeakPrice: bp.CurrentPrice,
@@ -183,6 +265,9 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			continue
 		}
 		e.log.Warn("closing local position the broker no longer holds", "symbol", sym)
+		e.record(audit.Reconciled, sym,
+			"closed a local position the broker no longer holds",
+			map[string]any{"action": "closed", "shares": lp.Shares, "entry_price": lp.EntryPrice})
 		price := lp.EntryPrice
 		if snaps, err := e.data.Snapshots(ctx, []string{sym}); err == nil {
 			if s, ok := snaps[sym]; ok && s.Price > 0 {
@@ -201,6 +286,10 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	for _, o := range unresolved {
 		e.log.Warn("order was never confirmed; resolved against broker positions",
 			"client_order_id", o.ClientOrderID, "symbol", o.Symbol, "side", o.Side)
+		e.record(audit.Reconciled, o.Symbol,
+			fmt.Sprintf("resolved an unconfirmed %s order against the broker's positions", o.Side),
+			map[string]any{"action": "order_resolved", "side": o.Side,
+				"shares": o.Shares, "client_order_id": o.ClientOrderID})
 		if err := e.store.UpdateOrderStatus(o.ClientOrderID, "reconciled", o.BrokerOrderID); err != nil {
 			return fmt.Errorf("mark order reconciled: %w", err)
 		}
@@ -327,6 +416,8 @@ func (e *Engine) pollSentiment(ctx context.Context, sess scheduler.Session) erro
 	}
 	e.log.Info("sentiment reading", "session", sess.Date,
 		"classification", reading.Classification, "percentages", pcts)
+	e.record(audit.SentimentRead, "", fmt.Sprintf("sentiment reads %s", reading.Classification),
+		map[string]any{"classification": string(reading.Classification), "percentages": pcts})
 	return e.store.AddSentimentReading(reading)
 }
 
@@ -349,12 +440,14 @@ func (e *Engine) resolveGate(ctx context.Context, sess scheduler.Session) (bool,
 		// The daemon was started after the first hour, so the gate has no data to
 		// judge. Trading requires a sentiment check to have happened, so stay out
 		// for the day rather than assuming conditions are fine.
+		reason := "no sentiment readings were taken during the first hour"
 		e.log.Warn("no sentiment readings for this session; halting for the day",
 			"session", sess.Date)
-		if err := e.store.SetVerdict(sess.Date, domain.VerdictBearish,
-			"no sentiment readings were taken during the first hour"); err != nil {
+		if err := e.store.SetVerdict(sess.Date, domain.VerdictBearish, reason); err != nil {
 			return false, err
 		}
+		e.record(audit.TradingHalted, "", "halted for the session: "+reason,
+			map[string]any{"reason": reason, "readings": 0})
 		return true, nil
 	}
 
@@ -364,10 +457,25 @@ func (e *Engine) resolveGate(ctx context.Context, sess scheduler.Session) (bool,
 		reason = fmt.Sprintf("first-hour sentiment %v", readings[len(readings)-1].Percentages)
 	}
 	e.log.Info("sentiment gate resolved", "session", sess.Date, "verdict", verdict)
+	last := readings[len(readings)-1]
+	detail := map[string]any{
+		"verdict":     string(verdict),
+		"readings":    len(readings),
+		"percentages": last.Percentages,
+	}
 	if err := e.store.SetVerdict(sess.Date, verdict, reason); err != nil {
 		return false, err
 	}
-	return verdict == domain.VerdictBearish, nil
+
+	halted := verdict == domain.VerdictBearish
+	if halted {
+		e.record(audit.TradingHalted, "",
+			"halted for the session: first-hour sentiment was overwhelmingly bearish", detail)
+	} else {
+		e.record(audit.GateResolved, "",
+			"gate passed; screening may begin", detail)
+	}
+	return halted, nil
 }
 
 // maybeScreen runs a screening pass if the scan interval has elapsed.
@@ -387,98 +495,187 @@ func (e *Engine) maybeScreen(ctx context.Context, sess scheduler.Session) error 
 	if err != nil {
 		return err
 	}
+
+	// Entry runs before the snapshot is stored so the page can show what actually
+	// happened to each qualifying candidate, not just that it qualified.
+	outcomes, entryErr := e.enterPositions(ctx, sess, evals)
+	for i := range evals {
+		if outcome, ok := outcomes[evals[i].Symbol]; ok {
+			evals[i].Outcome = outcome
+		}
+	}
+	// Saved even when entry failed: a pass that went wrong is exactly when seeing
+	// the candidate table matters.
 	if err := e.store.SaveScreenSnapshot(sess.Date, now, evals); err != nil {
 		return err
 	}
-	return e.enterPositions(ctx, sess, evals)
+	return entryErr
 }
 
 // screen evaluates the candidate universe against the four entry criteria.
-//
-// The move criterion is checked first from the movers snapshot, and only symbols
-// that clear it get the per-symbol float, news and average-volume lookups. At a
-// one-minute scan cadence, enriching every mover would multiply API calls for
-// names that are already disqualified on the cheapest criterion.
 func (e *Engine) screen(ctx context.Context, sess scheduler.Session) ([]domain.Evaluation, error) {
-	movers, err := e.data.Movers(ctx, e.cfg.Screening.UniverseSize)
+	inputs, _, err := e.gatherCandidates(ctx, e.newsSince())
 	if err != nil {
-		return nil, fmt.Errorf("movers: %w", err)
+		return nil, err
 	}
-	if len(movers) == 0 {
-		return nil, nil
-	}
-
-	symbols := make([]string, 0, len(movers))
-	for _, m := range movers {
-		symbols = append(symbols, m.Symbol)
-	}
-	snaps, err := e.data.Snapshots(ctx, symbols)
-	if err != nil {
-		return nil, fmt.Errorf("snapshots: %w", err)
-	}
-
-	var shortlist []string
-	for _, sym := range symbols {
-		if snaps[sym].IntradayPct >= e.cfg.Screening.MinIntradayPct {
-			shortlist = append(shortlist, sym)
-		}
-	}
-
-	news := map[string]int{}
-	if len(shortlist) > 0 {
-		news, err = e.data.NewsCounts(ctx, shortlist, sess.Open)
-		if err != nil {
-			return nil, fmt.Errorf("news: %w", err)
-		}
-	}
-
-	evals := make([]domain.Evaluation, 0, len(symbols))
-	onShortlist := make(map[string]bool, len(shortlist))
-	for _, s := range shortlist {
-		onShortlist[s] = true
-	}
-
-	for _, sym := range symbols {
-		snap := snaps[sym]
-		in := screener.Input{
-			Symbol:      sym,
-			Price:       snap.Price,
-			IntradayPct: snap.IntradayPct,
-			TodayVolume: snap.TodayVolume,
-		}
-		if onShortlist[sym] {
-			if avg, err := e.data.AverageDailyVolume(ctx, sym, e.cfg.Screening.AvgVolumeLookbackDays); err != nil {
-				e.log.Warn("average volume unavailable", "symbol", sym, "err", err)
-			} else {
-				in.AvgVolume = avg
-			}
-			if shares, ok, err := e.floats.FloatShares(ctx, sym); err != nil {
-				e.log.Warn("float unavailable", "symbol", sym, "err", err)
-			} else {
-				in.FloatShares, in.FloatKnown = shares, ok
-			}
-			in.NewsCount = news[sym]
-		}
+	evals := make([]domain.Evaluation, 0, len(inputs))
+	for _, in := range inputs {
 		evals = append(evals, screener.Evaluate(in, e.cfg))
 	}
 	return evals, nil
 }
 
+// newsSince is the start of the window searched for a catalyst.
+//
+// It deliberately reaches back before the market open rather than starting at it: a
+// gap-up's catalyst usually breaks overnight or pre-market, so a window beginning at
+// 09:30 would miss the story that caused the move and report no news for precisely
+// the candidates worth trading.
+func (e *Engine) newsSince() time.Time {
+	return e.now().Add(-e.cfg.Screening.NewsLookback)
+}
+
+// criteriaDetail flattens an evaluation's criteria for the audit trail, so the
+// record shows what was true at the moment of the decision rather than requiring
+// the reader to trust that the thresholds were the same.
+func criteriaDetail(eval domain.Evaluation) map[string]any {
+	out := make(map[string]any, len(eval.Criteria))
+	for _, c := range eval.Criteria {
+		out[c.Name] = c.Display
+	}
+	return out
+}
+
+// tradableUniverse returns the day's symbol list, fetching it at most once per
+// session.
+func (e *Engine) tradableUniverse(ctx context.Context) ([]string, error) {
+	date := scheduler.SessionDate(e.now())
+
+	e.mu.RLock()
+	cached, cachedDate := e.universe, e.universeDate
+	e.mu.RUnlock()
+	if cachedDate == date && len(cached) > 0 {
+		return cached, nil
+	}
+
+	symbols, err := e.data.TradableAssets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("tradable assets: %w", err)
+	}
+	e.log.Info("loaded tradable universe", "symbols", len(symbols), "session", date)
+
+	e.mu.Lock()
+	e.universe, e.universeDate = symbols, date
+	e.mu.Unlock()
+	return symbols, nil
+}
+
+// gatherCandidates scans the whole tradable universe and assembles the per-symbol
+// screening inputs.
+//
+// The order of work is what makes a full-market scan affordable. The price-move
+// criterion is evaluated first, from batched snapshots that cost a couple of dozen
+// requests for the entire market; that alone cuts thousands of symbols down to a
+// handful. Only those survivors get the per-symbol news and average-volume calls.
+//
+// When more names clear the move threshold than MaxEnriched allows, the busiest by
+// dollar volume are kept. Dollar volume is the closest cheap stand-in for the
+// relative-volume criterion the strategy actually ranks on — sorting by percentage
+// change instead (which is what Alpaca's movers endpoint did) would discard a
+// heavily traded +11% name in favour of a thin +40% one, the opposite of the
+// intended preference.
+func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time) ([]screener.Input, int, error) {
+	universe, err := e.tradableUniverse(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(universe) == 0 {
+		return nil, 0, nil
+	}
+
+	snaps, err := e.data.Snapshots(ctx, universe)
+	if err != nil {
+		return nil, 0, fmt.Errorf("snapshots: %w", err)
+	}
+
+	type mover struct {
+		symbol string
+		snap   domain.Snapshot
+		dollar float64
+	}
+	var movers []mover
+	for _, sym := range universe {
+		snap, ok := snaps[sym]
+		if !ok || snap.IntradayPct < e.cfg.Screening.MinIntradayPct {
+			continue
+		}
+		movers = append(movers, mover{
+			symbol: sym, snap: snap, dollar: snap.Price * snap.TodayVolume,
+		})
+	}
+
+	sort.SliceStable(movers, func(i, j int) bool { return movers[i].dollar > movers[j].dollar })
+	moved := len(movers)
+	if moved > e.cfg.Screening.MaxEnriched {
+		movers = movers[:e.cfg.Screening.MaxEnriched]
+		e.log.Info("more movers than the enrichment budget; keeping the busiest",
+			"cleared_threshold", moved, "enriched", len(movers))
+	}
+	if len(movers) == 0 {
+		return nil, len(universe), nil
+	}
+
+	shortlist := make([]string, 0, len(movers))
+	for _, m := range movers {
+		shortlist = append(shortlist, m.symbol)
+	}
+	news, err := e.data.NewsCounts(ctx, shortlist, newsSince)
+	if err != nil {
+		return nil, 0, fmt.Errorf("news: %w", err)
+	}
+
+	inputs := make([]screener.Input, 0, len(movers))
+	for _, m := range movers {
+		in := screener.Input{
+			Symbol:      m.symbol,
+			Price:       m.snap.Price,
+			IntradayPct: m.snap.IntradayPct,
+			TodayVolume: m.snap.TodayVolume,
+			NewsCount:   news[m.symbol],
+		}
+		if avg, err := e.data.AverageDailyVolume(ctx, m.symbol, e.cfg.Screening.AvgVolumeLookbackDays); err != nil {
+			e.log.Warn("average volume unavailable", "symbol", m.symbol, "err", err)
+		} else {
+			in.AvgVolume = avg
+		}
+		inputs = append(inputs, in)
+	}
+	return inputs, len(universe), nil
+}
+
 // enterPositions buys the strongest qualifying candidates that fit under the
-// exposure cap.
-func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, evals []domain.Evaluation) error {
+// exposure cap, and reports what happened to each one.
+//
+// A failure affecting a single candidate — an unavailable price, say — skips that
+// candidate rather than abandoning the pass. Aborting would discard the remaining
+// qualifiers, which on a one-minute cadence means a transient blip on one symbol
+// silently costs the others their entry. Failures that are not specific to a
+// candidate still stop the pass and surface as an error.
+func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, evals []domain.Evaluation) (map[string]string, error) {
+	outcomes := map[string]string{}
+
 	qualifying := screener.Qualifying(evals)
 	if len(qualifying) == 0 {
-		return nil
+		return outcomes, nil
 	}
 
 	open, err := e.store.OpenPositions()
 	if err != nil {
-		return err
+		return outcomes, err
 	}
 	tradedToday, err := e.store.SymbolsTradedOn(sess.Date)
 	if err != nil {
-		return err
+		return outcomes, err
 	}
 	openSymbols := make(map[string]bool, len(open))
 	for _, p := range open {
@@ -486,9 +683,19 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 	}
 	openCount := len(open)
 
-	for _, cand := range qualifying {
+	for i, cand := range qualifying {
 		if !risk.CanOpen(openCount, e.cfg) {
-			return nil
+			// Explain every remaining candidate rather than leaving them blank.
+			reason := fmt.Sprintf("position cap reached (%d)", e.cfg.Risk.MaxConcurrentPositions)
+			for _, rest := range qualifying[i:] {
+				outcomes[rest.Symbol] = reason
+				e.recordSkip(rest.Symbol, reason, map[string]any{
+					"reason":          reason,
+					"relative_volume": rest.VolumeMultiple,
+					"open_positions":  openCount,
+				})
+			}
+			return outcomes, nil
 		}
 		if allowed, reason, routine := risk.AllowEntry(cand.Symbol, openSymbols, tradedToday, openCount, e.cfg); !allowed {
 			if routine {
@@ -496,26 +703,53 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			} else {
 				e.log.Info("skipping candidate", "symbol", cand.Symbol, "reason", reason)
 			}
+			outcomes[cand.Symbol] = reason
+			// Routine reasons (already holding it, already traded today) are implied by
+			// the position events themselves, so they add nothing to the trail.
+			if !routine {
+				e.recordSkip(cand.Symbol, reason,
+					map[string]any{"reason": reason, "relative_volume": cand.VolumeMultiple})
+			}
 			continue
 		}
 
 		snaps, err := e.data.Snapshots(ctx, []string{cand.Symbol})
 		if err != nil {
-			return fmt.Errorf("price for %s: %w", cand.Symbol, err)
+			e.log.Warn("skipping candidate: price unavailable", "symbol", cand.Symbol, "err", err)
+			outcomes[cand.Symbol] = "price unavailable"
+			e.recordSkip(cand.Symbol, "price unavailable",
+				map[string]any{"reason": "price unavailable", "error": err.Error()})
+			continue
 		}
 		price := snaps[cand.Symbol].Price
+
+		// Re-read per candidate rather than once per pass: each fill consumes cash,
+		// so sizing the next position from a stale balance would over-commit.
 		acct, err := e.trading.Account(ctx)
 		if err != nil {
-			return fmt.Errorf("account: %w", err)
+			e.log.Warn("skipping candidate: account unavailable", "symbol", cand.Symbol, "err", err)
+			outcomes[cand.Symbol] = "account unavailable"
+			e.recordSkip(cand.Symbol, "account unavailable",
+				map[string]any{"reason": "account unavailable", "error": err.Error()})
+			continue
 		}
+
 		sizing := risk.Size(acct, price, e.cfg)
 		if !sizing.OK {
 			e.log.Info("skipping candidate", "symbol", cand.Symbol, "reason", sizing.Reason)
+			outcomes[cand.Symbol] = sizing.Reason
+			e.recordSkip(cand.Symbol, sizing.Reason,
+				map[string]any{"reason": sizing.Reason, "price": price, "cash": acct.Cash})
 			continue
 		}
 
 		if err := e.submit(ctx, sess, cand.Symbol, "buy", sizing.Shares, price); err != nil {
-			return err
+			e.log.Warn("skipping candidate: order rejected", "symbol", cand.Symbol, "err", err)
+			outcomes[cand.Symbol] = "order rejected"
+			e.recordSkip(cand.Symbol, "order rejected",
+				map[string]any{"reason": "order rejected", "shares": sizing.Shares,
+					"price": price, "error": err.Error()})
+			continue
 		}
 		if _, err := e.store.InsertPosition(domain.Position{
 			SessionDate: sess.Date, Symbol: cand.Symbol, Shares: sizing.Shares,
@@ -523,18 +757,35 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 		}); err != nil {
 			if errors.Is(err, store.ErrDuplicateOpenPosition) {
 				e.log.Warn("duplicate position rejected by store", "symbol", cand.Symbol)
+				outcomes[cand.Symbol] = "already holding this symbol"
 				continue
 			}
-			return err
+			return outcomes, err
 		}
 
 		e.log.Info("entered position", "symbol", cand.Symbol, "shares", sizing.Shares,
 			"price", price, "rel_volume", cand.VolumeMultiple)
+		outcomes[cand.Symbol] = fmt.Sprintf("bought %d @ $%.2f", sizing.Shares, price)
+		// Everything needed to reconstruct the decision later: the criteria that were
+		// met, the size and why it was that size, and the account state behind it.
+		e.record(audit.PositionOpened, cand.Symbol,
+			fmt.Sprintf("bought %d shares at $%.2f", sizing.Shares, price),
+			map[string]any{
+				"shares":               sizing.Shares,
+				"price":                price,
+				"dollars":              sizing.Dollars,
+				"relative_volume":      cand.VolumeMultiple,
+				"criteria":             criteriaDetail(cand),
+				"portfolio_value":      acct.PortfolioValue,
+				"cash_before":          acct.Cash,
+				"position_size_pct":    e.cfg.Risk.PositionSizePct,
+				"open_positions_after": openCount + 1,
+			})
 		openSymbols[cand.Symbol] = true
 		tradedToday[cand.Symbol] = true
 		openCount++
 	}
-	return nil
+	return outcomes, nil
 }
 
 // managePositions updates high-water marks and applies the exit rules. When
@@ -609,6 +860,20 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 		e.log.Info("exited position", "symbol", p.Symbol, "reason", decision.Reason,
 			"entry", p.EntryPrice, "exit", exitPrice,
 			"pct", fmt.Sprintf("%+.2f", p.UnrealizedPct(exitPrice)))
+		e.record(audit.PositionClosed, p.Symbol,
+			fmt.Sprintf("sold %d shares at $%.2f (%s), %+.2f%%",
+				p.Shares, exitPrice, decision.Reason, p.UnrealizedPct(exitPrice)),
+			map[string]any{
+				"reason":      string(decision.Reason),
+				"shares":      p.Shares,
+				"entry_price": p.EntryPrice,
+				"exit_price":  exitPrice,
+				"peak_price":  p.PeakPrice,
+				"trail_armed": p.TrailArmed,
+				"pnl_dollars": p.UnrealizedDollars(exitPrice),
+				"pnl_pct":     p.UnrealizedPct(exitPrice),
+				"held_for":    e.now().Sub(p.EntryTime).String(),
+			})
 	}
 	return nil
 }

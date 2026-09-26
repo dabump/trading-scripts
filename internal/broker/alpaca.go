@@ -26,17 +26,56 @@ type Alpaca struct {
 	secret  string
 	baseURL string
 	dataURL string
-	http    *http.Client
+	// feed selects the market data feed: "sip" for the full consolidated tape or
+	// "iex" for the free single-exchange feed. It matters more than it looks:
+	// IEX carries only a few percent of consolidated volume, so a relative-volume
+	// criterion computed from it measures IEX activity rather than the market's.
+	feed string
+	http *http.Client
 }
 
-func NewAlpaca(s *config.Secrets) *Alpaca {
+func NewAlpaca(s *config.Secrets, feed string) *Alpaca {
 	return &Alpaca{
 		keyID:   s.APIKey,
 		secret:  s.APISecret,
 		baseURL: strings.TrimRight(s.BaseURL, "/"),
 		dataURL: strings.TrimRight(s.DataURL, "/"),
-		http:    &http.Client{Timeout: 15 * time.Second},
+		feed:    feed,
+		http:    &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// snapshotBatchSize bounds how many symbols go into one snapshots request. The
+// endpoint documents no cap, but the symbols travel in the query string, so a
+// full-universe call would build a URL tens of kilobytes long and risk rejection
+// by any proxy in between.
+const snapshotBatchSize = 500
+
+// TradableAssets lists active, tradable US equities on the main exchanges.
+//
+// OTC venues are excluded: the strategy screens for liquid intraday momentum, and
+// OTC names combine poor data quality with spreads that make a market order a bad
+// idea. The result is stable enough to cache for the trading day.
+func (a *Alpaca) TradableAssets(ctx context.Context) ([]string, error) {
+	u := a.baseURL + "/v2/assets?status=active&asset_class=us_equity"
+
+	var resp []struct {
+		Symbol   string `json:"symbol"`
+		Tradable bool   `json:"tradable"`
+		Exchange string `json:"exchange"`
+	}
+	if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+		return nil, err
+	}
+
+	allowed := map[string]bool{"NYSE": true, "NASDAQ": true, "AMEX": true, "ARCA": true, "BATS": true}
+	out := make([]string, 0, len(resp))
+	for _, asset := range resp {
+		if asset.Tradable && allowed[asset.Exchange] {
+			out = append(out, asset.Symbol)
+		}
+	}
+	return out, nil
 }
 
 func (a *Alpaca) do(ctx context.Context, method, rawURL string, body io.Reader, out any) error {
@@ -108,11 +147,29 @@ func (b alpacaBar) toDomain() domain.Bar {
 }
 
 func (a *Alpaca) Snapshots(ctx context.Context, symbols []string) (map[string]domain.Snapshot, error) {
+	out := make(map[string]domain.Snapshot, len(symbols))
+	for start := 0; start < len(symbols); start += snapshotBatchSize {
+		end := start + snapshotBatchSize
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+		batch, err := a.snapshotBatch(ctx, symbols[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for sym, snap := range batch {
+			out[sym] = snap
+		}
+	}
+	return out, nil
+}
+
+func (a *Alpaca) snapshotBatch(ctx context.Context, symbols []string) (map[string]domain.Snapshot, error) {
 	if len(symbols) == 0 {
 		return map[string]domain.Snapshot{}, nil
 	}
-	u := fmt.Sprintf("%s/v2/stocks/snapshots?symbols=%s",
-		a.dataURL, url.QueryEscape(strings.Join(symbols, ",")))
+	u := fmt.Sprintf("%s/v2/stocks/snapshots?symbols=%s&feed=%s",
+		a.dataURL, url.QueryEscape(strings.Join(symbols, ",")), url.QueryEscape(a.feed))
 
 	var raw map[string]struct {
 		LatestTrade *struct {
@@ -149,9 +206,9 @@ func (a *Alpaca) Snapshots(ctx context.Context, symbols []string) (map[string]do
 }
 
 func (a *Alpaca) IntradayBars(ctx context.Context, symbol string, intervalMins int, since time.Time) ([]domain.Bar, error) {
-	u := fmt.Sprintf("%s/v2/stocks/%s/bars?timeframe=%dMin&start=%s&limit=1000&adjustment=raw",
+	u := fmt.Sprintf("%s/v2/stocks/%s/bars?timeframe=%dMin&start=%s&limit=1000&adjustment=raw&feed=%s",
 		a.dataURL, url.PathEscape(symbol), intervalMins,
-		url.QueryEscape(since.UTC().Format(time.RFC3339)))
+		url.QueryEscape(since.UTC().Format(time.RFC3339)), url.QueryEscape(a.feed))
 
 	var resp struct {
 		Bars []alpacaBar `json:"bars"`
@@ -170,8 +227,9 @@ func (a *Alpaca) AverageDailyVolume(ctx context.Context, symbol string, days int
 	// Request a wider window than `days` because weekends and holidays mean
 	// calendar days and trading days differ.
 	start := time.Now().UTC().AddDate(0, 0, -(days*2 + 10))
-	u := fmt.Sprintf("%s/v2/stocks/%s/bars?timeframe=1Day&start=%s&limit=1000&adjustment=raw",
-		a.dataURL, url.PathEscape(symbol), url.QueryEscape(start.Format(time.RFC3339)))
+	u := fmt.Sprintf("%s/v2/stocks/%s/bars?timeframe=1Day&start=%s&limit=1000&adjustment=raw&feed=%s",
+		a.dataURL, url.PathEscape(symbol), url.QueryEscape(start.Format(time.RFC3339)),
+		url.QueryEscape(a.feed))
 
 	var resp struct {
 		Bars []alpacaBar `json:"bars"`
@@ -202,58 +260,89 @@ func AverageVolumeExcludingToday(bars []alpacaBar, days int, now time.Time) floa
 	return sum / float64(n)
 }
 
-func (a *Alpaca) Movers(ctx context.Context, top int) ([]Mover, error) {
-	u := fmt.Sprintf("%s/v1beta1/screener/stocks/movers?top=%d", a.dataURL, top)
+// News pagination constants.
+const (
+	// newsPageLimit is the API maximum; asking for more is rejected.
+	newsPageLimit = 50
+	// newsSymbolBatch keeps each request's symbol list short enough that one page
+	// usually covers it. Requesting a hundred symbols against a 50-story page means
+	// a few heavily covered names consume the whole page and every other symbol
+	// looks like it has no news at all.
+	newsSymbolBatch = 25
+	// newsMaxPages bounds pagination so a malformed or repeating continuation token
+	// cannot spin forever mid-session.
+	newsMaxPages = 20
+)
 
-	var resp struct {
-		Gainers []struct {
-			Symbol        string  `json:"symbol"`
-			Price         float64 `json:"price"`
-			PercentChange float64 `json:"percent_change"`
-		} `json:"gainers"`
-	}
-	if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
-		return nil, err
-	}
-	// Only gainers matter: the strategy buys strength, never shorts weakness.
-	out := make([]Mover, 0, len(resp.Gainers))
-	for _, g := range resp.Gainers {
-		out = append(out, Mover{Symbol: g.Symbol, Price: g.Price, ChangePct: g.PercentChange})
-	}
-	return out, nil
-}
-
+// NewsCounts reports how many stories each symbol has since the given time.
+//
+// Both the batching and the pagination matter for correctness, not just speed: the
+// endpoint caps a page at 50 stories, so a single unpaginated request across a large
+// symbol list silently reports zero for most of them — which the screener reads as
+// "no catalyst" and quietly disqualifies otherwise-valid candidates.
 func (a *Alpaca) NewsCounts(ctx context.Context, symbols []string, since time.Time) (map[string]int, error) {
 	counts := make(map[string]int, len(symbols))
 	if len(symbols) == 0 {
 		return counts, nil
 	}
-	u := fmt.Sprintf("%s/v1beta1/news?symbols=%s&start=%s&limit=50",
-		a.dataURL, url.QueryEscape(strings.Join(symbols, ",")),
-		url.QueryEscape(since.UTC().Format(time.RFC3339)))
 
-	var resp struct {
-		News []struct {
-			Symbols []string `json:"symbols"`
-		} `json:"news"`
-	}
-	if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
-		return nil, err
-	}
 	requested := make(map[string]bool, len(symbols))
 	for _, s := range symbols {
 		requested[s] = true
 	}
-	for _, item := range resp.News {
-		for _, sym := range item.Symbols {
-			// A story can be tagged with symbols beyond those requested; only the
-			// ones being screened should be counted.
-			if requested[sym] {
-				counts[sym]++
-			}
+
+	for start := 0; start < len(symbols); start += newsSymbolBatch {
+		end := start + newsSymbolBatch
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+		if err := a.newsBatch(ctx, symbols[start:end], since, requested, counts); err != nil {
+			return nil, err
 		}
 	}
 	return counts, nil
+}
+
+func (a *Alpaca) newsBatch(ctx context.Context, batch []string, since time.Time, requested map[string]bool, counts map[string]int) error {
+	pageToken := ""
+	for page := 0; page < newsMaxPages; page++ {
+		u := fmt.Sprintf("%s/v1beta1/news?symbols=%s&start=%s&limit=%d",
+			a.dataURL, url.QueryEscape(strings.Join(batch, ",")),
+			url.QueryEscape(since.UTC().Format(time.RFC3339)), newsPageLimit)
+		if pageToken != "" {
+			u += "&page_token=" + url.QueryEscape(pageToken)
+		}
+
+		var resp struct {
+			News []struct {
+				Symbols []string `json:"symbols"`
+			} `json:"news"`
+			NextPageToken *string `json:"next_page_token"`
+		}
+		if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+			return err
+		}
+
+		for _, item := range resp.News {
+			for _, sym := range item.Symbols {
+				// A story can be tagged with symbols beyond those requested; only the
+				// ones being screened should be counted.
+				if requested[sym] {
+					counts[sym]++
+				}
+			}
+		}
+
+		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
+			return nil
+		}
+		if *resp.NextPageToken == pageToken {
+			// The server repeated its own token; continuing would loop forever.
+			return nil
+		}
+		pageToken = *resp.NextPageToken
+	}
+	return nil
 }
 
 func (a *Alpaca) Account(ctx context.Context) (domain.Account, error) {

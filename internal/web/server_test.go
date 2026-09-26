@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"html"
 	"io"
 	"log/slog"
@@ -27,10 +28,30 @@ type stubEngine struct {
 func (s *stubEngine) State() (domain.AgentState, string) { return s.state, s.errMsg }
 func (s *stubEngine) Session() (scheduler.Session, bool) { return s.session, s.tradingDay }
 
+// stubActions stands in for the engine's manual checks.
+type stubActions struct {
+	check   domain.SentimentCheck
+	preview domain.ScreenPreview
+	err     error
+	calls   int
+}
+
+func (a *stubActions) CheckSentiment(context.Context) (domain.SentimentCheck, error) {
+	a.calls++
+	return a.check, a.err
+}
+
+func (a *stubActions) ScreenNow(context.Context) (domain.ScreenPreview, error) {
+	a.calls++
+	return a.preview, a.err
+}
+
 func testConfig() *config.Config {
 	c := &config.Config{}
-	c.Screening = config.Screening{MaxFloatShares: 1e7, MinIntradayPct: 10,
-		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, FloatProvider: "none"}
+	c.MarketData = config.MarketData{Feed: "sip"}
+	c.Screening = config.Screening{MinIntradayPct: 10,
+		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
+		NewsLookback: 18 * time.Hour}
 	c.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
 	c.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, MACDFast: 5, MACDSlow: 10,
 		MACDSignal: 3, MACDIntervalMins: 15, EODExitOffsetMins: 30}
@@ -42,13 +63,13 @@ func testConfig() *config.Config {
 }
 
 type fixture struct {
-	srv            *Server
-	store          *store.Store
-	eng            *stubEngine
-	cfg            *config.Config
-	now            time.Time
-	date           string
-	floatAvailable bool
+	srv     *Server
+	store   *store.Store
+	eng     *stubEngine
+	cfg     *config.Config
+	now     time.Time
+	date    string
+	actions *stubActions
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -61,8 +82,9 @@ func newFixture(t *testing.T) *fixture {
 
 	open := time.Date(2026, 9, 28, 9, 30, 0, 0, scheduler.ET)
 	f := &fixture{
-		store: st, cfg: testConfig(), date: "2026-09-28", floatAvailable: true,
-		now: time.Date(2026, 9, 28, 11, 0, 0, 0, scheduler.ET),
+		store: st, cfg: testConfig(), date: "2026-09-28",
+		actions: &stubActions{},
+		now:     time.Date(2026, 9, 28, 11, 0, 0, 0, scheduler.ET),
 		eng: &stubEngine{
 			state:      domain.StateScreening,
 			tradingDay: true,
@@ -71,8 +93,8 @@ func newFixture(t *testing.T) *fixture {
 		},
 	}
 
-	srv, err := NewServer(f.cfg, st, f.eng, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		func() time.Time { return f.now }, true, f.floatAvailable)
+	srv, err := NewServer(f.cfg, st, f.eng, f.actions, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return f.now }, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +110,13 @@ func (f *fixture) get(t *testing.T, path string) (int, string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	return rec.Code, html.UnescapeString(rec.Body.String())
+}
+
+func (f *fixture) post(t *testing.T, path string) (int, string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
 	return rec.Code, html.UnescapeString(rec.Body.String())
 }
 
@@ -160,7 +189,6 @@ func TestScreeningTableShowsPerCriterionValues(t *testing.T) {
 		{
 			Symbol: "ABCD", Qualifies: true, VolumeMultiple: 6.1,
 			Criteria: []domain.Criterion{
-				{Name: "Float", Pass: true, Display: "4.2M"},
 				{Name: "News catalyst", Pass: true, Display: "2 today"},
 				{Name: "Intraday move", Pass: true, Display: "+14.0%"},
 				{Name: "Rel. volume", Pass: true, Display: "6.1x"},
@@ -169,7 +197,6 @@ func TestScreeningTableShowsPerCriterionValues(t *testing.T) {
 		{
 			Symbol: "WXYZ", Qualifies: false, FailReason: "fails: News catalyst",
 			Criteria: []domain.Criterion{
-				{Name: "Float", Pass: true, Display: "8.9M"},
 				{Name: "News catalyst", Pass: false, Display: "0 today"},
 				{Name: "Intraday move", Pass: true, Display: "+11.0%"},
 				{Name: "Rel. volume", Pass: true, Display: "5.3x"},
@@ -181,9 +208,9 @@ func TestScreeningTableShowsPerCriterionValues(t *testing.T) {
 
 	_, body := f.get(t, "/")
 	for _, want := range []string{
-		"Float", "News catalyst", "Intraday move", "Rel. volume",
-		"4.2M", "2 today", "+14.0%", "6.1x", // values, not just ticks
-		"8.9M", "0 today",
+		"News catalyst", "Intraday move", "Rel. volume",
+		"2 today", "+14.0%", "6.1x", // values, not just ticks
+		"0 today",
 		"Qualifies", "fails: News catalyst",
 	} {
 		if !strings.Contains(body, want) {
@@ -261,23 +288,6 @@ func TestEndOfDaySectionTiming(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("end-of-day summary missing %q", want)
 		}
-	}
-}
-
-// A misconfigured float provider means nothing can ever qualify; the page has to
-// say so rather than looking like a quiet market.
-func TestFloatProviderWarningShown(t *testing.T) {
-	f := newFixture(t)
-	f.floatAvailable = false
-	srv, err := NewServer(f.cfg, f.store, f.eng, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		func() time.Time { return f.now }, true, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.srv = srv
-	_, body := f.get(t, "/")
-	if !strings.Contains(body, "Screening cannot qualify anything") {
-		t.Error("expected a warning that the float criterion always fails")
 	}
 }
 

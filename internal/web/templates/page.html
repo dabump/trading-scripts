@@ -137,6 +137,42 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
 .totals .value { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums;
   font-family: ui-monospace, Menlo, monospace; }
 
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+button.act {
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  padding: 7px 14px; border-radius: 8px; color: var(--text);
+  background: var(--panel-2); border: 1px solid var(--line);
+  display: inline-flex; align-items: center; gap: 7px;
+}
+button.act:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+  color: var(--accent);
+}
+button.act:disabled { opacity: .55; cursor: progress; }
+button.act .k { font-size: 11px; color: var(--muted); }
+
+dialog.modal {
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 0;
+  background: var(--panel); color: var(--text);
+  width: min(920px, calc(100vw - 32px)); max-height: 85vh; overflow: auto;
+}
+dialog.modal::backdrop { background: rgba(4, 7, 11, .72); }
+dialog.modal .mhead {
+  display: flex; justify-content: space-between; align-items: center; gap: 16px;
+  padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--panel-2);
+  position: sticky; top: 0;
+}
+dialog.modal .mhead h3 { margin: 0; font-size: 15px; }
+dialog.modal .mhead .meta { color: var(--muted); font-size: 12px; }
+dialog.modal .mbody { padding: 16px 18px; }
+dialog.modal .close {
+  font: inherit; cursor: pointer; background: none; border: 1px solid var(--line);
+  color: var(--muted); border-radius: 6px; padding: 4px 10px;
+}
+dialog.modal .close:hover { color: var(--text); }
+.verdict-line { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
+.kv { color: var(--muted); font-size: 12px; margin: 0; }
+
 footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px;
   display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 </style>
@@ -145,11 +181,49 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px;
 <div class="wrap">
   <div id="content">{{template "content" .}}</div>
   <footer class="foot">
-    <span>Read-only status page. The agent makes its decisions independently of this view.</span>
+    <span>The agent trades on its own schedule; the buttons above only inspect, they never order.</span>
     <span>Refreshing every {{.PollSeconds}}s</span>
   </footer>
+  <dialog class="modal" id="modal">
+    <div id="modal-content"></div>
+  </dialog>
 </div>
 <script>
+// Manual checks. Both endpoints return rendered HTML, so the modal's markup lives
+// in the Go template like everything else rather than being rebuilt here.
+const modal = document.getElementById('modal');
+const modalContent = document.getElementById('modal-content');
+
+function closeModal() { if (modal.open) modal.close(); }
+modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-close-modal]')) closeModal();
+});
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button.act');
+  if (!btn) return;
+  const endpoint = btn.dataset.action;
+
+  // Disable every action while one is in flight: the server refuses concurrent
+  // runs anyway, and a greyed-out button explains the wait better than an error.
+  const buttons = document.querySelectorAll('button.act');
+  buttons.forEach(b => b.disabled = true);
+  modalContent.innerHTML = '<div class="mhead"><h3>Working…</h3></div>' +
+    '<div class="mbody"><p class="note">Querying market data.</p></div>';
+  if (!modal.open) modal.showModal();
+
+  try {
+    const res = await fetch(endpoint, { method: 'POST', headers: { 'Accept': 'text/html' } });
+    modalContent.innerHTML = await res.text();
+  } catch (err) {
+    modalContent.innerHTML = '<div class="mhead"><h3>Check failed</h3></div>' +
+      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
+});
+
 // Re-fetches the rendered fragment and swaps it in, so the markup is produced in
 // exactly one place (the Go template) rather than duplicated in JS.
 const POLL_MS = {{.PollSeconds}} * 1000;
@@ -179,6 +253,14 @@ setInterval(refresh, POLL_MS);
     <span class="badge {{.StateTone}}">
       <span class="icon">{{.StateIcon}}</span>{{.State}}
     </span>
+    <div class="actions">
+      <button class="act" type="button" data-action="actions/sentiment">
+        Check sentiment <span class="k">read-only</span>
+      </button>
+      <button class="act" type="button" data-action="actions/screen">
+        Screen candidates <span class="k">read-only</span>
+      </button>
+    </div>
   </div>
 </header>
 
@@ -187,9 +269,6 @@ setInterval(refresh, POLL_MS);
 {{end}}
 {{if .HaltReason}}
 <div class="alert soft"><strong>■ Halted for the session:</strong> {{.HaltReason}}</div>
-{{end}}
-{{if .FloatNote}}
-<div class="alert soft"><strong>Screening cannot qualify anything:</strong> {{.FloatNote}}</div>
 {{end}}
 
 <div class="grid two" style="margin-bottom:16px">
@@ -264,7 +343,7 @@ setInterval(refresh, POLL_MS);
   {{if .ScreenRows}}
   <table>
     <thead>
-      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num">{{.}}</th>{{end}}<th>Verdict</th></tr>
+      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num">{{.}}</th>{{end}}<th>Verdict</th><th>Action</th></tr>
     </thead>
     <tbody>
       {{range .ScreenRows}}
@@ -278,6 +357,7 @@ setInterval(refresh, POLL_MS);
         </td>
         {{end}}
         <td>{{if .Qualifies}}<span class="pill good">Qualifies</span>{{else}}<span class="muted">{{.Verdict}}</span>{{end}}</td>
+        <td>{{if .Outcome}}<span class="{{.OutcomeTone}}">{{.Outcome}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
       </tr>
       {{end}}
     </tbody>
@@ -320,4 +400,77 @@ setInterval(refresh, POLL_MS);
   {{end}}
 </section>
 {{end}}
+{{end}}
+
+{{define "modalHead"}}
+<div class="mhead">
+  <h3>{{.Title}}</h3>
+  <span class="meta">{{.TakenAt}}</span>
+  <button class="close" type="button" data-close-modal>Close</button>
+</div>
+{{end}}
+
+{{define "sentimentModal"}}
+{{template "modalHead" .}}
+<div class="mbody">
+  <p class="verdict-line {{.Tone}}">{{.Classification}}</p>
+  <p class="kv">{{.Verdict}}</p>
+  <p class="kv">Rule: {{.Threshold}}. Nothing was recorded — this check cannot change the session's gate.</p>
+  <table style="margin-top:14px">
+    <thead><tr><th>Index</th><th class="num">Change vs. previous close</th></tr></thead>
+    <tbody>
+      {{range .Rows}}
+      <tr><td class="sym">{{.Symbol}}</td><td class="num {{.Tone}}">{{.Change}}</td></tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{if .Missing}}
+  <div class="alert soft" style="margin-top:14px">No usable data for: {{range $i, $s := .Missing}}{{if $i}}, {{end}}{{$s}}{{end}}</div>
+  {{end}}
+</div>
+{{end}}
+
+{{define "screenModal"}}
+{{template "modalHead" .}}
+<div class="mbody">
+  {{if not .MarketOpen}}
+  <div class="alert soft">
+    The exchange is closed, so prices, percentages and volumes describe the last session rather
+    than a live move.
+  </div>
+  {{end}}
+  <p class="kv">Scanned {{.UniverseSize}} symbols · {{.Evaluated}} cleared the move filter · {{.PassCount}} qualified · nothing was ordered or saved.</p>
+  {{if .Rows}}
+  <table style="margin-top:14px">
+    <thead>
+      <tr><th>Symbol</th>{{range .Columns}}<th class="num">{{.}}</th>{{end}}<th>Result</th></tr>
+    </thead>
+    <tbody>
+      {{range .Rows}}
+      <tr>
+        <td class="sym">{{.Symbol}}</td>
+        {{range .Cells}}
+        <td class="num">
+          <span class="crit {{if .Pass}}pass{{else}}fail{{end}}">
+            <span class="mark">{{if .Pass}}✓{{else}}✕{{end}}</span>{{.Display}}
+          </span>
+        </td>
+        {{end}}
+        <td>{{if .Qualifies}}<span class="pill good">{{.Verdict}}</span>{{else}}<span class="muted">{{.Verdict}}</span>{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="note" style="margin-top:12px">The movers list came back empty, so there was nothing to evaluate.</p>
+  {{end}}
+</div>
+{{end}}
+
+{{define "actionError"}}
+<div class="mhead">
+  <h3>Check failed</h3>
+  <button class="close" type="button" data-close-modal>Close</button>
+</div>
+<div class="mbody"><div class="alert">{{.}}</div></div>
 {{end}}

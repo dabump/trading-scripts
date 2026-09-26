@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,16 +16,21 @@ type Fake struct {
 	mu sync.Mutex
 
 	acct      domain.Account
-	movers    []Mover
+	assets    []string
 	snaps     map[string]domain.Snapshot
 	bars      map[string][]domain.Bar
 	news      map[string]int
-	floats    map[string]float64
 	avgVolume map[string]float64
 	day       CalendarDay
 	positions map[string]BrokerPosition
 	placed    []OrderRequest
 	err       error
+
+	// Call counters, so tests can assert the scan's cost profile: a full-market
+	// scan is only affordable if the expensive per-symbol calls stay rare.
+	assetCalls     int
+	avgVolumeCalls map[string]int
+	newsSince      time.Time
 }
 
 func NewFake(acct domain.Account) *Fake {
@@ -33,9 +39,10 @@ func NewFake(acct domain.Account) *Fake {
 		snaps:     map[string]domain.Snapshot{},
 		bars:      map[string][]domain.Bar{},
 		news:      map[string]int{},
-		floats:    map[string]float64{},
 		avgVolume: map[string]float64{},
 		positions: map[string]BrokerPosition{},
+
+		avgVolumeCalls: map[string]int{},
 	}
 }
 
@@ -52,10 +59,49 @@ func (f *Fake) SetCalendar(day CalendarDay) {
 	f.day = day
 }
 
-func (f *Fake) SetMovers(movers ...Mover) {
+// SetAssets defines the tradable universe the screener will scan.
+func (f *Fake) SetAssets(symbols ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.movers = movers
+	f.assets = symbols
+}
+
+func (f *Fake) TradableAssets(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.assetCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]string(nil), f.assets...), nil
+}
+
+// AssetCalls reports how many times the universe was fetched.
+func (f *Fake) AssetCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.assetCalls
+}
+
+// NewsSince reports the start of the window the last news query asked for, so a
+// test can assert the catalyst search reaches back past the market open.
+func (f *Fake) NewsSince() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.newsSince
+}
+
+// EnrichedSymbols lists the symbols that incurred an average-volume lookup, which
+// is the expensive per-symbol step the screen tries to avoid.
+func (f *Fake) EnrichedSymbols() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.avgVolumeCalls))
+	for sym := range f.avgVolumeCalls {
+		out = append(out, sym)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // SetSnapshot sets a symbol's price and volume. Percentage change is derived so
@@ -70,6 +116,11 @@ func (f *Fake) SetSnapshot(symbol string, price, prevClose, volume float64) {
 		snap.IntradayPct = (price - prevClose) / prevClose * 100
 	}
 	f.snaps[symbol] = snap
+	if !slices.Contains(f.assets, symbol) {
+		// A symbol with market data is implicitly part of the universe, so tests
+		// don't have to declare it twice.
+		f.assets = append(f.assets, symbol)
+	}
 	if p, ok := f.positions[symbol]; ok {
 		p.CurrentPrice = price
 		f.positions[symbol] = p
@@ -102,12 +153,6 @@ func (f *Fake) SetNews(symbol string, count int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.news[symbol] = count
-}
-
-func (f *Fake) SetFloat(symbol string, shares float64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.floats[symbol] = shares
 }
 
 // Placed returns every order submitted so far.
@@ -144,6 +189,7 @@ func (f *Fake) IntradayBars(_ context.Context, symbol string, _ int, _ time.Time
 func (f *Fake) AverageDailyVolume(_ context.Context, symbol string, _ int) (float64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.avgVolumeCalls[symbol]++
 	if f.err != nil {
 		return 0, f.err
 	}
@@ -159,22 +205,10 @@ func (f *Fake) SetAverageVolume(symbol string, v float64) {
 	f.avgVolume[symbol] = v
 }
 
-func (f *Fake) Movers(_ context.Context, top int) ([]Mover, error) {
+func (f *Fake) NewsCounts(_ context.Context, symbols []string, since time.Time) (map[string]int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.err != nil {
-		return nil, f.err
-	}
-	out := append([]Mover(nil), f.movers...)
-	if top > 0 && len(out) > top {
-		out = out[:top]
-	}
-	return out, nil
-}
-
-func (f *Fake) NewsCounts(_ context.Context, symbols []string, _ time.Time) (map[string]int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.newsSince = since
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -183,16 +217,6 @@ func (f *Fake) NewsCounts(_ context.Context, symbols []string, _ time.Time) (map
 		out[s] = f.news[s]
 	}
 	return out, nil
-}
-
-func (f *Fake) FloatShares(_ context.Context, symbol string) (float64, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return 0, false, f.err
-	}
-	v, ok := f.floats[symbol]
-	return v, ok, nil
 }
 
 func (f *Fake) Account(context.Context) (domain.Account, error) {

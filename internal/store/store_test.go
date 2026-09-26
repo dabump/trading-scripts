@@ -229,7 +229,7 @@ func TestScreenSnapshotKeepsOnlyLatest(t *testing.T) {
 	first := []domain.Evaluation{{Symbol: "AAAA", Qualifies: false, FailReason: "fails: News catalyst"}}
 	second := []domain.Evaluation{
 		{Symbol: "BBBB", Qualifies: true, VolumeMultiple: 6.1,
-			Criteria: []domain.Criterion{{Name: "Float", Pass: true, Display: "4.2M"}}},
+			Criteria: []domain.Criterion{{Name: "Rel. volume", Pass: true, Display: "6.1x"}}},
 	}
 
 	if err := s.SaveScreenSnapshot("2026-09-28", t0, first); err != nil {
@@ -249,7 +249,7 @@ func TestScreenSnapshotKeepsOnlyLatest(t *testing.T) {
 	if !at.Equal(t0.Add(time.Minute)) {
 		t.Errorf("taken at = %v, want %v", at, t0.Add(time.Minute))
 	}
-	if len(got[0].Criteria) != 1 || got[0].Criteria[0].Display != "4.2M" {
+	if len(got[0].Criteria) != 1 || got[0].Criteria[0].Display != "6.1x" {
 		t.Errorf("criteria lost in round trip: %+v", got[0].Criteria)
 	}
 

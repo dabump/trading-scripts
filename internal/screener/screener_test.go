@@ -10,7 +10,6 @@ import (
 
 func cfg() *config.Config {
 	c := &config.Config{}
-	c.Screening.MaxFloatShares = 10_000_000
 	c.Screening.MinIntradayPct = 10
 	c.Screening.MinVolumeMultiple = 5
 	return c
@@ -20,8 +19,7 @@ func cfg() *config.Config {
 func passing() Input {
 	return Input{
 		Symbol: "ABCD", Price: 4.20, IntradayPct: 14,
-		TodayVolume: 6_100_000, AvgVolume: 1_000_000,
-		FloatShares: 4_200_000, FloatKnown: true, NewsCount: 2,
+		TodayVolume: 6_100_000, AvgVolume: 1_000_000, NewsCount: 2,
 	}
 }
 
@@ -32,22 +30,7 @@ func TestEvaluateAllCriteriaMustPass(t *testing.T) {
 		wantPass   bool
 		wantFailed string
 	}{
-		{"all four criteria pass", func(*Input) {}, true, ""},
-		{
-			"float at the limit fails (strictly less than)",
-			func(in *Input) { in.FloatShares = 10_000_000 },
-			false, CriterionFloat,
-		},
-		{
-			"float just under the limit passes",
-			func(in *Input) { in.FloatShares = 9_999_999 },
-			true, "",
-		},
-		{
-			"unknown float fails closed",
-			func(in *Input) { in.FloatKnown = false; in.FloatShares = 0 },
-			false, CriterionFloat,
-		},
+		{"all three criteria pass", func(*Input) {}, true, ""},
 		{
 			"no news fails",
 			func(in *Input) { in.NewsCount = 0 },
@@ -90,8 +73,8 @@ func TestEvaluateAllCriteriaMustPass(t *testing.T) {
 				t.Fatalf("Qualifies = %v, want %v (%s)", got.Qualifies, tt.wantPass, got.FailReason)
 			}
 			// Every criterion is always reported so the UI can show the breakdown.
-			if len(got.Criteria) != 4 {
-				t.Errorf("got %d criteria, want all 4 reported regardless of outcome", len(got.Criteria))
+			if len(got.Criteria) != 3 {
+				t.Errorf("got %d criteria, want all 3 reported regardless of outcome", len(got.Criteria))
 			}
 			if !tt.wantPass && !strings.Contains(got.FailReason, tt.wantFailed) {
 				t.Errorf("FailReason = %q, want it to name %q", got.FailReason, tt.wantFailed)
@@ -104,7 +87,6 @@ func TestEvaluateAllCriteriaMustPass(t *testing.T) {
 func TestEvaluateReportsValues(t *testing.T) {
 	got := Evaluate(passing(), cfg())
 	want := map[string]string{
-		CriterionFloat:  "4.2M",
 		CriterionNews:   "2 today",
 		CriterionMove:   "+14.0%",
 		CriterionVolume: "6.1x",
@@ -115,13 +97,6 @@ func TestEvaluateReportsValues(t *testing.T) {
 		}
 	}
 
-	unknown := passing()
-	unknown.FloatKnown = false
-	for _, c := range Evaluate(unknown, cfg()).Criteria {
-		if c.Name == CriterionFloat && c.Display != "unknown" {
-			t.Errorf("unknown float display = %q, want %q", c.Display, "unknown")
-		}
-	}
 }
 
 func TestQualifyingRanksByRelativeVolume(t *testing.T) {

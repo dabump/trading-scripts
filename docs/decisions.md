@@ -24,8 +24,8 @@ A dated record of decisions made during design, and why — so the reasoning beh
 
 | Decision | Rationale |
 |---|---|
-| Screening criteria: float < 10,000,000 shares, a same-day news catalyst, ≥10% intraday move, ≥5x average volume | User-specified directly; replaces the earlier open "market cap range" placeholder with a float-based criterion instead. |
-| All four criteria required simultaneously (AND), not scored/weighted | Matches how the user described the requirement ("before purchasing... already up by 10%... and 5x above average volume") — a hard gate, not a ranking. |
+| Screening criteria: a same-day news catalyst, ≥10% intraday move, ≥5x average volume | User-specified directly, replacing the earlier open "market cap range" placeholder. Note that nothing in the final set filters on company size. |
+| All criteria required simultaneously (AND), not scored/weighted | Matches how the user described the requirement ("before purchasing... already up by 10%... and 5x above average volume") — a hard gate, not a ranking. |
 | News catalyst = presence of a same-day headline only, no sentiment/NLP scoring | User chose the simpler v1 option; the price/volume move itself is treated as confirmation the news is what's moving the stock, not the headline's tone. |
 | Screening starts only after the first-hour sentiment gate passes; no background screening during the no-trade hour | User chose the simpler option over running screening during hour 1 and queuing candidates. |
 
@@ -43,7 +43,7 @@ A dated record of decisions made during design, and why — so the reasoning beh
 |---|---|
 | Two separate header indicators: market-hours badge (green/red) and agent-status badge (5-state legend) | These can diverge (e.g. market open but agent in its no-trade first hour) — merging them into one indicator would hide that distinction. |
 | Agent status states: `MARKET_CLOSED`, `SENTIMENT_CHECK`, `SCREENING`, `HALTED_BEARISH`, `ERROR` | Proposed by Claude, accepted by user. `ERROR` is deliberately kept visually distinct from `HALTED_BEARISH` (both red) since one is a fault and the other a deliberate risk decision. |
-| Screening table shows a per-criterion breakdown (float/news/%-move/volume), not just overall pass/fail | User chose this explicitly — makes it possible to see *why* a candidate qualified or didn't, not just whether it did. |
+| Screening table shows a per-criterion breakdown (news / %-move / volume), not just overall pass/fail | User chose this explicitly — makes it possible to see *why* a candidate qualified or didn't, not just whether it did. |
 | Open positions show current price + unrealized P&L, in addition to the originally-specified purchase price + share count | User confirmed adding this — a position's cost basis without live performance would require checking elsewhere for the number that matters day-to-day. |
 | End-of-day summary scope is today's session only, not a browsable multi-day history | User chose the simpler v1 option; multi-day browsing flagged as a possible later addition below. |
 
@@ -54,7 +54,7 @@ A full read-through of the spec surfaced several gaps. Resolutions below; unreso
 | Decision | Rationale |
 |---|---|
 | Neutral/ambiguous first-hour sentiment is treated the same as bullish (proceeds to screening), not the same as bearish | User's explicit choice. Only a clear overwhelmingly-bearish reading halts trading now — `strategy.md`'s three-way classification collapsed to a two-way one (overwhelmingly bearish vs. not). |
-| Candidate universe: try Alpaca's most-actives/screener data first, before adding a dedicated screener API | Consistent with the "try Alpaca first" pattern already used for float/news data. Not yet confirmed sufficient — see open items. |
+| Candidate universe: try Alpaca's most-actives/screener data first, before adding a dedicated screener API | Consistent with the "try Alpaca first" pattern already used for news data. Superseded on 2026-09-26 — see below. |
 | MACD exit moved from the 30-minute chart to the 15-minute chart (periods unchanged: fast=5, slow=10, signal=3) | The 30-minute version needed 5 hours of same-day data to compute at all, active only in roughly the last hour before the forced EOD exit. Moving to 15-minute candles halves that to 2.5 hours. User chose this fix over shrinking the periods further or reverting to multi-day lookback. Explicitly a mitigation, not a full fix — positions closed before ~12:30pm still can't trigger this exit. |
 | PDT rule flagged as a hard blocker for live trading, not for paper trading | Account is under $25k (or funding undecided) as of this date; the strategy's up-to-5-day-trades-per-day design would trip FINRA's PDT restriction almost immediately if run live as-is. No fix chosen yet — see open items. |
 
@@ -70,7 +70,7 @@ A full read-through of the spec surfaced several gaps. Resolutions below; unreso
 
 | Decision | Rationale |
 |---|---|
-| Screener re-scans the candidate universe every 1 minute once the sentiment gate opens | User's choice over reusing the 10-minute sentiment-poll cadence or a full streaming/continuous approach — tight enough to catch fast-developing low-float moves without needing a real-time data stream. |
+| Screener re-scans the candidate universe every 1 minute once the sentiment gate opens | User's choice over reusing the 10-minute sentiment-poll cadence or a full streaming/continuous approach — tight enough to catch fast-developing moves without needing a real-time data stream. |
 
 ## 2026-09-26 — Implementation
 
@@ -82,10 +82,10 @@ gaps the design left open so the agent could run; they are working defaults in
 
 | Value | Chosen | Reasoning |
 |---|---|---|
-| Profit target / trailing stop | +15% / 5% | Plausible for a low-float momentum day-trade; no backtest supports these numbers. |
+| Profit target / trailing stop | +15% / 5% | Plausible for a momentum day-trade; no backtest supports these numbers. |
 | Average-volume lookback | 20 sessions, excluding today | 20 is the conventional window. Today is excluded because today's volume is the number being compared against the average. |
 | Sentiment classification | Avg of SPY/QQQ/IWM ≤ −0.8% **and** none positive | Needed a concrete rule to implement the gate at all. IWM is in the basket because the strategy trades small caps, so a small-cap index belongs in the read. |
-| Order type | Market | Guarantees the exits actually happen, which matters more than slippage while paper trading. The low-float slippage risk noted in the design is real and unaddressed. |
+| Order type | Market | Guarantees the exits actually happen, which matters more than slippage while paper trading. The slippage risk on thinly traded names is real and unaddressed. |
 | Tie-break when candidates exceed free slots | Highest relative volume first | Best separates a genuine liquid move from a thin drift. |
 | Same-day re-entry | Disabled | Avoids repeatedly buying back into a name that already stopped out. |
 | Universe size | Top 50 movers per scan | Bounded API cost at a one-minute cadence. |
@@ -99,7 +99,6 @@ gaps the design left open so the agent could run; they are working defaults in
 | Restart reconciliation implemented: broker positions are the authority | Closes the flagged crash-between-submit-and-confirm hole. Adopts unknown broker positions, closes vanished local ones as `RECONCILED`, resolves unconfirmed orders. |
 | New `RECONCILED` exit reason, distinct from the four strategy exits | So the end-of-day summary never attributes an operational disappearance to a strategy rule. |
 | New `EOD_WINDOW` agent state (a sixth) | The five documented states could not describe the window between the forced-exit mark and the close without either claiming the market was closed or implying entries were still possible. |
-| Float fails **closed** when unavailable | An unverifiable float is a failed criterion, never a skipped one; the alternative silently drops a documented entry requirement. `float_provider` accepts only `none`, so today nothing can qualify — and the status page says so. |
 | Starting after the first hour halts the day | With no sentiment readings the gate cannot be judged, and trading without the safety check having run was never the intent. |
 | Live trading needs `-allow-live-trading` in addition to the live base URL | The PDT constraint is unresolved; a base-URL typo should not be able to start real trading. |
 | Config is validated at startup, including exposure > 100% | These failures are much cheaper before positions are open than during a session. |
@@ -128,13 +127,120 @@ available, so the client was tested against a stub server that returns
 Alpaca-shaped JSON. The first real paper-trading run is the actual verification of
 the endpoints themselves.
 
+## 2026-09-26 — Manual check buttons (via `grill-me`)
+
+| Decision | Rationale |
+|---|---|
+| Two header buttons: manual sentiment check and manual candidate screen, results in an in-page modal | User request. Modal over a real popup window: `window.open` is blocked by default in most browsers and would duplicate the theme. |
+| Both are strictly evaluate-and-display; neither can place an order | User's explicit choice. Enforced in the engine rather than the handler: the manual screen reuses the gathering and evaluation code but never calls the entry logic. The automated screening path *does* buy, so wiring a button straight to it would have placed orders — and the button was asked to work with the market closed, which is when that would be worst. |
+| A manual sentiment check is never persisted | User's explicit choice. The gate verdict is decided by the newest stored reading, so a persisted manual check could overturn what the first hour concluded. |
+| Manual screening works with the exchange closed, with a stale-data warning | Explicitly requested. Prices and volumes then describe the last session, which the modal says rather than presenting them as live. |
+| POST-only endpoints, one-at-a-time per action | A GET would let a prefetch or crawler trigger upstream work; the in-flight guard stops impatient clicking from becoming a rate-limit problem. |
+| A failed manual check does not put the agent into `ERROR` | A failed button press is the clicker's problem, not a fault in the trading loop; the error is shown in the modal where the user is looking. |
+
+This is a change to a documented contract: `web-ui.md` and `architecture.md`
+previously described the page as read-only and said it never drives decisions. It
+still never trades, but it is now an actuator for read-only checks, and both docs
+say so.
+
+## 2026-09-26 — Screening reduced to three criteria (via `grill-me`)
+
+| Decision | Rationale |
+|---|---|
+| Screening is a news catalyst, a ≥10% intraday move and ≥5x average volume — three criteria, with no size or liquidity filter | The size criterion originally specified could not be sourced from Alpaca, and the user chose to drop it rather than take on a second data provider. |
+| Nothing replaces it — no price ceiling, no market-cap proxy | User's explicit choice when offered substitutes. |
+| The removed configuration, interfaces and evaluation variants were deleted rather than left dormant | A disabled-but-present criterion is worse than an absent one: it implies a check that is not happening. |
+| The manual screening modal says "Qualifies" | It applies the same three criteria as the automated scan, so any hedged wording would understate what it means. |
+
+**This changes what the strategy is.** The size criterion was what made this a
+small-cap strategy. The screen is now "any stock up ≥10% on ≥5x volume with a
+same-day news catalyst", which admits large caps — and since the universe is
+Alpaca's top gainers across all market caps, nothing restricts it to small names
+despite the project still being described that way in places.
+
+**It also unblocks trading.** The unsourceable criterion was the only thing making
+every candidate fail, so the agent could not previously open a position at all. It
+now can, which raises the stakes on the two things still unverified: the Alpaca
+endpoint paths/payloads (never exercised against a real account) and the unresolved
+PDT constraint.
+
+## 2026-09-26 — Full-market scanning (via `grill-me`)
+
+The user asked why the scanner only looked at 50 stocks. It was a fair challenge:
+50 was a `PROPOSED` bound Claude picked to limit API cost, and it turned out to be
+both unraisable and the wrong selection rule.
+
+| Decision | Rationale |
+|---|---|
+| Scan every active, tradable US equity instead of Alpaca's market-movers endpoint | Verified against Alpaca's docs: `top` on the movers endpoint is hard-capped at 50, so the cap could not be raised at all. On an active day far more than 50 names clear +10%, so the list was being silently truncated. |
+| Exclude OTC venues from the universe | The strategy needs liquid intraday momentum; OTC combines poor data quality with spreads that make a market order a bad idea. |
+| Cache the universe once per session | The tradable asset list barely changes within a day, so re-fetching it on every one-minute scan would be pure waste. |
+| Snapshots are batched internally (500 symbols per request) | The symbols travel in the query string; a full-universe call in one request would build a URL tens of kilobytes long and risk rejection by any proxy in between. |
+| When more names clear the move filter than `max_enriched`, keep the busiest by **dollar volume** | This is the user's chosen fix for the ranking mismatch. The movers endpoint ordered by percentage change while the strategy ranks entries by relative volume, so the old behaviour would discard a heavily traded +11% name in favour of a thin +40% one. A test verifies this: it fails under the old %-change sort. |
+| `market_data.feed` added, set to `sip` | The account is on Algo Trader Plus. This is load-bearing rather than cosmetic: Alpaca's free tier is IEX-only, carrying a few percent of consolidated volume, and a relative-volume criterion computed from it compares one exchange's activity against a market-wide average. The daemon warns loudly if configured to `iex`. |
+| `universe_size` replaced by `max_enriched`, and `Movers` deleted from the broker interface | The old key described a cap that no longer exists; leaving the movers code dormant would imply a discovery path that is not used. |
+
+**Cost profile of the change.** The scan is affordable because the cheap filter runs
+first: batched snapshots cover the whole market in a couple of dozen requests, and
+only the handful clearing the move threshold incur per-symbol news and
+average-volume calls. A test asserts that symbols failing the move filter are never
+enriched.
+
+## 2026-09-26 — News catalyst was broken in two ways (via `grill-me`)
+
+The user reported that every candidate showed no news catalyst. Both causes were
+real bugs, each independently capable of producing that symptom.
+
+| Bug | Cause | Fix |
+|---|---|---|
+| Most symbols reported zero news | The news endpoint caps a page at **50 stories** (verified against Alpaca's docs) and the implementation requested a single unpaginated page for up to 100 symbols. Sorted newest-first, the 50-story budget was consumed by whichever few names are heavily covered, so every other symbol looked newsless. | Symbols are now batched 25 per request and each batch is paginated via `next_page_token`, with a page cap and a repeated-token guard so a malformed token cannot spin forever. |
+| Pre-market catalysts were invisible | The search window started at the session open (09:30 ET). The catalyst behind a gap-up almost always breaks overnight or pre-market, so the story that *caused* the move fell outside the window — the criterion was structurally unable to see the thing it was testing for. | New `screening.news_lookback` (default 18h, measured from now, validated ≥7h). Both the automated scan and the manual button use it, so they cannot disagree. |
+
+Both fixes carry tests that were confirmed to **fail against the old code** rather
+than merely passing against the new: the pagination test showed 10 of 60 symbols
+wrongly reporting no news, and the window test showed the search starting exactly at
+09:30.
+
+**Still unverified:** this was all proven against a stub server shaped like Alpaca's
+documented responses. Whether real Alpaca news coverage is dense enough for the
+criterion to be useful in practice — and whether 18h is the right window — can only
+be judged against a live account.
+
+## 2026-09-26 — Entry pass robustness and visibility (via `grill-me`)
+
+The user asked whether the screening logic and the buy decision are the same logic.
+They are — one `screener.Evaluate` pass per scan feeds both the displayed table and
+`enterPositions`, and a test asserts the manual and automated paths agree. Checking
+it surfaced two things worth changing.
+
+| Decision | Rationale |
+|---|---|
+| A per-candidate failure skips that candidate instead of aborting the entry pass | The handling was inconsistent: a sizing failure skipped, but an unavailable price or account fetch returned an error that abandoned every remaining qualifier and faulted the agent. At a one-minute cadence a transient blip on one symbol silently cost the others their entry. Failures that are not candidate-specific still surface as `ERROR`. |
+| Each qualifying candidate's entry outcome is recorded and shown on the page | Qualifying is not the same as being bought — the cap, the re-entry rule and available cash all still apply — and the reason was previously log-only. Candidates turned away by the cap are now explained individually rather than left blank. |
+| The screening snapshot is saved *after* the entry pass | So it can carry the outcome. It is saved even when entry failed, since a pass that went wrong is exactly when the candidate table matters. |
+
+## 2026-09-26 — Audit trail (via `grill-me`)
+
+| Decision | Rationale |
+|---|---|
+| Append-only JSONL under `logs/`, one file per session date | User's choice over a SQLite table. Portable, greppable, easy to ship or archive, and it closes the gap where `operations.md` described a `logs/` directory nothing wrote to. Per-day files give rotation without any extra machinery. |
+| State changes and actions only, not every evaluation | User's choice. The screen runs every minute; auditing each evaluation would bury the events that matter. The screening snapshot in the database already answers "what did the screen see just now". |
+| Flushed to disk on every event | A trail that loses its last entries in a crash fails at the moment it is most needed. At a few dozen events a day the cost is irrelevant. |
+| `AGENT_STARTED` records the full effective configuration, minus credentials | Without it, a reader has to assume the thresholds at the time matched today's config. Credentials are excluded so the trail is safe to share. |
+| A failed audit write logs loudly but does not stop the agent | The daemon may be holding open positions, and abandoning their exits to preserve a record would be the wrong trade. Considered and rejected: halting on audit failure, which is the stricter convention but the worse outcome here. |
+| Repeating events are de-duplicated rather than dropped | A persistent fault records once until it changes or the agent recovers; a candidate skipped for the same reason records once per session. Being at the position cap turns away every remaining qualifier on every scan, which would otherwise mean hundreds of identical rows. |
+
+Found while writing the tests: candidates turned away by the position cap were
+setting a page outcome but were not being audited at all — a real gap, since "we saw
+this qualify at 11:03 but were full" is exactly what a post-mortem wants.
+
 ## Open items (not yet decided)
 
-- **Float data source — the blocker.** Alpaca does not expose share float, so the float criterion fails closed and **no candidate can currently qualify for entry**. A provider has to be chosen and implemented before the agent can trade at all. News headlines are covered by Alpaca's news endpoint and are working.
-- **Screening candidate universe** — the movers endpoint is implemented, but whether it is available on this Alpaca plan and whether the top 50 gainers cover enough of the market is unverified against a real account (`docs/strategy.md`).
+- **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.
 - **PDT rule resolution before going live** — fund above $25k, reduce trade frequency, or switch to a cash account; none chosen yet (`docs/operations.md`).
 - Review the claude-proposed values above — especially the profit target, trailing stop and sentiment thresholds, none of which rest on evidence.
-- Whether market orders are acceptable for low-float entries, or entries should use limit orders (the config supports both; `market` is the current default).
+- Whether `news_lookback` should be widened, or derived from the previous session's close, so Monday gaps driven by weekend news are not missed (`docs/strategy.md`).
+- Whether market orders are acceptable for entries on thinly traded names, or entries should use limit orders (the config supports both; `market` is the current default).
 - Whether a portfolio-level daily drawdown limit is needed alongside the per-trade stop-loss (`docs/risk.md`). Still not implemented.
 - Hosting/deployment target for the running daemon (`docs/operations.md`).
 - Whether the status page needs a browsable multi-day session history (currently scoped to today-only) (`docs/web-ui.md`).

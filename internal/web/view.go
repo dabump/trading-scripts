@@ -4,6 +4,7 @@ package web
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
@@ -57,6 +58,11 @@ type ScreenRow struct {
 	Qualifies  bool
 	Verdict    string
 	FailReason string
+	// Outcome is what the entry pass did with a qualifying candidate. Qualifying is
+	// not the same as being bought — the position cap, the same-day re-entry rule
+	// and available cash all still apply.
+	Outcome     string
+	OutcomeTone string
 }
 
 type PositionRow struct {
@@ -122,7 +128,6 @@ type View struct {
 
 	PollSeconds int
 	PaperMode   bool
-	FloatNote   string
 }
 
 func money(v float64) string { return fmt.Sprintf("$%.2f", v) }
@@ -154,7 +159,6 @@ func BuildView(
 	tradingDay bool,
 	now time.Time,
 	paperMode bool,
-	floatAvailable bool,
 ) (*View, error) {
 	date := scheduler.SessionDate(now)
 	v := &View{
@@ -260,15 +264,15 @@ func BuildView(
 		} else {
 			row.Verdict = e.FailReason
 		}
+		row.Outcome = e.Outcome
+		row.OutcomeTone = "idle"
+		if strings.HasPrefix(e.Outcome, "bought") {
+			row.OutcomeTone = "good"
+		}
 		v.ScreenRows = append(v.ScreenRows, row)
 	}
 	if len(v.ScreenRows) == 0 {
 		v.ScreenNote = "No screening pass has run yet for this session."
-	}
-	if !floatAvailable {
-		v.FloatNote = "No float data source is wired up, so the float criterion " +
-			"always fails and no candidate can ever qualify. This is the open item in " +
-			"docs/decisions.md."
 	}
 
 	open, err := st.OpenPositions()

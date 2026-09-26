@@ -5,6 +5,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -27,20 +28,27 @@ type StateSource interface {
 	Session() (scheduler.Session, bool)
 }
 
-type Server struct {
-	cfg    *config.Config
-	store  *store.Store
-	engine StateSource
-	tmpl   *template.Template
-	log    *slog.Logger
-	now    func() time.Time
-	paper  bool
-	// floatAvailable records whether a float data source is actually wired up;
-	// without one nothing can qualify, which the page has to say out loud.
-	floatAvailable bool
+// Actions are the manually triggered checks behind the page's two buttons. Both
+// are read-only by contract: they evaluate and report, never persist and never
+// place an order. Keeping that promise is the implementation's job, not the
+// handler's — see engine.CheckSentiment and engine.ScreenNow.
+type Actions interface {
+	CheckSentiment(ctx context.Context) (domain.SentimentCheck, error)
+	ScreenNow(ctx context.Context) (domain.ScreenPreview, error)
 }
 
-func NewServer(cfg *config.Config, st *store.Store, eng StateSource, logger *slog.Logger, now func() time.Time, paper, floatAvailable bool) (*Server, error) {
+type Server struct {
+	cfg     *config.Config
+	store   *store.Store
+	engine  StateSource
+	tmpl    *template.Template
+	log     *slog.Logger
+	actions Actions
+	now     func() time.Time
+	paper   bool
+}
+
+func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Actions, logger *slog.Logger, now func() time.Time, paper bool) (*Server, error) {
 	tmpl, err := template.ParseFS(templatesFS, "templates/*.html")
 	if err != nil {
 		return nil, err
@@ -51,8 +59,8 @@ func NewServer(cfg *config.Config, st *store.Store, eng StateSource, logger *slo
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, store: st, engine: eng, tmpl: tmpl, log: logger,
-		now: now, paper: paper, floatAvailable: floatAvailable}, nil
+	return &Server{cfg: cfg, store: st, engine: eng, actions: actions, tmpl: tmpl,
+		log: logger, now: now, paper: paper}, nil
 }
 
 // Handler builds the router.
@@ -61,13 +69,187 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handlePage)
 	mux.HandleFunc("/fragment", s.handleFragment)
 	mux.HandleFunc("/api/status", s.handleJSON)
+	mux.HandleFunc("/actions/sentiment", s.handleCheckSentiment)
+	mux.HandleFunc("/actions/screen", s.handleScreenNow)
 	return mux
+}
+
+// actionTimeout bounds a manual check. Screening fans out to several per-symbol
+// calls, and a hung upstream should return an error to the modal rather than
+// leaving the button spinning forever.
+const actionTimeout = 45 * time.Second
+
+// SentimentModal is what the sentiment popup renders.
+type SentimentModal struct {
+	Title          string
+	TakenAt        string
+	Rows           []SentimentModalRow
+	Classification string
+	Tone           string
+	Verdict        string
+	Missing        []string
+	Threshold      string
+	Persisted      bool
+}
+
+type SentimentModalRow struct {
+	Symbol string
+	Change string
+	Tone   string
+}
+
+// ScreenModal is what the screening popup renders.
+type ScreenModal struct {
+	Title        string
+	TakenAt      string
+	UniverseSize int
+	MarketOpen   bool
+	Columns      []string
+	Rows         []ScreenRow
+	// PassCount is how many rows qualified; Evaluated is how many symbols cleared
+	// the price-move filter and were therefore looked at in full. The gap between
+	// Evaluated and UniverseSize is the whole market that was scanned cheaply.
+	PassCount int
+	Evaluated int
+}
+
+// handleCheckSentiment runs the sentiment check and renders the modal body.
+func (s *Server) handleCheckSentiment(w http.ResponseWriter, r *http.Request) {
+	// POST only: these trigger upstream work, so a prefetch or a crawler following
+	// a link must not be able to set them off.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.actions == nil {
+		s.renderActionError(w, "Manual checks are not available.", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), actionTimeout)
+	defer cancel()
+
+	check, err := s.actions.CheckSentiment(ctx)
+	if err != nil {
+		s.log.Warn("manual sentiment check failed", "err", err)
+		s.renderActionError(w, err.Error(), http.StatusOK)
+		return
+	}
+
+	m := &SentimentModal{
+		Title:          "Sentiment check",
+		TakenAt:        check.TakenAt.In(scheduler.ET).Format("15:04:05 MST"),
+		Classification: string(check.Classification),
+		Missing:        check.Missing,
+		Threshold: fmt.Sprintf("bearish at avg ≤ %.1f%%%s",
+			s.cfg.Sentiment.BearishAvgPct,
+			map[bool]string{true: " with none positive", false: ""}[s.cfg.Sentiment.RequireAllNegative]),
+	}
+	for _, sym := range s.cfg.Sentiment.Symbols {
+		v, ok := check.Percentages[sym]
+		row := SentimentModalRow{Symbol: sym, Change: "—", Tone: "idle"}
+		if ok {
+			row.Change = pct(v)
+			row.Tone = toneForPnL(v)
+		}
+		m.Rows = append(m.Rows, row)
+	}
+	switch check.Classification {
+	case domain.VerdictBearish:
+		m.Tone, m.Verdict = "bad", "Overwhelmingly bearish — this would halt trading for the session."
+	case domain.VerdictProceed:
+		m.Tone, m.Verdict = "good", "Not overwhelmingly bearish — this would allow screening to proceed."
+	default:
+		m.Tone, m.Verdict = "idle", "Not enough data to classify."
+	}
+
+	s.renderModal(w, "sentimentModal", m)
+}
+
+// handleScreenNow runs a screening pass and renders the modal body.
+func (s *Server) handleScreenNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.actions == nil {
+		s.renderActionError(w, "Manual checks are not available.", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), actionTimeout)
+	defer cancel()
+
+	preview, err := s.actions.ScreenNow(ctx)
+	if err != nil {
+		s.log.Warn("manual screening failed", "err", err)
+		s.renderActionError(w, err.Error(), http.StatusOK)
+		return
+	}
+
+	m := &ScreenModal{
+		Title:        "Candidate screen",
+		TakenAt:      preview.TakenAt.In(scheduler.ET).Format("15:04:05 MST"),
+		UniverseSize: preview.UniverseSize,
+		MarketOpen:   preview.MarketOpen,
+	}
+	for i, e := range preview.Evaluations {
+		if i == 0 {
+			for _, c := range e.Criteria {
+				m.Columns = append(m.Columns, c.Name)
+			}
+		}
+		row := ScreenRow{Symbol: e.Symbol, Qualifies: e.Qualifies, FailReason: e.FailReason}
+		for _, c := range e.Criteria {
+			row.Cells = append(row.Cells, CriterionCell{Pass: c.Pass, Display: c.Display})
+		}
+		if e.Qualifies {
+			// The manual screen now applies exactly the criteria the automated scan
+			// does, so "qualifies" is the truth: during trading hours the agent would
+			// act on this row.
+			row.Verdict = "Qualifies"
+			m.PassCount++
+		} else {
+			row.Verdict = e.FailReason
+		}
+		m.Rows = append(m.Rows, row)
+	}
+	m.Evaluated = len(m.Rows)
+
+	s.renderModal(w, "screenModal", m)
+}
+
+func (s *Server) renderModal(w http.ResponseWriter, name string, data any) {
+	var buf bytes.Buffer
+	if err := s.tmpl.ExecuteTemplate(&buf, name, data); err != nil {
+		s.log.Error("render modal", "template", name, "err", err)
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	buf.WriteTo(w)
+}
+
+// renderActionError reports a failed check inside the modal, so an upstream
+// outage shows up where the user is looking rather than only in the log.
+func (s *Server) renderActionError(w http.ResponseWriter, msg string, status int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	var buf bytes.Buffer
+	if err := s.tmpl.ExecuteTemplate(&buf, "actionError", msg); err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+	buf.WriteTo(w)
 }
 
 func (s *Server) view() (*View, error) {
 	state, errMsg := s.engine.State()
 	sess, tradingDay := s.engine.Session()
-	return BuildView(s.cfg, s.store, state, errMsg, sess, tradingDay, s.now(), s.paper, s.floatAvailable)
+	return BuildView(s.cfg, s.store, state, errMsg, sess, tradingDay, s.now(), s.paper)
 }
 
 // render writes to a buffer first so a template error produces a clean 500

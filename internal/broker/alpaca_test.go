@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +34,7 @@ func stubAlpaca(t *testing.T, routes map[string]string) *Alpaca {
 
 	return NewAlpaca(&config.Secrets{
 		APIKey: "key", APISecret: "secret", BaseURL: srv.URL, DataURL: srv.URL,
-	})
+	}, "sip")
 }
 
 func TestSnapshotsDecoding(t *testing.T) {
@@ -116,48 +117,75 @@ func TestIntradayBarsDecoding(t *testing.T) {
 	}
 }
 
-func TestMoversOnlyReturnsGainers(t *testing.T) {
+// The tradable universe drives the whole scan, so the filtering matters: OTC and
+// untradable assets must not reach the screener.
+func TestTradableAssetsFiltersVenueAndTradability(t *testing.T) {
 	a := stubAlpaca(t, map[string]string{
-		"/v1beta1/screener/stocks/movers": `{
-			"gainers": [
-				{"symbol": "UPUP", "price": 5.5, "percent_change": 42.1},
-				{"symbol": "RISE", "price": 2.2, "percent_change": 18.0}
-			],
-			"losers": [{"symbol": "DOWN", "price": 1.1, "percent_change": -30.0}]
-		}`,
+		"/v2/assets": `[
+			{"symbol":"GOOD","tradable":true,"exchange":"NASDAQ"},
+			{"symbol":"ALSOGOOD","tradable":true,"exchange":"NYSE"},
+			{"symbol":"UNTRADABLE","tradable":false,"exchange":"NASDAQ"},
+			{"symbol":"PINKSHEET","tradable":true,"exchange":"OTC"}
+		]`,
 	})
 
-	got, err := a.Movers(context.Background(), 10)
+	got, err := a.TradableAssets(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %d movers, want 2 gainers only", len(got))
+	want := []string{"GOOD", "ALSOGOOD"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
-	for _, m := range got {
-		if m.Symbol == "DOWN" {
-			t.Error("losers must not appear: the strategy only buys strength")
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got %v, want %v", got, want)
 		}
-	}
-	if got[0].Symbol != "UPUP" || got[0].ChangePct != 42.1 {
-		t.Errorf("first mover = %+v, want UPUP at 42.1%%", got[0])
 	}
 }
 
-func TestMoversRespectsTopLimit(t *testing.T) {
-	a := stubAlpaca(t, map[string]string{
-		"/v1beta1/screener/stocks/movers": `{"gainers": [
-			{"symbol": "A", "price": 1, "percent_change": 30},
-			{"symbol": "B", "price": 1, "percent_change": 20},
-			{"symbol": "C", "price": 1, "percent_change": 10}
-		]}`,
-	})
-	got, err := a.Movers(context.Background(), 10)
+// A full-universe snapshot call must be split into batches, or the symbols would
+// build a URL long enough to be rejected in transit.
+func TestSnapshotsBatchesLargeUniverse(t *testing.T) {
+	var requests int
+	var longestURL int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if len(r.URL.RequestURI()) > longestURL {
+			longestURL = len(r.URL.RequestURI())
+		}
+		syms := strings.Split(r.URL.Query().Get("symbols"), ",")
+		if len(syms) > snapshotBatchSize {
+			t.Errorf("batch of %d symbols exceeds the %d limit", len(syms), snapshotBatchSize)
+		}
+		if r.URL.Query().Get("feed") != "sip" {
+			t.Errorf("feed = %q, want sip", r.URL.Query().Get("feed"))
+		}
+		io.WriteString(w, `{"`+syms[0]+`":{"latestTrade":{"p":1.0},"dailyBar":{"c":1.0,"v":10},"prevDailyBar":{"c":1.0}}}`)
+	}))
+	defer srv.Close()
+
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
+
+	universe := make([]string, 1250)
+	for i := range universe {
+		universe[i] = fmt.Sprintf("SYM%04d", i)
+	}
+	got, err := a.Snapshots(context.Background(), universe)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// 1250 symbols at 500 per batch is three requests.
+	if requests != 3 {
+		t.Errorf("made %d requests for 1250 symbols, want 3", requests)
+	}
+	// Results from every batch must be merged, not just the last one.
 	if len(got) != 3 {
-		t.Errorf("got %d, want all 3 when under the limit", len(got))
+		t.Errorf("merged %d snapshots, want one per batch", len(got))
+	}
+	if longestURL > 8000 {
+		t.Errorf("longest URL was %d bytes; batching should keep it well under 8KB", longestURL)
 	}
 }
 
@@ -211,7 +239,7 @@ func TestPlaceOrderPayloadAndDecoding(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewAlpaca(&config.Secrets{APIKey: "key", APISecret: "secret", BaseURL: srv.URL, DataURL: srv.URL})
+	a := NewAlpaca(&config.Secrets{APIKey: "key", APISecret: "secret", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
 	res, err := a.PlaceOrder(context.Background(), OrderRequest{
 		Symbol: "ABCD", Shares: 200, Side: "buy", Type: "market", ClientOrderID: "cid-1",
 	})
@@ -245,7 +273,7 @@ func TestPlaceLimitOrderIncludesPrice(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL})
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
 	if _, err := a.PlaceOrder(context.Background(), OrderRequest{
 		Symbol: "ABCD", Shares: 10, Side: "buy", Type: "limit", LimitPrice: 4.5,
 	}); err != nil {
@@ -304,7 +332,7 @@ func TestErrorResponseIncludesStatusAndHidesQuery(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL})
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
 	_, err := a.Snapshots(context.Background(), []string{"ABCD"})
 	if err == nil {
 		t.Fatal("want an error on 403")
@@ -340,15 +368,5 @@ func TestAverageVolumeExcludingToday(t *testing.T) {
 	}
 	if got := AverageVolumeExcludingToday(nil, 20, now); got != 0 {
 		t.Errorf("average = %v, want 0 for no data", got)
-	}
-}
-
-func TestNoFloatProviderFailsClosed(t *testing.T) {
-	_, ok, err := NoFloatProvider{}.FloatShares(context.Background(), "ABCD")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ok {
-		t.Error("the default provider must report float as unavailable")
 	}
 }

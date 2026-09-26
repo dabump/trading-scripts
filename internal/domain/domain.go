@@ -138,6 +138,34 @@ type Evaluation struct {
 	// VolumeMultiple is retained for ranking when more candidates qualify than
 	// there are free position slots.
 	VolumeMultiple float64
+	// Outcome records what the entry pass did with a qualifying candidate —
+	// "bought", or why it was skipped. Qualifying is not the same as being bought:
+	// the position cap, the same-day re-entry rule and available cash all still
+	// apply, and without this the reason lived only in the log.
+	Outcome string
+}
+
+// SentimentCheck is the result of a manually triggered sentiment read. It is
+// deliberately not a SentimentReading: a manual check is never persisted, because
+// the gate verdict is decided by the most recent stored reading and a mid-session
+// manual check would otherwise be able to overturn what the first hour concluded.
+type SentimentCheck struct {
+	TakenAt        time.Time
+	Percentages    map[string]float64
+	Classification Verdict
+	// Missing lists configured symbols that returned no usable data.
+	Missing []string
+}
+
+// ScreenPreview is the result of a manually triggered screening pass. Nothing is
+// persisted and no order is ever placed from this path.
+type ScreenPreview struct {
+	TakenAt      time.Time
+	UniverseSize int
+	Evaluations  []Evaluation
+	// MarketOpen is false when this ran outside exchange hours, in which case the
+	// prices and percentages describe the last session, not a live move.
+	MarketOpen bool
 }
 
 // SentimentReading is one 10-minute poll during the first hour.

@@ -38,8 +38,10 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() { st.Close() })
 
 	cfg := &config.Config{}
-	cfg.Screening = config.Screening{MaxFloatShares: 10_000_000, MinIntradayPct: 10,
-		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, UniverseSize: 50, FloatProvider: "none"}
+	cfg.MarketData = config.MarketData{Feed: "sip"}
+	cfg.Screening = config.Screening{MinIntradayPct: 10,
+		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
+		NewsLookback: 18 * time.Hour}
 	cfg.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
 	cfg.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, MACDFast: 5, MACDSlow: 10,
 		MACDSignal: 3, MACDIntervalMins: 15, EODExitOffsetMins: 30}
@@ -61,7 +63,7 @@ func newHarness(t *testing.T) *harness {
 	h.fake.SetCalendar(broker.CalendarDay{Date: h.date, Open: h.open, Close: h.close})
 
 	h.eng = New(Deps{
-		Config: cfg, Store: st, Data: h.fake, Trading: h.fake, Floats: h.fake,
+		Config: cfg, Store: st, Data: h.fake, Trading: h.fake,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:    func() time.Time { return h.now },
 	})
@@ -106,7 +108,6 @@ func (h *harness) addCandidate(symbol string, price float64) {
 	h.fake.SetSnapshot(symbol, price, price/1.14, 6_000_000) // +14%
 	h.fake.SetAverageVolume(symbol, 1_000_000)               // 6x
 	h.fake.SetNews(symbol, 2)
-	h.fake.SetFloat(symbol, 4_200_000)
 }
 
 func (h *harness) openPositions() []domain.Position {
@@ -124,7 +125,6 @@ func TestFullBullishDay(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
 	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
 
 	// Before the open nothing happens.
 	h.at(9, 0)
@@ -235,7 +235,6 @@ func TestBearishGateHaltsTheDay(t *testing.T) {
 	h := newHarness(t)
 	h.setBearish()
 	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
 
 	for _, m := range []int{30, 45} {
 		h.at(9, m)
@@ -292,61 +291,12 @@ func TestStartedAfterFirstHourHaltsForSafety(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
 	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
 
 	h.at(13, 0)
 	h.tick()
 	h.wantState(domain.StateHaltedBearish)
 	if got := len(h.fake.Placed()); got != 0 {
 		t.Errorf("placed %d orders without a sentiment check, want 0", got)
-	}
-}
-
-// The float criterion must fail closed when no provider supplies it, otherwise a
-// documented entry requirement is silently skipped.
-func TestUnknownFloatBlocksEntry(t *testing.T) {
-	h := newHarness(t)
-	h.eng = New(Deps{
-		Config: h.cfg, Store: h.store, Data: h.fake, Trading: h.fake,
-		Floats: broker.NoFloatProvider{},
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:    func() time.Time { return h.now },
-	})
-
-	h.setBullish()
-	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
-
-	h.at(9, 30)
-	h.tick()
-	h.at(10, 25)
-	h.tick()
-	h.at(10, 35)
-	h.tick()
-
-	if got := len(h.openPositions()); got != 0 {
-		t.Errorf("entered %d positions with an unverifiable float, want 0", got)
-	}
-
-	evals, _, err := h.store.LatestScreenSnapshot(h.date)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(evals) != 1 {
-		t.Fatalf("got %d evaluations, want 1", len(evals))
-	}
-	// The page must still show why it was rejected.
-	if evals[0].Qualifies {
-		t.Error("candidate must not qualify")
-	}
-	var sawUnknownFloat bool
-	for _, c := range evals[0].Criteria {
-		if c.Name == "Float" && c.Display == "unknown" {
-			sawUnknownFloat = true
-		}
-	}
-	if !sawUnknownFloat {
-		t.Errorf("float criterion should read \"unknown\": %+v", evals[0].Criteria)
 	}
 }
 
@@ -357,13 +307,10 @@ func TestExposureCapAndRanking(t *testing.T) {
 	h.setBullish()
 
 	// Seven candidates with increasing relative volume.
-	var movers []broker.Mover
 	for i, sym := range []string{"AAAA", "BBBB", "CCCC", "DDDD", "EEEE", "FFFF", "GGGG"} {
 		h.addCandidate(sym, 5.00)
 		h.fake.SetAverageVolume(sym, 6_000_000/float64(6+i)) // rel vol grows with i
-		movers = append(movers, broker.Mover{Symbol: sym, Price: 5, ChangePct: 14})
 	}
-	h.fake.SetMovers(movers...)
 
 	h.at(9, 30)
 	h.tick()
@@ -394,7 +341,6 @@ func TestStopLossExit(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
 	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
 
 	h.at(9, 30)
 	h.tick()
@@ -424,7 +370,6 @@ func TestMACDExit(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
 	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
 
 	h.at(9, 30)
 	h.tick()
@@ -464,7 +409,6 @@ func TestForcedEODExit(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
 	h.addCandidate("ABCD", 5.00)
-	h.fake.SetMovers(broker.Mover{Symbol: "ABCD", Price: 5.00, ChangePct: 14})
 
 	h.at(9, 30)
 	h.tick()
@@ -618,7 +562,7 @@ func TestSentimentCadenceSurvivesRestart(t *testing.T) {
 
 	// A "restart": a brand-new engine over the same store.
 	h.eng = New(Deps{
-		Config: h.cfg, Store: h.store, Data: h.fake, Trading: h.fake, Floats: h.fake,
+		Config: h.cfg, Store: h.store, Data: h.fake, Trading: h.fake,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:    func() time.Time { return h.now },
 	})

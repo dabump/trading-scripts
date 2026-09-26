@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/martincoetzee/trading-agent/internal/audit"
 	"github.com/martincoetzee/trading-agent/internal/broker"
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
@@ -62,12 +63,16 @@ func run() error {
 	}
 	defer st.Close()
 
+	auditLog, err := audit.Open(cfg.Audit.Directory)
+	if err != nil {
+		return err
+	}
+	defer auditLog.Close()
+
 	var (
-		data           broker.MarketData
-		trading        broker.Trading
-		floats         broker.FloatProvider = broker.NoFloatProvider{}
-		paper                               = true
-		floatAvailable                      = false
+		data    broker.MarketData
+		trading broker.Trading
+		paper   = true
 	)
 
 	if *offline {
@@ -86,8 +91,7 @@ func run() error {
 			"scan_interval", cfg.Timing.ScreenerScanInterval)
 
 		fake := seedFake(time.Now())
-		data, trading, floats = fake, fake, fake
-		floatAvailable = true
+		data, trading = fake, fake
 	} else {
 		secrets, err := config.LoadSecrets()
 		if err != nil {
@@ -104,20 +108,53 @@ func run() error {
 		}
 		paper = !secrets.IsLive()
 
-		alpaca := broker.NewAlpaca(secrets)
+		alpaca := broker.NewAlpaca(secrets, cfg.MarketData.Feed)
+		if cfg.MarketData.Feed == "iex" {
+			logger.Warn("using the IEX feed, which carries only a few percent of " +
+				"consolidated volume; the relative-volume screening criterion will not " +
+				"reflect market-wide activity")
+		}
 		data, trading = alpaca, alpaca
-		// float_provider is validated to "none", so nothing supplies float data yet
-		// and the screener fails that criterion closed.
-		logger.Warn("no float data source is configured; the float criterion will fail " +
-			"for every candidate and nothing can qualify (see docs/decisions.md)")
 	}
 
 	eng := engine.New(engine.Deps{
-		Config: cfg, Store: st, Data: data, Trading: trading, Floats: floats,
-		Logger: logger,
+		Config: cfg, Store: st, Data: data, Trading: trading,
+		Logger: logger, Audit: auditLog,
 	})
 
-	srv, err := web.NewServer(cfg, st, eng, logger, time.Now, paper, floatAvailable)
+	// The effective configuration is recorded at startup so a later reader can tell
+	// which thresholds were in force when a trade happened. Credentials are
+	// deliberately absent: an audit trail must be safe to hand to someone.
+	now := time.Now()
+	if err := auditLog.Record(audit.Event{
+		At:          now,
+		SessionDate: scheduler.SessionDate(now),
+		Kind:        audit.AgentStarted,
+		Summary:     fmt.Sprintf("agent started (paper=%v, offline=%v)", paper, *offline),
+		Detail: map[string]any{
+			"paper":                    paper,
+			"offline":                  *offline,
+			"data_feed":                cfg.MarketData.Feed,
+			"min_intraday_pct":         cfg.Screening.MinIntradayPct,
+			"min_volume_multiple":      cfg.Screening.MinVolumeMultiple,
+			"avg_volume_lookback_days": cfg.Screening.AvgVolumeLookbackDays,
+			"news_lookback":            cfg.Screening.NewsLookback.String(),
+			"max_enriched":             cfg.Screening.MaxEnriched,
+			"position_size_pct":        cfg.Risk.PositionSizePct,
+			"max_concurrent_positions": cfg.Risk.MaxConcurrentPositions,
+			"stop_loss_pct":            cfg.Risk.StopLossPct,
+			"profit_target_pct":        cfg.Exit.ProfitTargetPct,
+			"trailing_stop_pct":        cfg.Exit.TrailingStopPct,
+			"macd":                     fmt.Sprintf("%d/%d/%d @ %dmin", cfg.Exit.MACDFast, cfg.Exit.MACDSlow, cfg.Exit.MACDSignal, cfg.Exit.MACDIntervalMins),
+			"eod_exit_offset_minutes":  cfg.Exit.EODExitOffsetMins,
+			"order_type":               cfg.Execution.OrderType,
+			"allow_same_day_reentry":   cfg.Risk.AllowSameDayReentry,
+		},
+	}); err != nil {
+		return fmt.Errorf("record startup audit event: %w", err)
+	}
+
+	srv, err := web.NewServer(cfg, st, eng, eng, logger, time.Now, paper)
 	if err != nil {
 		return err
 	}
@@ -130,7 +167,8 @@ func run() error {
 	go func() { errs <- eng.Run(ctx) }()
 
 	logger.Info("agent started", "paper", paper, "offline", *offline,
-		"listen", cfg.Web.ListenAddr, "db", cfg.Storage.DatabasePath)
+		"listen", cfg.Web.ListenAddr, "db", cfg.Storage.DatabasePath,
+		"audit", auditLog.Path(scheduler.SessionDate(now)))
 
 	err = <-errs
 	if errors.Is(err, context.Canceled) {
@@ -163,21 +201,19 @@ func seedFake(now time.Time) *broker.Fake {
 		fake.SetSnapshot(sym, 101.10, 100, 5_000_000)
 	}
 
-	// One qualifying low-float mover, and one that fails on news only, so the
-	// screening table shows both outcomes.
-	fake.SetMovers(
-		broker.Mover{Symbol: "DEMO", Price: 4.56, ChangePct: 14},
-		broker.Mover{Symbol: "NONEWS", Price: 2.30, ChangePct: 11.5},
-	)
+	// A handful of symbols standing in for the tradable universe: one qualifies, one
+	// fails on news only, and one never clears the move threshold — so the screening
+	// table shows each outcome.
+	fake.SetSnapshot("FLAT", 10.00, 9.95, 800_000)
+	fake.SetAverageVolume("FLAT", 750_000)
+
 	fake.SetSnapshot("DEMO", 4.56, 4.00, 6_100_000)
 	fake.SetAverageVolume("DEMO", 1_000_000)
 	fake.SetNews("DEMO", 2)
-	fake.SetFloat("DEMO", 4_200_000)
 
 	fake.SetSnapshot("NONEWS", 2.30, 2.06, 5_400_000)
 	fake.SetAverageVolume("NONEWS", 1_000_000)
 	fake.SetNews("NONEWS", 0)
-	fake.SetFloat("NONEWS", 8_900_000)
 
 	return fake
 }

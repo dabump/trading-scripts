@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The shipped config must actually load and validate; a typo here would only
@@ -14,8 +15,9 @@ func TestLoadShippedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("shipped config failed to load: %v", err)
 	}
-	if c.Screening.MaxFloatShares != 10_000_000 {
-		t.Errorf("max float = %v, want 10000000 (docs/strategy.md §2)", c.Screening.MaxFloatShares)
+	if c.Screening.MinIntradayPct != 10 || c.Screening.MinVolumeMultiple != 5 {
+		t.Errorf("screen thresholds = %v%% / %vx, want 10%% / 5x (docs/strategy.md §2)",
+			c.Screening.MinIntradayPct, c.Screening.MinVolumeMultiple)
 	}
 	if c.Risk.PositionSizePct != 10 || c.Risk.MaxConcurrentPositions != 5 {
 		t.Errorf("sizing = %v%% x %d, want 10%% x 5 (docs/risk.md)",
@@ -24,13 +26,16 @@ func TestLoadShippedConfig(t *testing.T) {
 	if c.Exit.MACDIntervalMins != 15 {
 		t.Errorf("macd interval = %d, want 15 (docs/strategy.md §4)", c.Exit.MACDIntervalMins)
 	}
+	// The full consolidated tape, without which the volume criterion is meaningless.
+	if c.MarketData.Feed != "sip" {
+		t.Errorf("feed = %q, want sip", c.MarketData.Feed)
+	}
+	// Must reach back past the open, or pre-market catalysts are invisible.
+	if c.Screening.NewsLookback < 7*time.Hour {
+		t.Errorf("news_lookback = %v, want at least 7h", c.Screening.NewsLookback)
+	}
 	if c.Timing.ScreenerScanInterval.Minutes() != 1 {
 		t.Errorf("scan interval = %v, want 1m (docs/strategy.md §2)", c.Timing.ScreenerScanInterval)
-	}
-	// Screening must fail closed until a float provider is actually chosen.
-	if c.Screening.FloatProvider != "none" {
-		t.Errorf("float_provider = %q, want \"none\" while the data source is an open item",
-			c.Screening.FloatProvider)
 	}
 }
 
@@ -47,8 +52,9 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 
 func valid() *Config {
 	c := &Config{}
-	c.Screening = Screening{MaxFloatShares: 1e7, MinIntradayPct: 10, MinVolumeMultiple: 5,
-		AvgVolumeLookbackDays: 20, UniverseSize: 50, FloatProvider: "none"}
+	c.MarketData = MarketData{Feed: "sip"}
+	c.Screening = Screening{MinIntradayPct: 10, MinVolumeMultiple: 5,
+		AvgVolumeLookbackDays: 20, MaxEnriched: 100, NewsLookback: 18 * time.Hour}
 	c.Risk = Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
 	c.Exit = Exit{ProfitTargetPct: 15, TrailingStopPct: 5, MACDFast: 5, MACDSlow: 10,
 		MACDSignal: 3, MACDIntervalMins: 15, EODExitOffsetMins: 30}
@@ -58,6 +64,7 @@ func valid() *Config {
 	c.Execution = Execution{OrderType: "market"}
 	c.Web = Web{ListenAddr: ":8080", PollInterval: 12e9}
 	c.Storage = Storage{DatabasePath: "data/agent.db"}
+	c.Audit = Audit{Directory: "logs"}
 	return c
 }
 
@@ -94,14 +101,24 @@ func TestValidate(t *testing.T) {
 			"limit_slip_pct",
 		},
 		{
-			"an unimplemented float provider is rejected",
-			func(c *Config) { c.Screening.FloatProvider = "alpaca" },
-			"float_provider",
-		},
-		{
 			"stop loss of 100% is rejected",
 			func(c *Config) { c.Risk.StopLossPct = 100 },
 			"stop_loss_pct",
+		},
+		{
+			"a news lookback that stops short of the market open is rejected",
+			func(c *Config) { c.Screening.NewsLookback = 2 * time.Hour },
+			"news_lookback",
+		},
+		{
+			"an unknown data feed is rejected",
+			func(c *Config) { c.MarketData.Feed = "nasdaq" },
+			"market_data.feed",
+		},
+		{
+			"the free IEX feed is accepted, with its caveats left to the operator",
+			func(c *Config) { c.MarketData.Feed = "iex" },
+			"",
 		},
 	}
 

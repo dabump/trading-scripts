@@ -10,14 +10,6 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/domain"
 )
 
-// Mover is a symbol surfaced by the market-movers screen, which is the source of
-// the candidate universe.
-type Mover struct {
-	Symbol    string
-	Price     float64
-	ChangePct float64
-}
-
 // CalendarDay is one exchange session as the broker reports it. Using the
 // broker's calendar rather than a hardcoded holiday list means holidays and
 // early closes come from data that stays correct without maintenance.
@@ -56,6 +48,13 @@ type BrokerPosition struct {
 
 // MarketData is the read side: prices, candles, the candidate universe and news.
 type MarketData interface {
+	// TradableAssets lists every symbol the screen may consider. It replaces
+	// Alpaca's market-movers endpoint, which is hard-capped at 50 results and
+	// ordered by percentage change — a selection the strategy does not want, since
+	// it ranks candidates by relative volume rather than by size of move.
+	TradableAssets(ctx context.Context) ([]string, error)
+	// Snapshots may be called with the whole tradable universe; implementations are
+	// expected to batch internally rather than building one enormous URL.
 	Snapshots(ctx context.Context, symbols []string) (map[string]domain.Snapshot, error)
 	// IntradayBars returns the current session's candles at the given interval,
 	// oldest first.
@@ -63,7 +62,6 @@ type MarketData interface {
 	// AverageDailyVolume averages the prior sessions' volume, excluding today
 	// (today is the number being compared against it).
 	AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error)
-	Movers(ctx context.Context, top int) ([]Mover, error)
 	// NewsCounts reports how many stories each symbol has since the given time.
 	NewsCounts(ctx context.Context, symbols []string, since time.Time) (map[string]int, error)
 }
@@ -74,23 +72,4 @@ type Trading interface {
 	Calendar(ctx context.Context, date string) (CalendarDay, error)
 	PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error)
 	Positions(ctx context.Context) ([]BrokerPosition, error)
-}
-
-// FloatProvider supplies share float, which is not part of a broker's normal
-// market data feed. Kept separate because it is the one screening input whose
-// source is still an open item in docs/decisions.md.
-type FloatProvider interface {
-	// FloatShares reports the symbol's float. The bool is false when the value is
-	// simply unavailable, which the screener treats as a failed criterion rather
-	// than a skipped one.
-	FloatShares(ctx context.Context, symbol string) (float64, bool, error)
-}
-
-// NoFloatProvider is the default: it never supplies a float, so the float
-// criterion fails closed and nothing qualifies. This is deliberate — trading on
-// an unverified float would silently drop a documented entry requirement.
-type NoFloatProvider struct{}
-
-func (NoFloatProvider) FloatShares(context.Context, string) (float64, bool, error) {
-	return 0, false, nil
 }

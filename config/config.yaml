@@ -5,15 +5,23 @@
 # during implementation so the agent could run, and are listed in
 # docs/decisions.md as pending your review. Change them freely.
 
+market_data:
+  # "sip" is the full consolidated tape (paid Algo Trader Plus); "iex" is the free
+  # single-exchange feed carrying only a few percent of consolidated volume, on
+  # which the relative-volume criterion below is not meaningful.
+  feed: sip
+
 screening:
-  max_float_shares: 10000000        # docs/strategy.md §2
   min_intraday_pct: 10.0            # docs/strategy.md §2
   min_volume_multiple: 5.0          # docs/strategy.md §2
   avg_volume_lookback_days: 20      # PROPOSED (docs left the lookback undecided)
-  universe_size: 50                 # PROPOSED: how many movers to pull per scan
-  # "none" fails the float criterion closed, so nothing qualifies. Switch to
-  # "alpaca" only once the float data source open item is actually resolved.
-  float_provider: none
+  # The whole tradable universe is scanned each pass; this only bounds how many of
+  # the symbols that clear min_intraday_pct get the expensive per-symbol lookups.
+  max_enriched: 100                 # PROPOSED
+  # Must reach back past the market open: a gap-up's catalyst almost always breaks
+  # overnight or pre-market, so searching only from 09:30 would miss it. 18h covers
+  # the prior evening through this morning's pre-market. PROPOSED.
+  news_lookback: 18h
 
 risk:
   position_size_pct: 10.0           # docs/risk.md
@@ -53,3 +61,9 @@ web:
 
 storage:
   database_path: data/agent.db      # docs/operations.md
+
+audit:
+  # Append-only JSON-lines trail of decisions and actions, one file per session
+  # date. Separate from the operational log on stderr: this is the record you read
+  # back weeks later to answer "why did it buy that?".
+  directory: logs

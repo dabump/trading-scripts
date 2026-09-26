@@ -14,26 +14,43 @@ import (
 )
 
 type Config struct {
-	Screening Screening `yaml:"screening"`
-	Risk      Risk      `yaml:"risk"`
-	Exit      Exit      `yaml:"exit"`
-	Timing    Timing    `yaml:"timing"`
-	Sentiment Sentiment `yaml:"sentiment"`
-	Execution Execution `yaml:"execution"`
-	Web       Web       `yaml:"web"`
-	Storage   Storage   `yaml:"storage"`
+	MarketData MarketData `yaml:"market_data"`
+	Screening  Screening  `yaml:"screening"`
+	Risk       Risk       `yaml:"risk"`
+	Exit       Exit       `yaml:"exit"`
+	Timing     Timing     `yaml:"timing"`
+	Sentiment  Sentiment  `yaml:"sentiment"`
+	Execution  Execution  `yaml:"execution"`
+	Web        Web        `yaml:"web"`
+	Storage    Storage    `yaml:"storage"`
+	Audit      Audit      `yaml:"audit"`
+}
+
+// MarketData selects which Alpaca data feed to use.
+type MarketData struct {
+	// Feed is "sip" (full consolidated tape, paid plan) or "iex" (free, a few
+	// percent of consolidated volume). This is not a cosmetic setting: the
+	// relative-volume criterion is meaningless on IEX data, because it would be
+	// comparing one exchange's activity against the whole market's average.
+	Feed string `yaml:"feed"`
 }
 
 type Screening struct {
-	MaxFloatShares        float64 `yaml:"max_float_shares"`
 	MinIntradayPct        float64 `yaml:"min_intraday_pct"`
 	MinVolumeMultiple     float64 `yaml:"min_volume_multiple"`
 	AvgVolumeLookbackDays int     `yaml:"avg_volume_lookback_days"`
-	UniverseSize          int     `yaml:"universe_size"`
-	// FloatProvider selects where float data comes from. "none" fails the float
-	// criterion closed (nothing qualifies), which is the safe default until a
-	// provider is chosen — see the open item in docs/decisions.md.
-	FloatProvider string `yaml:"float_provider"`
+	// MaxEnriched bounds how many symbols get the expensive per-symbol news and
+	// average-volume lookups after the cheap price-move filter. On a violent day
+	// hundreds of names clear +10%, and enriching all of them every minute would
+	// be wasteful; the busiest by dollar volume are kept.
+	MaxEnriched int `yaml:"max_enriched"`
+	// NewsLookback is how far back to search for a catalyst, measured from now.
+	//
+	// It has to reach past the market open. The catalyst behind a gap-up almost
+	// always breaks overnight or in the pre-market session, so searching only from
+	// 09:30 would miss the very story that caused the move and report "no news" for
+	// exactly the candidates the strategy wants.
+	NewsLookback time.Duration `yaml:"news_lookback"`
 }
 
 type Risk struct {
@@ -70,8 +87,8 @@ type Sentiment struct {
 }
 
 type Execution struct {
-	// OrderType is "market" or "limit". Market guarantees a fill but can slip
-	// badly on low-float names; see the open item in docs/decisions.md.
+	// OrderType is "market" or "limit". Market guarantees a fill but can slip badly
+	// on thinly traded names; see the open item in docs/decisions.md.
 	OrderType    string  `yaml:"order_type"`
 	LimitSlipPct float64 `yaml:"limit_slip_pct"`
 }
@@ -83,6 +100,12 @@ type Web struct {
 
 type Storage struct {
 	DatabasePath string `yaml:"database_path"`
+}
+
+// Audit configures the decision-and-action trail.
+type Audit struct {
+	// Directory holds one append-only JSON-lines file per session date.
+	Directory string `yaml:"directory"`
 }
 
 // Secrets are the credentials loaded from the environment, never from YAML.
@@ -119,9 +142,6 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
-	if c.Screening.MaxFloatShares <= 0 {
-		add("screening.max_float_shares must be > 0")
-	}
 	if c.Screening.MinIntradayPct <= 0 {
 		add("screening.min_intraday_pct must be > 0")
 	}
@@ -131,14 +151,19 @@ func (c *Config) Validate() error {
 	if c.Screening.AvgVolumeLookbackDays < 1 {
 		add("screening.avg_volume_lookback_days must be >= 1")
 	}
-	// Only "none" is accepted because no float data source has been implemented:
-	// Alpaca's API does not expose share float, and which provider to add is still
-	// an open item in docs/decisions.md. Adding one means adding an implementation
-	// of broker.FloatProvider and a value here, together.
-	if c.Screening.FloatProvider != "none" {
-		add("screening.float_provider must be \"none\": no float data source is implemented yet")
+	if c.Screening.MaxEnriched < 1 {
+		add("screening.max_enriched must be >= 1")
 	}
-
+	// Anything shorter than the trading day itself would start the search after the
+	// open, which is the bug this setting exists to prevent.
+	if c.Screening.NewsLookback < 7*time.Hour {
+		add("screening.news_lookback must be at least 7h so it reaches back past the market open")
+	}
+	switch c.MarketData.Feed {
+	case "sip", "iex":
+	default:
+		add("market_data.feed must be one of: sip, iex")
+	}
 	if c.Risk.PositionSizePct <= 0 || c.Risk.PositionSizePct > 100 {
 		add("risk.position_size_pct must be in (0, 100]")
 	}
@@ -211,6 +236,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.DatabasePath == "" {
 		add("storage.database_path must be set")
+	}
+	if c.Audit.Directory == "" {
+		add("audit.directory must be set")
 	}
 
 	return errors.Join(errs...)

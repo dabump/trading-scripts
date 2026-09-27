@@ -35,6 +35,9 @@ gofmt -l .                           # must print nothing
 go run ./cmd/agent -offline          # run with a fake broker: no credentials, no network, no real orders
 jq -r '"\(.at[11:19])  \(.kind)  \(.summary)"' logs/audit-*.jsonl   # read the audit trail
 go run ./cmd/agent                   # run for real; needs ALPACA_* env vars (see .env.example)
+
+docker compose up -d --build                     # containerised, paper trading
+docker compose --profile demo up agent-offline   # containerised offline demo on :8081
 ```
 
 `-offline` seeds a fake broker and compresses the session timings so a whole
@@ -58,5 +61,7 @@ with `/api/status` returning the same state as JSON.
 - **Screening is three criteria**: a same-day news catalyst, ≥10% intraday move, and ≥5x average volume. Nothing filters on company size, so the screen admits large caps — worth knowing, since parts of the docs still describe the strategy as small-cap.
 - **The two manual buttons cannot trade.** `engine.CheckSentiment` and `engine.ScreenNow` back them; both share code with the automated path but stop short of `enterPositions`, and neither persists anything. If you refactor the screening path, keep that separation — the automated scan buys, and the buttons are expected to work with the market closed.
 - **The web layer never calls the broker** (except through those two read-only actions). The trading loop persists each position's last mark, so the ~12s page poll costs no market-data API calls. `/fragment` returns the same template's content block, which is what the page swaps in — markup is never duplicated in JavaScript.
+- **The binary embeds tzdata** (`internal/scheduler`). Do not remove it: a minimal container image has no timezone database, and the fallback silently shifts every session boundary by an hour during EDT. `TestExchangeTimezoneHandlesDST` guards this.
+- **`CGO_ENABLED=0` is required, not preferred.** The pure-Go SQLite driver is what makes the binary static and the container image minimal.
 - **Migrations live in `internal/store/migrations/`**, not at the repo root, because `go:embed` cannot reach outside its package and the deployment target is a single self-contained binary.
 - **Live trading is gated behind `-allow-live-trading`** on top of the base URL, because the Pattern Day Trader constraint in `docs/operations.md` is unresolved.

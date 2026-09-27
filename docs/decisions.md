@@ -234,6 +234,28 @@ Found while writing the tests: candidates turned away by the position cap were
 setting a page outcome but were not being audited at all — a real gap, since "we saw
 this qualify at 11:03 but were full" is exactly what a post-mortem wants.
 
+## 2026-09-26 — Containerisation
+
+| Decision | Rationale |
+|---|---|
+| Multi-stage build on `alpine`, not `scratch`/distroless | The binary is static so `scratch` would work, but a shell and `wget` make the container debuggable and let the healthcheck hit `/api/status` without adding a health subcommand to the binary. ~8MB for that is a good trade. |
+| The timezone database is embedded in the binary | A minimal image carries no tzdata, and `mustLoadET` silently falls back to a fixed EST offset — which puts every session boundary an hour out from March to November, most of the trading year. This is the single worst class of container bug for a clock-driven system: it passes on a developer machine and is wrong in production. A DST test now guards it. |
+| `go vet` and the full test suite run inside the build stage | A daemon that places orders should not be packageable while its tests fail. |
+| `data/` and `logs/` are named volumes, and the demo profile uses separate ones | The database makes a restart recoverable and the audit trail is evidence; both must outlive the container, and a demo run must never write into either. |
+| Config bind-mounted read-only, with a copy baked in | Thresholds change with a restart instead of a rebuild, while the image still runs unmounted. |
+| Port published to `127.0.0.1` only | The page exposes positions and two manual action buttons and has no authentication. |
+| 30s stop grace period, exec-form `ENTRYPOINT` | SIGTERM reaches the process and triggers the graceful shutdown already implemented; being killed mid-order-submission is recoverable via reconciliation but better avoided. |
+
+**Not verified:** the image was never actually built. Docker is installed on this
+machine but the daemon is inactive and the socket is `root:docker` while the user is
+in `wheel`, so the build could not run. Verified instead, offline: the exact build
+context `.dockerignore` produces was reproduced and `go vet`, the full test suite and
+the static build all pass inside it; `file` confirms the binary is statically linked;
+the default config's relative paths resolve to precisely the declared volume mount
+points (including SQLite's WAL sidecars); `/` and `/api/status` both answer 200; and
+SIGTERM produces a clean shutdown. The first `docker compose up --build` is still the
+real test.
+
 ## Open items (not yet decided)
 
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.

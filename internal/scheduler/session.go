@@ -5,6 +5,13 @@ package scheduler
 import (
 	"time"
 
+	// The timezone database is embedded in the binary rather than read from the
+	// host. Every session boundary in this package is defined in exchange time, and
+	// a minimal container image carries no tzdata — without this the fallback below
+	// would engage and put every boundary an hour out from March to November, which
+	// is most of the trading year. ~450KB to remove an entire class of bug.
+	_ "time/tzdata"
+
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 )
@@ -16,9 +23,9 @@ var ET = mustLoadET()
 func mustLoadET() *time.Location {
 	loc, err := time.LoadLocation("America/New_York")
 	if err != nil {
-		// Fall back to a fixed offset only if tzdata is unavailable; this loses
-		// DST correctness, so it is better to know about it than to silently
-		// drift by an hour twice a year.
+		// Unreachable in practice now that tzdata is embedded above. Kept as a last
+		// resort, but it loses DST correctness, so reaching it means something is
+		// badly wrong with the build.
 		return time.FixedZone("EST", -5*60*60)
 	}
 	return loc

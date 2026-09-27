@@ -119,6 +119,51 @@ jq 'select(.kind == "POSITION_OPENED")' logs/audit-2026-09-28.jsonl
 
 ## Deployment
 
+### Docker
+
+```bash
+cp .env.example .env            # then fill in the Alpaca paper keys
+docker compose up -d --build    # paper trading
+docker compose logs -f agent
+docker compose --profile demo up agent-offline   # fake broker, no credentials, port 8081
+```
+
+The status page is published on `127.0.0.1:8080` only — bound to loopback rather
+than every interface, because the page exposes positions and the two manual buttons
+and has no authentication.
+
+Notes on the image, since several of these are the difference between working and
+subtly wrong:
+
+- **The binary embeds its own timezone database** (`internal/scheduler`). Every
+  session boundary is defined in exchange time, and a minimal image carries no
+  tzdata — without the embed the fallback engages and puts every boundary an hour out
+  from March to November. `TestExchangeTimezoneHandlesDST` fails if that regresses.
+- **`CGO_ENABLED=0` is load-bearing, not tuning.** The SQLite driver is pure Go, so
+  the binary is fully static; verified with `file` reporting "statically linked".
+- **`data/` and `logs/` are named volumes.** The database is what makes a restart
+  recoverable and the audit trail is append-only evidence; both must outlive the
+  container. Note the volume covers the whole directory, which matters because WAL
+  mode writes `agent.db-wal` and `agent.db-shm` alongside the database.
+- **Config is bind-mounted read-only**, so thresholds change with a restart rather
+  than a rebuild. A copy is baked into the image so it still runs unmounted.
+- **The build stage runs `go vet` and the full test suite**, so a failing test cannot
+  produce an image. This daemon places orders; "it compiled" is not the bar.
+- **Runs as an unprivileged user** (uid 10001) with `no-new-privileges`.
+- **`ENTRYPOINT` uses exec form** so SIGTERM reaches the process and triggers the
+  graceful shutdown the daemon implements, with a 30s grace period — being killed
+  mid-order-submission is the one moment worth being patient about.
+- **The healthcheck hits `/api/status`**, which reports the agent's own view of
+  itself, so a wedged daemon is caught rather than just a dead process.
+- Container logs are capped (10MB × 5); the durable record is the audit trail on the
+  volume, not Docker's log driver.
+
+Going live inside a container still takes both deliberate steps — `ALPACA_BASE_URL`
+pointing at the live endpoint *and* `-allow-live-trading` added to the command — and
+the PDT constraint above is unresolved.
+
+### Bare binary
+
 - Single Go binary (CGO-free, so it is portable and needs no SQLite system library), run as a long-lived process rather than invoked repeatedly via cron, so it can hold the daily loop state and serve the web page continuously.
 - `go run ./cmd/agent -offline` runs the whole loop against a seeded fake broker with compressed session timings — no credentials, no network, no orders. This is how to see the daemon work end to end before an Alpaca account exists.
 - Starting against the live endpoint additionally requires `-allow-live-trading`; the base URL alone is not enough, given the unresolved PDT constraint above.

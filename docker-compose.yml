@@ -1,0 +1,82 @@
+# Paper trading by default. Going live takes two deliberate steps — pointing
+# ALPACA_BASE_URL at the live endpoint *and* passing -allow-live-trading — and the
+# Pattern Day Trader constraint in docs/operations.md is unresolved, so read that
+# first.
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trading-agent:latest
+    container_name: trading-agent
+
+    # Credentials come from .env, which is gitignored. Copy .env.example and fill it
+    # in; never bake keys into the image or into this file.
+    env_file:
+      - .env
+
+    ports:
+      - "127.0.0.1:8081:8080"
+
+    volumes:
+      # Named volumes, not bind mounts: the SQLite database is what makes a restart
+      # recoverable and the audit trail is append-only evidence. Both must outlive
+      # the container.
+      - agent-data:/app/data
+      - agent-logs:/app/logs
+      # Config is bind-mounted read-only so thresholds can be changed and the
+      # container restarted without a rebuild.
+      - ./config/config.yaml:/app/config/config.yaml:ro
+
+    restart: unless-stopped
+
+    # The daemon shuts down gracefully on SIGTERM. The default 10s is tight if it is
+    # mid-request to Alpaca, and being killed during an order submission is the one
+    # moment worth being patient about — restart reconciliation can recover from it,
+    # but not having to is better.
+    stop_grace_period: 30s
+
+    logging:
+      # The audit trail on disk is the durable record; this is just the operational
+      # log, so it is capped rather than allowed to fill the host.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+
+    # Modest but real: a stuck scan should not be able to starve the host.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Offline demo: a fake broker, seeded data and compressed session timings, so the
+  # whole daily flow plays out in a few minutes with no credentials and no network.
+  # Run with:  docker compose --profile demo up agent-offline
+  agent-offline:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trading-agent:latest
+    container_name: trading-agent-offline
+    command: ["-config", "/app/config/config.yaml", "-offline"]
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      # Deliberately separate from the live volumes: demo runs must never write into
+      # the real database or the real audit trail.
+      - agent-demo-data:/app/data
+      - agent-demo-logs:/app/logs
+      - ./config/config.yaml:/app/config/config.yaml:ro
+    restart: "no"
+
+volumes:
+  agent-data:
+  agent-logs:
+  agent-demo-data:
+  agent-demo-logs:

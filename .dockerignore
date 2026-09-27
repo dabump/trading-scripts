@@ -1,0 +1,15 @@
+# Keep credentials and runtime state out of the build context entirely — anything
+# copied in is recoverable from the image, so secrets must never enter it.
+.env
+data/
+logs/
+
+.git/
+.gitignore
+.claude/
+archived/
+docs/
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

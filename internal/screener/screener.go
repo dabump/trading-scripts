@@ -63,6 +63,10 @@ func (in Input) VolumeMultiple() float64 {
 // pass or fail, with its underlying value, because docs/web-ui.md requires the
 // page to show why a candidate did or did not qualify.
 //
+// The move criterion is a floor with no ceiling, and that is a measured choice
+// rather than an omission: capping the move was tested and made things worse once
+// winners were allowed to run. See config.Screening.MinIntradayPct.
+//
 // The criteria are news, price move and relative volume only. Nothing here filters
 // on company size, so the screen admits large caps as readily as small ones.
 func Evaluate(in Input, cfg *config.Config) domain.Evaluation {

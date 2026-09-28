@@ -43,7 +43,7 @@ func newHarness(t *testing.T) *harness {
 		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
 		NewsLookback: 18 * time.Hour, MinPrice: 1, MinDollarVolume: 1_000_000}
 	cfg.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	cfg.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, EODExitOffsetMins: 30}
+	cfg.Exit = config.Exit{EODExitOffsetMins: 30}
 	cfg.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute, SentimentWindow: time.Hour,
 		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
 	cfg.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"},
@@ -178,7 +178,9 @@ func TestFullBullishDay(t *testing.T) {
 		t.Errorf("position = %s x%d, want ABCD x2000", pos[0].Symbol, pos[0].Shares)
 	}
 
-	// Runs up past the +15% profit target, arming the trailing stop.
+	// Runs up well past what the removed profit target would have been, and then
+	// gives back more than the removed trailing stop would have tolerated. Neither
+	// may close it: the only exits left are the stop-loss and the bell.
 	h.at(11, 0)
 	h.fake.SetPrice("ABCD", 6.00) // +20%
 	h.tick()
@@ -189,16 +191,31 @@ func TestFullBullishDay(t *testing.T) {
 	if pos[0].PeakPrice != 6.00 {
 		t.Errorf("peak = %v, want 6.00", pos[0].PeakPrice)
 	}
-	if !pos[0].TrailArmed {
-		t.Error("trailing stop must arm once the profit target is reached")
+
+	h.at(11, 30)
+	h.fake.SetPrice("ABCD", 5.70) // 5% off the peak, once a trailing-stop exit
+	h.tick()
+	if got := len(h.openPositions()); got != 1 {
+		t.Fatalf("a 5%% pullback from the peak must no longer close a position: %d open", got)
 	}
 
-	// Falls 5% off the peak: the trailing stop fires.
-	h.at(11, 30)
-	h.fake.SetPrice("ABCD", 5.70)
+	// Letting it run is the point of removing those rules: the rest of the move is
+	// what pays for the losing trades.
+	h.at(14, 0)
+	h.fake.SetPrice("ABCD", 7.00) // +40%
+	h.tick()
+	if got := len(h.openPositions()); got != 1 {
+		t.Fatalf("position closed before the bell: %d open", got)
+	}
+	if pos = h.openPositions(); pos[0].PeakPrice != 7.00 {
+		t.Errorf("peak = %v, want it to follow the price up to 7.00", pos[0].PeakPrice)
+	}
+
+	// The forced end-of-day exit is what finally closes it.
+	h.at(15, 30)
 	h.tick()
 	if got := len(h.openPositions()); got != 0 {
-		t.Fatalf("got %d open positions, want 0 after the trailing stop", got)
+		t.Fatalf("got %d open positions after the EOD exit, want 0", got)
 	}
 
 	all, err := h.store.SessionPositions(h.date)
@@ -208,19 +225,13 @@ func TestFullBullishDay(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("got %d session positions, want 1", len(all))
 	}
-	if all[0].ExitReason != domain.ExitTrailingStop {
-		t.Errorf("exit reason = %q, want TRAILING_STOP", all[0].ExitReason)
+	if all[0].ExitReason != domain.ExitForcedEOD {
+		t.Errorf("exit reason = %q, want FORCED_EOD", all[0].ExitReason)
 	}
-	// 2000 shares from $5.00 to $5.70 is +$1400.
-	if got := all[0].RealizedDollars(); got < 1399.9 || got > 1400.1 {
-		t.Errorf("realized = $%.2f, want $1400", got)
-	}
-
-	// Same-day re-entry is disabled by default, so it must not be re-bought.
-	h.at(12, 0)
-	h.tick()
-	if got := len(h.openPositions()); got != 0 {
-		t.Errorf("re-entered a symbol already traded today: %d open", got)
+	// 2000 shares from $5.00 to $7.00 is +$4000 — versus the $1400 the trailing
+	// stop would have booked at $5.70.
+	if got := all[0].RealizedDollars(); got < 3999.9 || got > 4000.1 {
+		t.Errorf("realized = $%.2f, want $4000", got)
 	}
 
 	// After the close the agent is idle again.
@@ -361,6 +372,17 @@ func TestStopLossExit(t *testing.T) {
 	}
 	if all[0].ExitReason != domain.ExitStopLoss {
 		t.Errorf("exit reason = %q, want STOP_LOSS", all[0].ExitReason)
+	}
+
+	// Same-day re-entry is disabled by default, so a name that just stopped out
+	// must not be bought back even though it still clears every criterion. This is
+	// checked here rather than on the winning path because the winner now stays
+	// open until the bell.
+	h.at(12, 0)
+	h.fake.SetPrice("ABCD", 5.00)
+	h.tick()
+	if got := len(h.openPositions()); got != 0 {
+		t.Errorf("re-entered a symbol already traded today: %d open", got)
 	}
 }
 

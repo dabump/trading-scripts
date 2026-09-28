@@ -46,7 +46,7 @@ Entry uses **the same evaluation** the status page displays — one `screener.Ev
 pass per scan feeds both, so the two can never disagree about what qualifies.
 
 - Day-trade only — no overnight holds.
-- On a qualifying candidate: buy sized at 10% of portfolio (see [`risk.md`](./risk.md) for sizing and exposure cap interaction).
+- On a qualifying candidate: buy sized at 5% of portfolio (see [`risk.md`](./risk.md) for sizing and exposure cap interaction; it was 10% until measurement showed the drawdown that implied).
 
 **Qualifying is not the same as being bought.** Four further gates apply only at
 entry, and candidates are taken in relative-volume order until slots run out:
@@ -68,15 +68,18 @@ store error, say) still stop the pass and surface as `ERROR`.
 
 ## 4. Exit
 
-A position exits on whichever of these triggers first:
+A position exits on whichever of these triggers first — and there are only two:
 
-1. **Profit target + trailing stop (PROPOSED: +15% target, 5% trail)** — the trailing stop *arms* once the peak reaches the profit target, then exits if price falls the trail percentage below the high-water mark. Before it arms, the hard stop-loss is the only floor. Once armed it stays armed, even if price falls back below the target.
-2. **Hard stop-loss** at −10% (this one is settled — see [`risk.md`](./risk.md)).
-3. **Forced end-of-day exit** at 30 minutes before market close, regardless of P&L — settled, no exceptions.
+1. **Hard stop-loss** at −10% (settled — see [`risk.md`](./risk.md)).
+2. **Forced end-of-day exit** at 30 minutes before market close, regardless of P&L — settled, no exceptions.
 
-All three are checked continuously once a position is open; whichever fires first closes it. In code, `strategy.EvaluateExit` returns the *first* match and the order it checks them in **is** the priority: forced EOD, then stop-loss, then trailing stop. `risk.md` requires the stop-loss to outrank the momentum signals.
+Both are checked continuously once a position is open. In code, `strategy.EvaluateExit` returns the *first* match and the order it checks them in **is** the priority: forced EOD, then stop-loss. Nothing follows the stop, so a winner runs until the bell.
 
-**Removed: the MACD bearish crossover.** A 15-minute MACD cross (fast=5, slow=10, signal=3) was the fourth trigger until 2026-09-28. Backtesting it against the agent's own implementation showed it firing on **24.9% of trades for a mean return of −0.08%** — indistinguishable from not having it, while costing an intraday-bar request per open position per tick and carrying a 13-candle (`slow + signal`) warm-up that made the trigger unavailable before roughly 12:45pm ET anyway. It was dropped rather than retuned: nothing in the evidence suggested a better set of periods existed, and the warm-up dead zone is structural to computing MACD inside a single session. `internal/strategy/macd.go` and `MarketData.IntradayBars` went with it.
+**Removed: the profit target and trailing stop.** A +15% target arming a 5% trailing stop was the first exit rule until 2026-09-28, and it was the single most expensive thing in the strategy. A trail armed at +15% and trailing 5% cannot mathematically exit above +9.25%, and in practice exited at **+9.31%** — while those same positions went on to average **+53%**. It capped the right tail at +9% and left the left tail at −10.7%, which at a 42% win rate cannot be profitable. Over one year and 1,697 trades, removing it moved the per-trade mean from **−2.13% to +0.18%** and a $10,000 account from **$289 to $8,483**. A 150-cell sweep of stop × target × trail found no combination that made money. See [`decisions.md`](./decisions.md).
+
+**Removed earlier: the MACD bearish crossover.** A 15-minute MACD cross (fast=5, slow=10, signal=3) was a trigger until the same day's earlier change. Backtesting showed it firing on **24.9% of trades for a mean return of −0.08%** — indistinguishable from not having it, while costing an intraday-bar request per open position per tick and carrying a 13-candle warm-up that made it unavailable before roughly 12:45pm ET anyway. `internal/strategy/macd.go` and `MarketData.IntradayBars` went with it.
+
+The pattern in both removals is the same and worth stating once: this strategy's return lives in a thin right tail, so **any rule that truncates a gain is taking the part that pays for all the losses**. A new exit trigger needs evidence that it pays for itself before it goes in.
 
 ## Same-day re-entry
 

@@ -36,7 +36,18 @@ type MarketData struct {
 }
 
 type Screening struct {
-	MinIntradayPct        float64 `yaml:"min_intraday_pct"`
+	MinIntradayPct float64 `yaml:"min_intraday_pct"`
+	// MaxIntradayPct is a ceiling on the move, and it exists because the strategy's
+	// own premise stops holding past a point.
+	//
+	// A one-year backtest over the full universe found return falling monotonically
+	// as the entry gap widened: +15-25% returned -0.90% a trade, +25-50% returned
+	// -1.11%, +50-100% returned -2.14%, and above +100% returned -3.13% with a
+	// median of -10.00% — that last bucket is 280 trades, so the gap between it and
+	// the +15-25% bucket is roughly three standard errors, not noise. Names up
+	// several hundred percent intraday are exhausted moves and halt candidates, not
+	// momentum entries.
+	MaxIntradayPct        float64 `yaml:"max_intraday_pct"`
 	MinVolumeMultiple     float64 `yaml:"min_volume_multiple"`
 	AvgVolumeLookbackDays int     `yaml:"avg_volume_lookback_days"`
 	// MinPrice and MinDollarVolume are tradability floors, not momentum criteria.
@@ -73,10 +84,11 @@ type Risk struct {
 	AllowSameDayReentry    bool    `yaml:"allow_same_day_reentry"`
 }
 
+// Exit carries only the forced end-of-day deadline. The profit target and trailing
+// stop that used to live here were removed after measurement; see EvaluateExit in
+// internal/strategy and docs/decisions.md.
 type Exit struct {
-	ProfitTargetPct   float64 `yaml:"profit_target_pct"`
-	TrailingStopPct   float64 `yaml:"trailing_stop_pct"`
-	EODExitOffsetMins int     `yaml:"eod_exit_offset_minutes"`
+	EODExitOffsetMins int `yaml:"eod_exit_offset_minutes"`
 }
 
 type Timing struct {
@@ -194,12 +206,6 @@ func (c *Config) Validate() error {
 		add("risk.position_size_pct * risk.max_concurrent_positions = %.0f%% exceeds 100%% of the portfolio", exposure)
 	}
 
-	if c.Exit.ProfitTargetPct <= 0 {
-		add("exit.profit_target_pct must be > 0")
-	}
-	if c.Exit.TrailingStopPct <= 0 || c.Exit.TrailingStopPct >= 100 {
-		add("exit.trailing_stop_pct must be in (0, 100)")
-	}
 	if c.Exit.EODExitOffsetMins < 1 {
 		add("exit.eod_exit_offset_minutes must be >= 1")
 	}

@@ -18,6 +18,11 @@ screening:
   # price, and sub-$1 was also the worst-performing price bucket. PROPOSED values.
   min_price: 1.0
   min_dollar_volume: 1000000
+  # A floor with deliberately no ceiling. A max_intraday_pct was tried and removed:
+  # under the old profit-target/trailing-stop exits the widest gaps were the worst
+  # trades, but once winners were allowed to run the extreme movers became the right
+  # tail the strategy depends on, and capping at +50% cost about half the terminal
+  # equity over a year. See docs/decisions.md.
   min_intraday_pct: 10.0            # docs/strategy.md §2
   min_volume_multiple: 5.0          # docs/strategy.md §2
   avg_volume_lookback_days: 20      # PROPOSED (docs left the lookback undecided)
@@ -30,17 +35,28 @@ screening:
   news_lookback: 18h
 
 risk:
-  position_size_pct: 10.0           # docs/risk.md
+  # 5%, not the 10% originally specified. Per-trade expectancy barely changes with
+  # size, but the account does, because a fixed fraction of a moving balance
+  # compounds: over the measured year 10% ended at $8,483 with a 79% max drawdown
+  # while 5% ended at $11,237 with 48%. See docs/risk.md and docs/decisions.md.
+  position_size_pct: 5.0
   max_concurrent_positions: 5       # docs/risk.md
   stop_loss_pct: 10.0               # docs/risk.md
   allow_same_day_reentry: false     # PROPOSED (docs left same-day re-entry undecided)
 
 exit:
-  # There is deliberately no MACD trigger. A 2024-2026 backtest measured it firing on
-  # 24.9% of trades for a mean return of -0.08% — it did no work, while costing a bar
-  # request per position per tick. See docs/decisions.md.
-  profit_target_pct: 15.0           # PROPOSED (docs left this undecided)
-  trailing_stop_pct: 5.0            # PROPOSED (docs left this undecided)
+  # Two triggers were removed on measurement and should not return without evidence.
+  #
+  # There is no MACD trigger: a 2024-2026 backtest measured it firing on 24.9% of
+  # trades for a mean of -0.08%, doing no work while costing a bar request per
+  # position per tick.
+  #
+  # There is no profit target or trailing stop either, and that one mattered. Armed at
+  # +15% and trailing 5% it could not exit above +9.25%, while those same positions
+  # went on to average +53%. Over 1,697 trades it turned a per-trade mean of +0.18%
+  # into -2.13% (t = -9.76), and a 150-cell sweep of stop x target x trail found no
+  # combination that made money. The return lives in a thin right tail, so truncating
+  # gains removes what pays for the losses. See docs/decisions.md.
   eod_exit_offset_minutes: 30       # docs/strategy.md §4
 
 timing:

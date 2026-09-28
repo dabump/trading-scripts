@@ -55,11 +55,12 @@ func TestAuditTrailCoversATradingDay(t *testing.T) {
 	h.at(10, 35)
 	h.tick()
 
-	// Run it up past the target, then break the trailing stop.
+	// Run it up and hold it: with no profit target or trailing stop left, the
+	// forced end-of-day exit is what closes a winner.
 	h.at(11, 0)
 	h.fake.SetPrice("ABCD", 6.00)
 	h.tick()
-	h.at(11, 30)
+	h.at(15, 30)
 	h.fake.SetPrice("ABCD", 5.70)
 	h.tick()
 
@@ -93,16 +94,19 @@ func TestAuditTrailCoversATradingDay(t *testing.T) {
 
 	// The sell record must say why and what it cost or made.
 	closed, _ := findEvent(events, audit.PositionClosed, "ABCD")
-	if closed.Detail["reason"] != string(domain.ExitTrailingStop) {
-		t.Errorf("exit reason = %v, want TRAILING_STOP", closed.Detail["reason"])
+	if closed.Detail["reason"] != string(domain.ExitForcedEOD) {
+		t.Errorf("exit reason = %v, want FORCED_EOD", closed.Detail["reason"])
 	}
 	if pnl, ok := closed.Detail["pnl_dollars"].(float64); !ok || pnl < 1399 || pnl > 1401 {
 		t.Errorf("pnl_dollars = %v, want ~1400", closed.Detail["pnl_dollars"])
 	}
+	if _, ok := closed.Detail["peak_price"]; !ok {
+		t.Error("sell record should carry the high-water mark")
+	}
 	if _, ok := closed.Detail["held_for"]; !ok {
 		t.Error("sell record should say how long the position was held")
 	}
-	if !strings.Contains(closed.Summary, "TRAILING_STOP") {
+	if !strings.Contains(closed.Summary, "FORCED_EOD") {
 		t.Errorf("summary = %q, should name the exit trigger", closed.Summary)
 	}
 }

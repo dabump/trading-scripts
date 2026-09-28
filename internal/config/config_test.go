@@ -19,9 +19,15 @@ func TestLoadShippedConfig(t *testing.T) {
 		t.Errorf("screen thresholds = %v%% / %vx, want 10%% / 5x (docs/strategy.md §2)",
 			c.Screening.MinIntradayPct, c.Screening.MinVolumeMultiple)
 	}
-	if c.Risk.PositionSizePct != 10 || c.Risk.MaxConcurrentPositions != 5 {
-		t.Errorf("sizing = %v%% x %d, want 10%% x 5 (docs/risk.md)",
+	if c.Risk.PositionSizePct != 5 || c.Risk.MaxConcurrentPositions != 5 {
+		t.Errorf("sizing = %v%% x %d, want 5%% x 5 (docs/risk.md)",
 			c.Risk.PositionSizePct, c.Risk.MaxConcurrentPositions)
+	}
+	// The exits are the stop-loss and the forced end-of-day deadline, and nothing
+	// else. A profit target or trailing stop here would reintroduce the single
+	// largest measured loss in the strategy's history (docs/decisions.md).
+	if c.Exit.EODExitOffsetMins != 30 {
+		t.Errorf("eod offset = %d, want 30 (docs/strategy.md §4)", c.Exit.EODExitOffsetMins)
 	}
 	// Tradability floors: without them the screen selects warrants and sub-$1 names
 	// that cannot be filled (see docs/decisions.md).
@@ -60,7 +66,7 @@ func valid() *Config {
 		AvgVolumeLookbackDays: 20, MaxEnriched: 100, NewsLookback: 18 * time.Hour,
 		MinPrice: 1, MinDollarVolume: 1_000_000}
 	c.Risk = Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	c.Exit = Exit{ProfitTargetPct: 15, TrailingStopPct: 5, EODExitOffsetMins: 30}
+	c.Exit = Exit{EODExitOffsetMins: 30}
 	c.Timing = Timing{SentimentPollInterval: 600e9, SentimentWindow: 3600e9,
 		ScreenerScanInterval: 60e9, PositionPollInterval: 15e9}
 	c.Sentiment = Sentiment{Symbols: []string{"SPY"}, BearishAvgPct: -0.8}

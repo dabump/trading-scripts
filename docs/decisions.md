@@ -348,7 +348,152 @@ Verified by removing the floors from `gatherCandidates` and watching
 `TestUntradableMoversAreRejectedBeforeEnrichment` fail on all four assertions — including
 an order actually placed for the $0.07 warrant.
 
+## 2026-09-28 — One-year backtest of the current strategy set
+
+Measured with `cmd/backtest`, which imports `screener`, `sentiment`, `risk` and
+`strategy` rather than reimplementing them, so the numbers describe the rules
+`cmd/agent` actually runs.
+
+**Method.** 2025-09-28 → 2026-09-26, 250 sessions, the **whole** tradable universe
+(13,192 symbols), real Alpaca SIP data, split-adjusted, 5-minute bars. A superset
+pre-filter on daily bars reduced the period to 7,246 candidate symbol-days; each was
+then replayed at every 5-minute boundary from 10:30 to the forced exit, with volume
+accumulated only from bars already closed, news counted only from stories already
+published, and the sentiment gate evaluated from SPY/QQQ/IWM at 10:30. No look-ahead.
+Unlike the earlier 2024-2026 run this one models the agent's **all-day scan cadence**
+rather than a single 10:30 decision, and applies the **news filter and the sentiment
+gate**, neither of which the earlier run included.
+
+**Result: the strategy as configured loses money, and not marginally.**
+
+| | as configured | with 0.25% slippage/side |
+|---|---|---|
+| Trades | 1,697 | 1,686 |
+| Win rate | 42.2% | 38.2% |
+| Mean / trade | **−1.70%** | **−2.13%** |
+| Median | −1.55% | −2.11% |
+| t-statistic | **−7.80** | **−9.76** |
+| Equity from $10k | **$564** (−94.4%) | $289 |
+| Max drawdown | 95.1% | 97.5% |
+
+At t ≈ −10 over 1,697 trades this is not noise. 33 sessions were halted by the
+bearish gate; 1,242 symbol-days were turned away by the tradability floors added
+earlier the same day.
+
+**The exits are the problem, and specifically the profit target and trailing stop.**
+
+| exit | share | mean | mean MFE | exits at | left on the table |
+|---|---|---|---|---|---|
+| Stop-loss | 37.4% | −10.69% | +13.73% | −10% | +18.95% |
+| Trailing stop | 23.2% | +9.31% | **+53.43%** | +9.31% | **+44.05%** |
+| Forced EOD | 39.5% | +0.34% | +6.08% | — | +3.09% |
+
+A trailing stop armed at +15% and trailing 5% cannot exit above +9.25%, and in
+practice exits at +9.31% — while those same positions go on to average **+53%**. The
+rule caps the right tail at +9% and leaves the left tail at −10.7%. At a 42% win rate
+that payoff ratio cannot be profitable, and the measurement says it is not.
+
+Removing it is the single largest available improvement. Every structure that keeps a
+profit target scores t ≈ −10; every structure without one scores t ≈ 0:
+
+| structure | trades | mean | t | equity |
+|---|---|---|---|---|
+| as configured (10 / 15 / 5) | 1,686 | −2.13% | −9.76 | $289 |
+| stop 20% + forced EOD | 1,319 | +0.33% | +0.36 | $8,719 |
+| **stop 10% + forced EOD** | 1,601 | **+0.18%** | **+0.28** | **$8,483** |
+| stop 15% + forced EOD | 1,431 | +0.11% | +0.15 | $7,726 |
+| forced EOD only | 1,064 | +0.10% | +0.08 | $6,064 |
+| stop 5% + forced EOD | 1,727 | −0.11% | −0.23 | $6,065 |
+| take-profit +10% + 10% stop | 1,715 | −2.04% | −9.95 | $314 |
+| tight: 3% / +8% / 2% | 1,760 | −1.54% | −10.05 | $697 |
+
+A 150-cell sweep of stop × target × trail (3–25% / 5–20% / 0–8%) was run as well.
+**Every cell loses money**; the best ends at $727. No tuning of the current exit
+structure rescues it — the structure itself has to change.
+
+**Position size, not the exits, decides the account.** On stop 10% + forced EOD the
+per-trade mean barely moves with size, but the equity curve does, because 10% of a
+falling balance compounds:
+
+| size | mean | equity | max drawdown |
+|---|---|---|---|
+| 2% | +0.29% | $10,695 | 23.1% |
+| 5% | +0.26% | $11,237 | 48.5% |
+| 10% (current) | +0.18% | $8,483 | 79.2% |
+| 20% | +0.28% | $4,842 | 96.4% |
+
+**Two entry findings, incidental but load-bearing.** The relative-volume tie-break
+ranks backwards: 5–8x returns −1.46% and 12–20x returns −2.81%, so preferring the
+highest relative volume systematically picks the worse name. And the bigger the gap,
+the worse the trade: +15–25% returns −0.90%, over +100% returns −3.13% with a median
+of −10.00%. The largest movers in the sample — `DSY` +732%, `CPHI` +729%, `SKK` +597%
+— all stopped out.
+
+| Decision | Rationale |
+|---|---|
+| Nothing changed in the strategy yet; this entry records the measurement only | The user asked what the strategy would do and how to improve the exits, not for the changes to be applied. The recommendations are listed under open items below. |
+| `cmd/backtest` added to the repo rather than kept as a throwaway script | The plan this came from requires re-measuring after any `screener`/`strategy` change, and a measurement tool that drifts from the daemon reports on a strategy nobody runs. It imports the production packages and has its own tests for the pre-filter's superset property and the ambiguous-bar exit ordering. |
+
+A correction to the earlier 2024-2026 backtest recorded above: it reported mean
+**+0.54%** per trade with the exits applied and concluded the exits were what saved a
+losing premise. With the full scan cadence modelled — the agent screens every minute
+all day, not once at 10:30 — that reverses. The earlier figure was an artifact of
+testing a single entry moment per session. The exits do not save the strategy; the
+profit target and trailing stop are its largest single loss.
+
+## 2026-09-28 — Recommendations applied, and one reverted on measurement
+
+Acting on the backtest recorded above. Three of the five recommendations survived
+re-measurement, one was a no-op, and one was **implemented and then backed out**
+because measuring it after the other changes showed it did harm.
+
+| Decision | Rationale |
+|---|---|
+| **Removed `exit.profit_target_pct` and `exit.trailing_stop_pct`**, and with them `strategy.TrailArmed`, `domain.ExitTrailingStop`, `Position.TrailArmed`, the `trail_armed` column and the status page's "trailing armed" pill | The measured cost of the rule. Armed at +15% and trailing 5% it could not exit above +9.25% and exited at +9.31%, while the same positions went on to average +53%. Over 1,697 trades removing it moved the per-trade mean from −2.13% to +0.18% and the t-statistic from −9.76 to +0.28. `EvaluateExit` is now two triggers: forced EOD, then stop-loss. |
+| **`risk.position_size_pct` 10% → 5%** | Per-trade expectancy is nearly independent of size; the equity curve is not, because a fixed fraction of a moving balance compounds. At 0.25% slippage, 10% ended the year at $8,483 with a 79% max drawdown against 5% at $11,237 with 48%. 2% was better still on drawdown ($10,695 / 23%) — the user chose 5%, accepting the deeper drawdown for the higher terminal equity. Maximum exposure is now 25%, not 50%. |
+| **`risk.stop_loss_pct` left at 10%** | The recommendation was "do not tighten", and that is satisfied by changing nothing. Widening to 15–20% measured slightly better ($10,641 and $12,620 at 5% size against $11,237) but the differences are well inside noise on a t-statistic near 0.3, and `risk.md` treats 10% as settled. Not worth churning a settled risk parameter for an insignificant gain. |
+| **Candidate tie-break left alone** | Measured, not assumed. Ranking by highest relative volume (current), lowest relative volume, smallest move, largest move and highest price all land between −0.57% and −0.67% mean, t between −1.2 and −1.5. No ordering is distinguishable from another. The earlier per-bucket hint that the ranking was inverted does not survive a direct test — which is the second time that particular claim has failed to replicate, and it should now be considered settled as *no effect*. The tie-break only binds when slots are scarce, so this is the expected result. |
+| **A ceiling on the entry move was added and then removed** | This is the important one. Under the old exits the widest gaps were clearly the worst trades: above +100% returned −3.13% against −0.90% for +15–25%, roughly three standard errors apart. `screening.max_intraday_pct` was implemented on that basis. Re-measured *after* the profit target and trailing stop came out, every ceiling was worse than none: none → +0.18% mean and $8,483, +50% → −0.59% and $4,262, +100% → −0.58% and $3,687. The reason is the reason the exits changed — once winners are allowed to run, the extreme movers **are** the right tail; the best trade in the year is +324%. The setting, its validation, its panel row and its tests were all backed out. |
+
+**The generalisable lesson, which is worth more than the changes:** the move-ceiling
+finding was real, well-powered and correctly derived — and wrong, because it was
+derived under a rule set that then changed. Screening and exits are not independent.
+Any future entry-side finding has to be re-measured against the exits in force, and
+`cmd/backtest` keeps `reportMoveCaps` specifically so this conclusion can be re-tested
+rather than trusted.
+
+**Where the strategy now stands**, one year, full universe, 1,591 trades:
+
+| slippage/side | mean | median | equity from $10k | max drawdown |
+|---|---|---|---|---|
+| 0.00% | **+0.76%** | −3.91% | **$16,453** | 38.4% |
+| 0.10% | +0.55% | −4.20% | $13,611 | 45.3% |
+| **0.25%** | **+0.26%** | −4.49% | **$11,237** | 48.5% |
+| 0.50% | −0.32% | −5.10% | $6,962 | 59.3% |
+
+Win rate 35.1%, best trade +324%, worst −42%. The profile inverted: it now loses on
+most trades and makes its money on a minority of large winners, which is what the
+removed rules were preventing.
+
+**It still has no statistically significant edge.** t = 1.20 with no slippage and
+lower with any, against a threshold of about 2. The changes removed a proven loss
+(t = −9.76) and left something indistinguishable from zero. Execution quality is now
+the whole question: the difference between 0.10% and 0.50% slippage is the difference
+between +$3,611 and −$3,038. Measuring realised slippage in paper trading is the next
+step, and limit orders are the obvious lever — `execution.order_type` already supports
+them.
+
+**The PDT blocker is unchanged.** The worst rolling five-session day-trade count is
+**63** against a limit of 3 for a sub-$25k margin account.
+
 ## Open items (not yet decided)
+
+- **Measure realised slippage in paper trading, then decide on limit orders.** It is now the single largest unknown: the strategy is profitable at 0.10% per side and unprofitable at 0.50%. `execution.order_type` supports `limit` with `limit_slip_pct` already.
+- **Still no demonstrated edge, and still not a candidate for live capital.** t = 1.20 is not significance. The survivorship bias in the universe and the optimistic stop fills both push the true figure down, not up.
+
+- **Recommended, in order of measured value, none applied:** (1) remove `exit.profit_target_pct` and `exit.trailing_stop_pct` entirely, leaving the hard stop and the forced EOD exit — moves t from −9.76 to +0.28; (2) cut `risk.position_size_pct` to 2–5%, which changes max drawdown from 79% to 23% at the same per-trade mean; (3) widen `risk.stop_loss_pct` toward 15–20%, or at least do not tighten it, since 5% is measurably worse than 10%; (4) invert or drop the relative-volume tie-break; (5) add a ceiling on the intraday move at entry, because gaps over +50% are the worst bucket measured.
+- **Even the best structure has no edge.** t ≈ +0.3 is indistinguishable from zero: the recommendations above remove a proven loss, they do not produce a proven profit. Nothing measured here justifies live capital.
+- **The PDT rule is not a future problem, it is a blocker.** The worst rolling five-session day-trade count is **64** against a limit of 3 for a sub-$25k margin account.
 
 - **The strategy has no demonstrated edge, and this is the load-bearing open item.** Screening floors and the MACD removal address composition and dead weight; neither creates an edge. Before any real money: measure realised slippage in paper trading, since that single number decides the outcome, and decide whether entries must be limit orders.
 

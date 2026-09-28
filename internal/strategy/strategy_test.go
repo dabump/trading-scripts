@@ -10,8 +10,6 @@ import (
 func cfg() *config.Config {
 	c := &config.Config{}
 	c.Risk.StopLossPct = 10
-	c.Exit.ProfitTargetPct = 15
-	c.Exit.TrailingStopPct = 5
 	return c
 }
 
@@ -42,33 +40,35 @@ func TestEvaluateExitPriority(t *testing.T) {
 			wantExit: false,
 		},
 		{
-			name: "trailing stop does not arm below the profit target",
+			// The removed trailing stop would have closed this at +14%. Nothing may
+			// now take a winner off the table before the bell: the strategy's whole
+			// return is in the right tail, and a rule that trims it was measured
+			// turning a positive per-trade mean negative.
+			name: "a position well off its peak is still held",
 			in: ExitInput{
-				// Peaked at +14%, never reached the +15% target, then fell 5% off
-				// that peak. The trailing stop must stay disarmed.
-				Position: domain.Position{EntryPrice: 100, PeakPrice: 114},
-				Price:    108,
+				Position: domain.Position{EntryPrice: 100, PeakPrice: 160},
+				Price:    120,
 			},
 			wantExit: false,
 		},
 		{
-			name: "trailing stop fires once armed",
+			name: "a large gain is held to the close",
 			in: ExitInput{
-				// Peaked at +20% (target reached), now 5% below that peak.
-				Position: domain.Position{EntryPrice: 100, PeakPrice: 120},
-				Price:    114,
+				Position: domain.Position{EntryPrice: 100, PeakPrice: 250},
+				Price:    250,
 			},
-			wantExit:   true,
-			wantReason: domain.ExitTrailingStop,
+			wantExit: false,
 		},
 		{
-			name: "armed trailing stop stays armed after dipping below target",
+			// Only the stop-loss reads the peak-independent floor, so a position
+			// that peaked high and then collapsed past the stop still stops out.
+			name: "a collapse past the stop still exits on the stop",
 			in: ExitInput{
-				Position: domain.Position{EntryPrice: 100, PeakPrice: 116, TrailArmed: true},
-				Price:    110,
+				Position: domain.Position{EntryPrice: 100, PeakPrice: 200},
+				Price:    89,
 			},
 			wantExit:   true,
-			wantReason: domain.ExitTrailingStop,
+			wantReason: domain.ExitStopLoss,
 		},
 	}
 
@@ -98,22 +98,24 @@ func TestExitThresholdsTriggerAtExactBoundaries(t *testing.T) {
 		wantReason domain.ExitReason
 	}{
 		{
-			name:       "exactly 5% below a 6.00 peak",
-			pos:        domain.Position{EntryPrice: 5.00, PeakPrice: 6.00, TrailArmed: true},
-			price:      5.70,
-			wantReason: domain.ExitTrailingStop,
-		},
-		{
 			name:       "exactly 10% below a 4.20 entry",
 			pos:        domain.Position{EntryPrice: 4.20, PeakPrice: 4.20},
 			price:      3.78,
 			wantReason: domain.ExitStopLoss,
 		},
 		{
-			name:       "exactly 5% below a 1.13 peak",
-			pos:        domain.Position{EntryPrice: 1.00, PeakPrice: 1.13, TrailArmed: true},
-			price:      1.0735,
-			wantReason: domain.ExitTrailingStop,
+			// 1.00 * 0.9 is 0.9000000000000001 in binary, so an exact 0.90 reads as
+			// above the stop without the epsilon.
+			name:       "exactly 10% below a 1.00 entry",
+			pos:        domain.Position{EntryPrice: 1.00, PeakPrice: 1.00},
+			price:      0.90,
+			wantReason: domain.ExitStopLoss,
+		},
+		{
+			name:       "exactly 10% below a 33.33 entry",
+			pos:        domain.Position{EntryPrice: 33.33, PeakPrice: 40.00},
+			price:      29.997,
+			wantReason: domain.ExitStopLoss,
 		},
 	}
 	for _, tt := range tests {
@@ -132,37 +134,5 @@ func TestExitThresholdsTriggerAtExactBoundaries(t *testing.T) {
 	}, c)
 	if got.Exit {
 		t.Errorf("a price above the stop must not exit: %+v", got)
-	}
-}
-
-// The profit target must also arm at its exact boundary.
-func TestTrailArmsAtExactTarget(t *testing.T) {
-	c := cfg()
-	// 4.20 * 1.15 = 4.829999999999999 in binary.
-	p := domain.Position{EntryPrice: 4.20, PeakPrice: 4.83}
-	if !TrailArmed(p, c) {
-		t.Error("a peak exactly at the profit target must arm the trailing stop")
-	}
-}
-
-func TestTrailArmed(t *testing.T) {
-	c := cfg()
-	tests := []struct {
-		name string
-		pos  domain.Position
-		want bool
-	}{
-		{"below target", domain.Position{EntryPrice: 100, PeakPrice: 114}, false},
-		{"exactly at target", domain.Position{EntryPrice: 100, PeakPrice: 115}, true},
-		{"above target", domain.Position{EntryPrice: 100, PeakPrice: 130}, true},
-		{"already latched", domain.Position{EntryPrice: 100, PeakPrice: 101, TrailArmed: true}, true},
-		{"peak below entry", domain.Position{EntryPrice: 100, PeakPrice: 90}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := TrailArmed(tt.pos, c); got != tt.want {
-				t.Errorf("TrailArmed = %v, want %v", got, tt.want)
-			}
-		})
 	}
 }

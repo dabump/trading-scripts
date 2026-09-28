@@ -47,6 +47,14 @@ func TestEvaluateAllCriteriaMustPass(t *testing.T) {
 			true, "",
 		},
 		{
+			// There is deliberately no ceiling. A cap was measured and removed: the
+			// extreme movers are the right tail the strategy lives on once winners
+			// are allowed to run.
+			"an extreme move still passes",
+			func(in *Input) { in.IntradayPct = 312 },
+			true, "",
+		},
+		{
 			"volume below 5x fails",
 			func(in *Input) { in.TodayVolume = 4_900_000 },
 			false, CriterionVolume,

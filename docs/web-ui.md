@@ -96,7 +96,10 @@ Plus a totals row: net P&L for the day (aggregate $ and %) and a win/loss count,
 ## Active strategy section (bottom of the page)
 
 A four-part panel at the foot of the page describing the running strategy: the
-sentiment gate, the screening criteria, entry and sizing, and the exits.
+sentiment gate, the screening criteria, entry and sizing, and the exits. The exits
+section lists "Take profit: none" rather than omitting the row, because the absence is
+a deliberate measured choice and a reader checking the page should see that it was
+decided rather than forgotten.
 
 **Every value is read from the loaded configuration**, never written into the
 template. That is the whole point of the section: a hardcoded panel would pass a

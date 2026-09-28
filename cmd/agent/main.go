@@ -156,8 +156,6 @@ func run() error {
 			"position_size_pct":        cfg.Risk.PositionSizePct,
 			"max_concurrent_positions": cfg.Risk.MaxConcurrentPositions,
 			"stop_loss_pct":            cfg.Risk.StopLossPct,
-			"profit_target_pct":        cfg.Exit.ProfitTargetPct,
-			"trailing_stop_pct":        cfg.Exit.TrailingStopPct,
 			"min_price":                cfg.Screening.MinPrice,
 			"min_dollar_volume":        cfg.Screening.MinDollarVolume,
 			"eod_exit_offset_minutes":  cfg.Exit.EODExitOffsetMins,

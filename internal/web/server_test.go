@@ -56,7 +56,7 @@ func testConfig() *config.Config {
 		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
 		NewsLookback: 18 * time.Hour, MinPrice: 1, MinDollarVolume: 1_000_000}
 	c.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	c.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, EODExitOffsetMins: 30}
+	c.Exit = config.Exit{EODExitOffsetMins: 30}
 	c.Timing = config.Timing{SentimentWindow: time.Hour, SentimentPollInterval: 10 * time.Minute,
 		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
 	c.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"}, BearishAvgPct: -0.8}
@@ -234,7 +234,7 @@ func TestOpenPositionsShowLivePnL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.store.UpdateMark(id, 5.60, 5.75, true); err != nil {
+	if err := f.store.UpdateMark(id, 5.60, 5.75); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,7 +246,6 @@ func TestOpenPositionsShowLivePnL(t *testing.T) {
 		"$5.75",    // peak
 		"+1200.00", // 2000 x $0.60
 		"+12.00%",
-		"trailing armed",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("positions table missing %q", want)
@@ -267,7 +266,7 @@ func TestEndOfDaySectionTiming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.store.ClosePosition(id, 4.40, f.now, domain.ExitTrailingStop); err != nil {
+	if err := f.store.ClosePosition(id, 4.40, f.now, domain.ExitStopLoss); err != nil {
 		t.Fatal(err)
 	}
 
@@ -287,7 +286,7 @@ func TestEndOfDaySectionTiming(t *testing.T) {
 		"$4.00",   // opened
 		"$4.40",   // closed
 		"+10.00%", // P&L %
-		"TRAILING_STOP",
+		"STOP_LOSS",
 		"+40.00", // net: 100 x $0.40
 		"1 up · 0 down",
 	} {

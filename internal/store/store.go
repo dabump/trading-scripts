@@ -224,10 +224,10 @@ func (s *Store) InsertPosition(p domain.Position) (int64, error) {
 	// mark for a position opened between two trading-loop ticks.
 	res, err := s.db.Exec(
 		`INSERT INTO positions
-		 (session_date, symbol, shares, entry_price, entry_time, peak_price, last_price, trail_armed, is_open)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+		 (session_date, symbol, shares, entry_price, entry_time, peak_price, last_price, is_open)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
 		p.SessionDate, p.Symbol, p.Shares, p.EntryPrice, formatTime(p.EntryTime),
-		peak, p.EntryPrice, boolToInt(p.TrailArmed))
+		peak, p.EntryPrice)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, fmt.Errorf("%w: %s", ErrDuplicateOpenPosition, p.Symbol)
@@ -237,14 +237,13 @@ func (s *Store) InsertPosition(p domain.Position) (int64, error) {
 	return res.LastInsertId()
 }
 
-// UpdateMark records the latest observed price, raises the high-water mark, and
-// latches the trailing stop. The peak and the armed flag only ever move up, so a
-// stale or out-of-order tick cannot undo them.
-func (s *Store) UpdateMark(id int64, lastPrice, peak float64, trailArmed bool) error {
+// UpdateMark records the latest observed price and raises the high-water mark. The
+// peak only ever moves up, so a stale or out-of-order tick cannot undo it.
+func (s *Store) UpdateMark(id int64, lastPrice, peak float64) error {
 	_, err := s.db.Exec(
 		`UPDATE positions
-		 SET last_price = ?, peak_price = MAX(peak_price, ?), trail_armed = MAX(trail_armed, ?)
-		 WHERE id = ?`, lastPrice, peak, boolToInt(trailArmed), id)
+		 SET last_price = ?, peak_price = MAX(peak_price, ?)
+		 WHERE id = ?`, lastPrice, peak, id)
 	if err != nil {
 		return fmt.Errorf("update mark: %w", err)
 	}
@@ -269,15 +268,14 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 	for rows.Next() {
 		var p domain.Position
 		var entryTime, exitTime string
-		var trailArmed, isOpen int
+		var isOpen int
 		if err := rows.Scan(&p.ID, &p.SessionDate, &p.Symbol, &p.Shares, &p.EntryPrice,
-			&entryTime, &p.PeakPrice, &p.LastPrice, &trailArmed, &isOpen, &p.ExitPrice,
+			&entryTime, &p.PeakPrice, &p.LastPrice, &isOpen, &p.ExitPrice,
 			&exitTime, &p.ExitReason); err != nil {
 			return nil, err
 		}
 		p.EntryTime = parseTime(entryTime)
 		p.ExitTime = parseTime(exitTime)
-		p.TrailArmed = trailArmed == 1
 		p.Open = isOpen == 1
 		out = append(out, p)
 	}
@@ -285,7 +283,7 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 }
 
 const positionColumns = `id, session_date, symbol, shares, entry_price, entry_time,
-	peak_price, last_price, trail_armed, is_open, exit_price, exit_time, exit_reason`
+	peak_price, last_price, is_open, exit_price, exit_time, exit_reason`
 
 // OpenPositions returns every currently-held position, regardless of session.
 func (s *Store) OpenPositions() ([]domain.Position, error) {
@@ -427,11 +425,4 @@ func (s *Store) SymbolsTradedOn(date string) (map[string]bool, error) {
 		out[sym] = true
 	}
 	return out, rows.Err()
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

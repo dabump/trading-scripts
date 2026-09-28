@@ -122,7 +122,6 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
   background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
 }
 .pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); }
-.pill.armed { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
 
 .legend { display: grid; gap: 8px; }
 .legend .row { display: flex; gap: 12px; align-items: baseline; font-size: 13px; }
@@ -336,7 +335,7 @@ setInterval(refresh, POLL_MS);
       <tr>
         <th>Symbol</th><th class="num">Shares</th><th class="num">Entry</th>
         <th class="num">Current</th><th class="num">Peak</th>
-        <th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th></th>
+        <th class="num">P&amp;L</th><th class="num">P&amp;L %</th>
       </tr>
     </thead>
     <tbody>
@@ -349,7 +348,6 @@ setInterval(refresh, POLL_MS);
         <td class="num muted">{{.Peak}}</td>
         <td class="num {{.Tone}}">{{.PnLDollars}}</td>
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
-        <td>{{if .TrailArmed}}<span class="pill armed">trailing armed</span>{{end}}</td>
       </tr>
       {{end}}
     </tbody>

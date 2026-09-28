@@ -38,12 +38,10 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `screening.avg_volume_lookback_days` | 20 | **PROPOSED** — excludes today |
 | `screening.max_enriched` | 100 | **PROPOSED** — caps the per-symbol lookups after the move filter, not the scan itself |
 | `screening.news_lookback` | 18h | **PROPOSED** — must reach back past the open so pre-market catalysts are visible; validated to be ≥7h |
-| `risk.position_size_pct` | 10.0 | `risk.md` |
+| `risk.position_size_pct` | 5.0 | `risk.md`; reduced from 10.0 on measurement — same expectancy, far less drawdown |
 | `risk.max_concurrent_positions` | 5 | `risk.md`; validated so sizing × concurrency cannot exceed 100% |
 | `risk.stop_loss_pct` | 10.0 | `risk.md` |
 | `risk.allow_same_day_reentry` | `false` | **PROPOSED** |
-| `exit.profit_target_pct` | 15.0 | **PROPOSED** — arms the trailing stop |
-| `exit.trailing_stop_pct` | 5.0 | **PROPOSED** |
 | `exit.eod_exit_offset_minutes` | 30 | `strategy.md` §4 |
 | `timing.sentiment_poll_interval` | 10m | `strategy.md` §1 |
 | `timing.sentiment_window` | 1h | `strategy.md` §1 |

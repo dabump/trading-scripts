@@ -75,7 +75,6 @@ type PositionRow struct {
 	PnLDollars string
 	PnLPct     string
 	Tone       string
-	TrailArmed bool
 }
 
 type EODRow struct {
@@ -355,7 +354,7 @@ func BuildView(
 			Symbol: p.Symbol, Shares: p.Shares,
 			Entry: money(p.EntryPrice), Current: money(current), Peak: money(p.PeakPrice),
 			PnLDollars: signedMoney(pnl), PnLPct: pct(p.UnrealizedPct(current)),
-			Tone: toneForPnL(pnl), TrailArmed: p.TrailArmed,
+			Tone: toneForPnL(pnl),
 		})
 	}
 	v.ExposureText = fmt.Sprintf("%d of %d slots · %s at risk",
@@ -446,7 +445,11 @@ func strategySections(cfg *config.Config) []StrategySection {
 				Value: "$" + groupNumber(cfg.Screening.MinDollarVolume),
 				Note:  "dollar volume before entry; keeps unfillable names out",
 			},
-			{Label: "Intraday move", Value: "≥ " + pctOf(cfg.Screening.MinIntradayPct)},
+			{
+				Label: "Intraday move",
+				Value: "≥ " + pctOf(cfg.Screening.MinIntradayPct),
+				Note:  "no ceiling: capping the move was measured and made things worse",
+			},
 			{
 				Label: "Relative volume",
 				Value: "≥ " + trimNumber(cfg.Screening.MinVolumeMultiple) + "x",
@@ -530,14 +533,11 @@ func strategySections(cfg *config.Config) []StrategySection {
 				Note:  "a hard floor, checked ahead of the momentum signals",
 			},
 			{
-				Label: "Profit target",
-				Value: "+" + pctOf(cfg.Exit.ProfitTargetPct),
-				Note:  "arms the trailing stop; it does not sell on its own",
-			},
-			{
-				Label: "Trailing stop",
-				Value: pctOf(cfg.Exit.TrailingStopPct) + " below the peak",
-				Note:  "active only once the profit target has been reached",
+				Label: "Take profit",
+				Value: "none",
+				Note: "removed on measurement: a profit target with a trailing stop " +
+					"capped gains at +9% while losses ran to −10%, and the return lives " +
+					"in the tail it was cutting",
 			},
 		},
 	}

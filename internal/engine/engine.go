@@ -861,11 +861,9 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 		if price > p.PeakPrice {
 			p.PeakPrice = price
 		}
-		armed := strategy.TrailArmed(p, e.cfg)
-		if err := e.store.UpdateMark(p.ID, price, p.PeakPrice, armed); err != nil {
+		if err := e.store.UpdateMark(p.ID, price, p.PeakPrice); err != nil {
 			return err
 		}
-		p.TrailArmed = armed
 
 		decision := strategy.EvaluateExit(strategy.ExitInput{
 			Position: p, Price: price, EODReached: forceEOD,
@@ -896,7 +894,6 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 				"entry_price": p.EntryPrice,
 				"exit_price":  exitPrice,
 				"peak_price":  p.PeakPrice,
-				"trail_armed": p.TrailArmed,
 				"pnl_dollars": p.UnrealizedDollars(exitPrice),
 				"pnl_pct":     p.UnrealizedPct(exitPrice),
 				"held_for":    e.now().Sub(p.EntryTime).String(),

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -148,27 +149,24 @@ func TestPositionLifecycle(t *testing.T) {
 		t.Errorf("entry time = %v, want %v", open[0].EntryTime, entry)
 	}
 
-	if err := s.UpdateMark(id, 5.00, 5.00, true); err != nil {
+	if err := s.UpdateMark(id, 5.00, 5.00); err != nil {
 		t.Fatal(err)
 	}
-	// A lower peak must never overwrite a higher one, and the armed flag must not
-	// be un-latched, but the last mark does follow the price down.
-	if err := s.UpdateMark(id, 4.50, 4.50, false); err != nil {
+	// A lower peak must never overwrite a higher one, but the last mark does follow
+	// the price down.
+	if err := s.UpdateMark(id, 4.50, 4.50); err != nil {
 		t.Fatal(err)
 	}
 	open, _ = s.OpenPositions()
 	if open[0].PeakPrice != 5.00 {
 		t.Errorf("peak = %v, want 5.00 to be retained", open[0].PeakPrice)
 	}
-	if !open[0].TrailArmed {
-		t.Error("trail must stay armed once latched")
-	}
 	if open[0].LastPrice != 4.50 {
 		t.Errorf("last price = %v, want 4.50 to track the current mark", open[0].LastPrice)
 	}
 
 	exitAt := entry.Add(2 * time.Hour)
-	if err := s.ClosePosition(id, 4.75, exitAt, domain.ExitTrailingStop); err != nil {
+	if err := s.ClosePosition(id, 4.75, exitAt, domain.ExitStopLoss); err != nil {
 		t.Fatal(err)
 	}
 	open, _ = s.OpenPositions()
@@ -184,8 +182,8 @@ func TestPositionLifecycle(t *testing.T) {
 		t.Fatalf("got %d session positions, want 1", len(all))
 	}
 	closed := all[0]
-	if closed.Open || closed.ExitReason != domain.ExitTrailingStop {
-		t.Errorf("got open=%v reason=%q, want closed via trailing stop", closed.Open, closed.ExitReason)
+	if closed.Open || closed.ExitReason != domain.ExitStopLoss {
+		t.Errorf("got open=%v reason=%q, want closed via the stop-loss", closed.Open, closed.ExitReason)
 	}
 	// 200 shares from 4.20 to 4.75 is $110 and +13.10%.
 	if got := closed.RealizedDollars(); got < 109.99 || got > 110.01 {
@@ -312,5 +310,89 @@ func TestSymbolsTradedOn(t *testing.T) {
 	}
 	if other, _ := s.SymbolsTradedOn("2026-09-29"); len(other) != 0 {
 		t.Errorf("got %v for a different date, want empty", other)
+	}
+}
+
+// The deployment target is a single binary pointed at a database that already
+// exists, so a migration has to work as an upgrade and not only on a fresh file.
+// 003 drops a column, which SQLite refuses outright in some conditions — a fresh-DB
+// test would pass while every real deployment failed to start.
+func TestMigrationUpgradesAnExistingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Build the schema as it stood before 003, with a row in it, and mark 001 and
+	// 002 as already applied so Open has to run 003 and nothing else.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmts := []string{
+		`CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		`CREATE TABLE positions (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_date TEXT NOT NULL,
+			symbol       TEXT NOT NULL,
+			shares       INTEGER NOT NULL,
+			entry_price  REAL NOT NULL,
+			entry_time   TEXT NOT NULL,
+			peak_price   REAL NOT NULL,
+			trail_armed  INTEGER NOT NULL DEFAULT 0,
+			is_open      INTEGER NOT NULL DEFAULT 1,
+			exit_price   REAL NOT NULL DEFAULT 0,
+			exit_time    TEXT NOT NULL DEFAULT '',
+			exit_reason  TEXT NOT NULL DEFAULT '',
+			last_price   REAL NOT NULL DEFAULT 0
+		)`,
+		`CREATE UNIQUE INDEX positions_one_open_per_symbol ON positions (symbol) WHERE is_open = 1`,
+		`INSERT INTO positions
+			(session_date, symbol, shares, entry_price, entry_time, peak_price,
+			 trail_armed, is_open, last_price)
+		 VALUES ('2026-09-28', 'ABCD', 200, 4.20, '2026-09-28T10:35:00Z', 5.00, 1, 1, 4.80)`,
+		`INSERT INTO schema_migrations (name, applied_at) VALUES ('001_init.sql', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO schema_migrations (name, applied_at) VALUES ('002_last_price.sql', '2026-01-01T00:00:00Z')`,
+	}
+	for _, q := range stmts {
+		if _, err := legacy.Exec(q); err != nil {
+			t.Fatalf("seed legacy schema: %v\n%s", err, q)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrating an existing database failed: %v", err)
+	}
+	defer s.Close()
+
+	// The position survives the column drop, with its other fields intact.
+	open, err := s.OpenPositions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("got %d open positions, want the pre-existing one", len(open))
+	}
+	got := open[0]
+	if got.Symbol != "ABCD" || got.Shares != 200 || got.EntryPrice != 4.20 ||
+		got.PeakPrice != 5.00 || got.LastPrice != 4.80 {
+		t.Errorf("position did not survive the migration intact: %+v", got)
+	}
+
+	// The column is actually gone, not merely unread.
+	if _, err := s.db.Exec(`SELECT trail_armed FROM positions`); err == nil {
+		t.Error("trail_armed is still present after 003")
+	}
+
+	// The one-open-position-per-symbol guarantee must survive too: SQLite rebuilds
+	// the table for a column drop, and a lost partial index would silently allow
+	// double positions.
+	_, err = s.InsertPosition(domain.Position{
+		SessionDate: "2026-09-28", Symbol: "ABCD", Shares: 1, EntryPrice: 4.20,
+		EntryTime: time.Now(),
+	})
+	if !errors.Is(err, ErrDuplicateOpenPosition) {
+		t.Errorf("duplicate insert error = %v, want ErrDuplicateOpenPosition — the partial index did not survive", err)
 	}
 }

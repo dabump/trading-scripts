@@ -40,9 +40,8 @@ const (
 type ExitReason string
 
 const (
-	ExitForcedEOD    ExitReason = "FORCED_EOD"
-	ExitStopLoss     ExitReason = "STOP_LOSS"
-	ExitTrailingStop ExitReason = "TRAILING_STOP"
+	ExitForcedEOD ExitReason = "FORCED_EOD"
+	ExitStopLoss  ExitReason = "STOP_LOSS"
 	// ExitReconciled is not a strategy exit: it records a position the broker no
 	// longer holds, found during restart reconciliation. Kept distinct so the
 	// end-of-day summary never attributes a disappearance to a strategy rule.
@@ -87,7 +86,6 @@ type Position struct {
 	// LastPrice is the most recent mark recorded by the trading loop, used by the
 	// status page so it never has to call the market data API itself.
 	LastPrice  float64
-	TrailArmed bool
 	Open       bool
 	ExitPrice  float64
 	ExitTime   time.Time

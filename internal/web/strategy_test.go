@@ -90,18 +90,6 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			wantValue: "−6.5% from entry",
 		},
 		{
-			name:      "profit target",
-			label:     "Profit target",
-			mutate:    func(f *fixture) { f.cfg.Exit.ProfitTargetPct = 22 },
-			wantValue: "+22%",
-		},
-		{
-			name:      "trailing stop",
-			label:     "Trailing stop",
-			mutate:    func(f *fixture) { f.cfg.Exit.TrailingStopPct = 2.5 },
-			wantValue: "2.5% below the peak",
-		},
-		{
 			name:      "forced end-of-day offset",
 			label:     "Forced end-of-day",
 			mutate:    func(f *fixture) { f.cfg.Exit.EODExitOffsetMins = 45 },
@@ -266,7 +254,7 @@ func TestStrategyPanelListsExitsInPriorityOrder(t *testing.T) {
 	f := newFixture(t)
 	_, body := f.get(t, "/")
 
-	want := []string{"Forced end-of-day", "Stop-loss", "Profit target", "Trailing stop"}
+	want := []string{"Forced end-of-day", "Stop-loss", "Take profit"}
 	prev := -1
 	for _, label := range want {
 		at := strings.Index(body, label)

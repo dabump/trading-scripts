@@ -11,6 +11,7 @@ The rule that replaced "the page cannot trade" is narrower and more useful: **a 
 - **Rendering:** server-rendered Go `html/template`, styled with modern CSS (cards, clear typography/spacing, subtle color accents) — no JS frontend framework, no separate build pipeline. Keeps this a single Go binary; "modern and stylish" is a CSS/layout goal, not a reason to add a second toolchain.
 - **Theme:** dark, fitting a trading-terminal feel and easier to glance at repeatedly through the trading day. No light-theme toggle in v1 — one theme, done well, rather than two done halfway.
 - **Live updates:** lightweight JS polling every ~10–15s that patches the page in place (not a full reload, not a WebSocket). This resolves the "refresh behavior" question below — it's no longer open.
+- **Every symbol is a link to its TradingView chart**, opened in a new tab (`tradingview.com/chart/?symbol=…`). The page shows why the agent acted but no chart, and reading the tape is the first thing an operator does with a ticker they have just seen. It is one shared template (`symbolCell`), so positions, the screening table and both modals link identically; a plain anchor rather than JS, so the existing click handlers — which all match on `button` — cannot swallow it, and so it survives the fragment swap.
 
 ## Manual checks (two buttons)
 

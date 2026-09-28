@@ -111,6 +111,10 @@ tbody tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); 
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .sym { font-weight: 650; letter-spacing: .02em; }
+.sym a, .sym a:link, .sym a:visited, .sym a:hover, .sym a:active {
+  color: var(--text); text-decoration: none; border-bottom: 1px dotted var(--muted);
+}
+.sym a:hover { border-bottom-color: var(--text); }
 .good { color: var(--good); }
 .bad { color: var(--bad); }
 .warn { color: var(--warn); }
@@ -509,7 +513,7 @@ setInterval(refresh, POLL_MS);
     <tbody>
       {{range .Positions}}
       <tr>
-        <td class="sym">{{.Symbol}}</td>
+        {{template "symbolCell" .Symbol}}
         <td class="num">{{.Shares}}{{if .SharesNote}}<span class="meta"> {{.SharesNote}}</span>{{end}}</td>
         <td class="num muted">{{.Entry}}</td>
         <td class="num muted">{{.Stop}}</td>
@@ -543,7 +547,7 @@ setInterval(refresh, POLL_MS);
     <tbody>
       {{range .ClosedRows}}
       <tr>
-        <td class="sym">{{.Symbol}}</td>
+        {{template "symbolCell" .Symbol}}
         <td class="num">{{.Shares}}</td>
         <td class="num muted">{{.Open}}</td>
         <td class="num">{{.Close}}</td>
@@ -578,7 +582,7 @@ setInterval(refresh, POLL_MS);
     <tbody>
       {{range .ScreenRows}}
       <tr>
-        <td class="sym">{{.Symbol}}</td>
+        {{template "symbolCell" .Symbol}}
         {{range .Cells}}
         <td class="num">
           <span class="crit {{if .Pass}}pass{{else}}fail{{end}}">
@@ -623,6 +627,8 @@ setInterval(refresh, POLL_MS);
 </section>
 {{end}}
 
+{{define "symbolCell"}}<td class="sym"><a href="https://www.tradingview.com/chart/?symbol={{.}}" target="_blank" rel="noopener noreferrer" title="Open {{.}} on TradingView">{{.}}</a></td>{{end}}
+
 {{define "modalHead"}}
 <div class="mhead">
   <h3>{{.Title}}</h3>
@@ -641,7 +647,7 @@ setInterval(refresh, POLL_MS);
     <thead><tr><th>Index</th><th class="num">Change vs. previous close</th></tr></thead>
     <tbody>
       {{range .Rows}}
-      <tr><td class="sym">{{.Symbol}}</td><td class="num {{.Tone}}">{{.Change}}</td></tr>
+      <tr>{{template "symbolCell" .Symbol}}<td class="num {{.Tone}}">{{.Change}}</td></tr>
       {{end}}
     </tbody>
   </table>
@@ -721,7 +727,7 @@ setInterval(refresh, POLL_MS);
     <tbody>
       {{range .Rows}}
       <tr>
-        <td class="sym">{{.Symbol}}</td>
+        {{template "symbolCell" .Symbol}}
         {{range .Cells}}
         <td class="num">
           <span class="crit {{if .Pass}}pass{{else}}fail{{end}}">

@@ -205,24 +205,6 @@ func (a *Alpaca) snapshotBatch(ctx context.Context, symbols []string) (map[strin
 	return out, nil
 }
 
-func (a *Alpaca) IntradayBars(ctx context.Context, symbol string, intervalMins int, since time.Time) ([]domain.Bar, error) {
-	u := fmt.Sprintf("%s/v2/stocks/%s/bars?timeframe=%dMin&start=%s&limit=1000&adjustment=raw&feed=%s",
-		a.dataURL, url.PathEscape(symbol), intervalMins,
-		url.QueryEscape(since.UTC().Format(time.RFC3339)), url.QueryEscape(a.feed))
-
-	var resp struct {
-		Bars []alpacaBar `json:"bars"`
-	}
-	if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
-		return nil, err
-	}
-	out := make([]domain.Bar, 0, len(resp.Bars))
-	for _, b := range resp.Bars {
-		out = append(out, b.toDomain())
-	}
-	return out, nil
-}
-
 func (a *Alpaca) AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error) {
 	// Request a wider window than `days` because weekends and holidays mean
 	// calendar days and trading days differ.

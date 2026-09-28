@@ -631,14 +631,28 @@ func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time) ([]s
 		dollar float64
 	}
 	var movers []mover
+	var rejected int
 	for _, sym := range universe {
 		snap, ok := snaps[sym]
 		if !ok || snap.IntradayPct < e.cfg.Screening.MinIntradayPct {
 			continue
 		}
-		movers = append(movers, mover{
-			symbol: sym, snap: snap, dollar: snap.Price * snap.TodayVolume,
-		})
+		dollar := snap.Price * snap.TodayVolume
+		// Tradability floors before enrichment: a name too cheap or too thin to fill
+		// is not a candidate, and rejecting it here also saves its news and
+		// average-volume lookups.
+		if ok, reason := screener.Tradable(snap.Price, dollar, e.cfg); !ok {
+			e.log.Debug("not tradable", "symbol", sym, "reason", reason)
+			rejected++
+			continue
+		}
+		movers = append(movers, mover{symbol: sym, snap: snap, dollar: dollar})
+	}
+	if rejected > 0 {
+		e.log.Info("movers rejected by the tradability floors",
+			"rejected", rejected, "remaining", len(movers),
+			"min_price", e.cfg.Screening.MinPrice,
+			"min_dollar_volume", e.cfg.Screening.MinDollarVolume)
 	}
 
 	sort.SliceStable(movers, func(i, j int) bool { return movers[i].dollar > movers[j].dollar })
@@ -853,22 +867,8 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 		}
 		p.TrailArmed = armed
 
-		var closes []float64
-		if !forceEOD {
-			bars, err := e.data.IntradayBars(ctx, p.Symbol, e.cfg.Exit.MACDIntervalMins, sess.Open)
-			if err != nil {
-				e.log.Warn("intraday bars unavailable; MACD exit cannot be evaluated",
-					"symbol", p.Symbol, "err", err)
-			} else {
-				closes = make([]float64, 0, len(bars))
-				for _, b := range bars {
-					closes = append(closes, b.Close)
-				}
-			}
-		}
-
 		decision := strategy.EvaluateExit(strategy.ExitInput{
-			Position: p, Price: price, Closes: closes, EODReached: forceEOD,
+			Position: p, Price: price, EODReached: forceEOD,
 		}, e.cfg)
 		if !decision.Exit {
 			continue

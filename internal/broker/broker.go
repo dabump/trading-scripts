@@ -56,9 +56,6 @@ type MarketData interface {
 	// Snapshots may be called with the whole tradable universe; implementations are
 	// expected to batch internally rather than building one enormous URL.
 	Snapshots(ctx context.Context, symbols []string) (map[string]domain.Snapshot, error)
-	// IntradayBars returns the current session's candles at the given interval,
-	// oldest first.
-	IntradayBars(ctx context.Context, symbol string, intervalMins int, since time.Time) ([]domain.Bar, error)
 	// AverageDailyVolume averages the prior sessions' volume, excluding today
 	// (today is the number being compared against it).
 	AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error)

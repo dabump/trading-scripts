@@ -108,13 +108,16 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			wantValue: "45 min before close",
 		},
 		{
-			name:  "macd periods and interval",
-			label: "MACD bearish cross",
-			mutate: func(f *fixture) {
-				f.cfg.Exit.MACDFast, f.cfg.Exit.MACDSlow, f.cfg.Exit.MACDSignal = 3, 7, 2
-				f.cfg.Exit.MACDIntervalMins = 5
-			},
-			wantValue: "3/7/2 on 5-minute candles",
+			name:      "minimum price floor",
+			label:     "Minimum price",
+			mutate:    func(f *fixture) { f.cfg.Screening.MinPrice = 2.5 },
+			wantValue: "$2.5",
+		},
+		{
+			name:      "minimum dollar volume floor",
+			label:     "Minimum traded today",
+			mutate:    func(f *fixture) { f.cfg.Screening.MinDollarVolume = 2_500_000 },
+			wantValue: "$2,500,000",
 		},
 		{
 			name:      "sentiment window",
@@ -179,23 +182,6 @@ func TestStrategyPanelDerivesValues(t *testing.T) {
 
 		if got, _ := rowValue(t, f, "Maximum exposure"); got != "28%" {
 			t.Errorf("exposure = %q, want 28%% (7 × 4)", got)
-		}
-	})
-
-	t.Run("macd warm-up follows the periods and interval", func(t *testing.T) {
-		f := newFixture(t)
-		// slow + signal = 13 candles at 15 minutes = 3h15m.
-		_, note := rowValue(t, f, "MACD bearish cross")
-		if !strings.Contains(note, "13 candles") || !strings.Contains(note, "3h 15m") {
-			t.Errorf("warm-up note = %q, want it to state 13 candles / 3h 15m", note)
-		}
-
-		// Change the interval and the derived warm-up must move with it.
-		f2 := newFixture(t)
-		f2.cfg.Exit.MACDIntervalMins = 30
-		_, note2 := rowValue(t, f2, "MACD bearish cross")
-		if !strings.Contains(note2, "6h 30m") {
-			t.Errorf("warm-up note = %q, want 6h 30m at 30-minute candles", note2)
 		}
 	})
 
@@ -280,7 +266,7 @@ func TestStrategyPanelListsExitsInPriorityOrder(t *testing.T) {
 	f := newFixture(t)
 	_, body := f.get(t, "/")
 
-	want := []string{"Forced end-of-day", "Stop-loss", "Profit target", "Trailing stop", "MACD bearish cross"}
+	want := []string{"Forced end-of-day", "Stop-loss", "Profit target", "Trailing stop"}
 	prev := -1
 	for _, label := range want {
 		at := strings.Index(body, label)
@@ -338,6 +324,32 @@ func TestDurationText(t *testing.T) {
 	for _, tt := range tests {
 		if got := durationText(tt.in); got != tt.want {
 			t.Errorf("durationText(%v) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// Grouping must only insert separators. If it ever rounded, it would reintroduce the
+// exact bug trimNumber was written to avoid: a tuned value the page reports as a
+// different number.
+func TestGroupNumberSeparatesWithoutRounding(t *testing.T) {
+	tests := []struct {
+		in   float64
+		want string
+	}{
+		{0, "0"},
+		{999, "999"},
+		{1000, "1,000"},
+		{1_000_000, "1,000,000"},
+		{25_000_000, "25,000,000"},
+		{1234.5, "1,234.5"},
+		{1_000_000.25, "1,000,000.25"},
+		{-1_500_000, "-1,500,000"},
+		// The precision trimNumber preserves must survive grouping.
+		{2_500_000.125, "2,500,000.125"},
+	}
+	for _, tt := range tests {
+		if got := groupNumber(tt.in); got != tt.want {
+			t.Errorf("groupNumber(%v) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }

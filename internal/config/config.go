@@ -39,6 +39,19 @@ type Screening struct {
 	MinIntradayPct        float64 `yaml:"min_intraday_pct"`
 	MinVolumeMultiple     float64 `yaml:"min_volume_multiple"`
 	AvgVolumeLookbackDays int     `yaml:"avg_volume_lookback_days"`
+	// MinPrice and MinDollarVolume are tradability floors, not momentum criteria.
+	//
+	// Without them the screen is dominated by instruments the strategy was never
+	// meant to hold: a backtest over 2024-2026 surfaced warrants at $0.07, SPAC units
+	// whose 20-session average volume was 15 shares, and sub-$1 names averaging a few
+	// hundred shares a day. A $1,000 position in those is not executable at any
+	// sensible price, and sub-$1 names were also the worst-performing price bucket
+	// measured. Both are checked from the snapshot, so they cost no extra API calls
+	// and reject candidates before the expensive per-symbol lookups.
+	MinPrice float64 `yaml:"min_price"`
+	// MinDollarVolume is price × volume traded so far today, at the moment of the
+	// decision — a liquidity measure, not a size one.
+	MinDollarVolume float64 `yaml:"min_dollar_volume"`
 	// MaxEnriched bounds how many symbols get the expensive per-symbol news and
 	// average-volume lookups after the cheap price-move filter. On a violent day
 	// hundreds of names clear +10%, and enriching all of them every minute would
@@ -63,10 +76,6 @@ type Risk struct {
 type Exit struct {
 	ProfitTargetPct   float64 `yaml:"profit_target_pct"`
 	TrailingStopPct   float64 `yaml:"trailing_stop_pct"`
-	MACDFast          int     `yaml:"macd_fast"`
-	MACDSlow          int     `yaml:"macd_slow"`
-	MACDSignal        int     `yaml:"macd_signal"`
-	MACDIntervalMins  int     `yaml:"macd_interval_minutes"`
 	EODExitOffsetMins int     `yaml:"eod_exit_offset_minutes"`
 }
 
@@ -154,6 +163,12 @@ func (c *Config) Validate() error {
 	if c.Screening.MaxEnriched < 1 {
 		add("screening.max_enriched must be >= 1")
 	}
+	if c.Screening.MinPrice <= 0 {
+		add("screening.min_price must be > 0")
+	}
+	if c.Screening.MinDollarVolume <= 0 {
+		add("screening.min_dollar_volume must be > 0")
+	}
 	// Anything shorter than the trading day itself would start the search after the
 	// open, which is the bug this setting exists to prevent.
 	if c.Screening.NewsLookback < 7*time.Hour {
@@ -184,15 +199,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Exit.TrailingStopPct <= 0 || c.Exit.TrailingStopPct >= 100 {
 		add("exit.trailing_stop_pct must be in (0, 100)")
-	}
-	if c.Exit.MACDFast < 1 || c.Exit.MACDSlow < 1 || c.Exit.MACDSignal < 1 {
-		add("exit macd periods must all be >= 1")
-	}
-	if c.Exit.MACDFast >= c.Exit.MACDSlow {
-		add("exit.macd_fast (%d) must be < exit.macd_slow (%d)", c.Exit.MACDFast, c.Exit.MACDSlow)
-	}
-	if c.Exit.MACDIntervalMins < 1 {
-		add("exit.macd_interval_minutes must be >= 1")
 	}
 	if c.Exit.EODExitOffsetMins < 1 {
 		add("exit.eod_exit_offset_minutes must be >= 1")
@@ -242,13 +248,6 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
-}
-
-// MACDWarmupBars is the number of candles needed before a bearish crossover can
-// be detected: the slow EMA is seeded with an SMA, the signal line is an EMA of
-// the MACD line, and crossover detection needs the previous bar too.
-func (c *Config) MACDWarmupBars() int {
-	return c.Exit.MACDSlow + c.Exit.MACDSignal
 }
 
 // LoadSecrets reads credentials from the environment. It does not fall back to

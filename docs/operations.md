@@ -31,6 +31,8 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | Key | Value | Notes |
 |---|---|---|
 | `market_data.feed` | `sip` | Full consolidated tape. `iex` is accepted but the relative-volume criterion is not meaningful on it |
+| `screening.min_price` | 1.0 | `strategy.md` §2 — tradability floor, not a momentum criterion; validated > 0 |
+| `screening.min_dollar_volume` | 1000000 | `strategy.md` §2 — dollar volume traded today; validated > 0 |
 | `screening.min_intraday_pct` | 10.0 | `strategy.md` §2 |
 | `screening.min_volume_multiple` | 5.0 | `strategy.md` §2 |
 | `screening.avg_volume_lookback_days` | 20 | **PROPOSED** — excludes today |
@@ -42,8 +44,6 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `risk.allow_same_day_reentry` | `false` | **PROPOSED** |
 | `exit.profit_target_pct` | 15.0 | **PROPOSED** — arms the trailing stop |
 | `exit.trailing_stop_pct` | 5.0 | **PROPOSED** |
-| `exit.macd_fast` / `macd_slow` / `macd_signal` | 5 / 10 / 3 | `strategy.md` §4 |
-| `exit.macd_interval_minutes` | 15 | `strategy.md` §4; warm-up is slow+signal = 13 bars ≈ 3h15m |
 | `exit.eod_exit_offset_minutes` | 30 | `strategy.md` §4 |
 | `timing.sentiment_poll_interval` | 10m | `strategy.md` §1 |
 | `timing.sentiment_window` | 1h | `strategy.md` §1 |
@@ -60,8 +60,8 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `audit.directory` | `logs` | Append-only JSONL trail, one file per session date; gitignored |
 
 Invalid configurations are rejected at startup rather than mid-session: unknown
-keys, a non-negative bearish threshold, MACD fast ≥ slow, and total exposure over
-100% all fail fast, because discovering them with real positions open is the
+keys, a non-negative bearish threshold, a non-positive screening floor, and total
+exposure over 100% all fail fast, because discovering them with real positions open is the
 expensive way to find out.
 
 ## Persistence

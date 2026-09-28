@@ -128,3 +128,63 @@ func TestEmptyUniverseIsNotAnError(t *testing.T) {
 		t.Errorf("got %d evaluations, want 0", len(preview.Evaluations))
 	}
 }
+
+// The tradability floors run before enrichment, so an untradable mover must cost
+// nothing beyond its snapshot: no news query, no average-volume lookup, no
+// evaluation and no order. The backtest found the screen otherwise dominated by
+// warrants and SPAC units — names a $10k account cannot fill.
+func TestUntradableMoversAreRejectedBeforeEnrichment(t *testing.T) {
+	h := newHarness(t)
+	h.setBullish()
+
+	// Both clear +10% and 5x volume; both fail a floor.
+	//
+	// A warrant at $0.07 that trades plenty of dollars: only the price floor stops it.
+	h.fake.SetSnapshot("GIBOW", 0.07, 0.06, 30_000_000)
+	h.fake.SetAverageVolume("GIBOW", 1_000_000)
+	h.fake.SetNews("GIBOW", 3)
+	// A SPAC unit at a respectable price whose whole day is $980 of turnover.
+	h.fake.SetSnapshot("QETAU", 9.80, 8.50, 100)
+	h.fake.SetAverageVolume("QETAU", 15)
+	h.fake.SetNews("QETAU", 3)
+
+	// One legitimate candidate, so a pass that rejects everything is not mistaken
+	// for the floors working.
+	h.addCandidate("ABCD", 5.00)
+
+	h.at(9, 30)
+	h.tick()
+	h.at(10, 25)
+	h.tick()
+	h.at(10, 35)
+	h.tick()
+
+	for _, sym := range h.fake.EnrichedSymbols() {
+		if sym == "GIBOW" || sym == "QETAU" {
+			t.Errorf("%q was enriched despite failing a tradability floor", sym)
+		}
+	}
+
+	// It must also be absent from the screen the page shows, not merely unbought:
+	// an untradable name is not a candidate the strategy considered.
+	evals, _, err := h.store.LatestScreenSnapshot(h.date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, e := range evals {
+		seen[e.Symbol] = true
+	}
+	if seen["GIBOW"] || seen["QETAU"] {
+		t.Errorf("an untradable symbol reached the screen snapshot: %v", seen)
+	}
+	if !seen["ABCD"] {
+		t.Error("the tradable candidate should still have been screened")
+	}
+
+	for _, o := range h.fake.Placed() {
+		if o.Symbol == "GIBOW" || o.Symbol == "QETAU" {
+			t.Errorf("placed an order for untradable %q", o.Symbol)
+		}
+	}
+}

@@ -309,7 +309,48 @@ Verified by mutating config and observing the page follow: move 10→12.75%, siz
 slippage note appearing). A test table asserts each field independently against the
 JSON view, so a label/value pair cannot pass by coincidental substring match.
 
+## 2026-09-28 — Backtest, then: screening floors added, MACD exit removed
+
+The strategy had been assembled from elicited preferences with no evidence behind it.
+The backtest that followed is the first measurement of whether it makes money, and the
+honest summary is **no demonstrated edge**: 1,200 symbols sampled from the 13,192 the
+agent's own filter admits, 2024-09-01 → 2026-09-20, 510,231 daily bars, candidates
+confirmed against 15-minute bars at the true 10:30 ET decision point with no
+look-ahead. The raw premise (buy 10:30, sell 15:30) returned a mean of **−2.72%** per
+trade. With the agent's real exit rules the mean turns **+0.54%** — but the *median*
+trade loses **4.48%**, so the whole result rests on the 24.6% of trades that reach the
+trailing stop. And 0.25% of slippage per side takes the two-year equity curve to
+**−2.5%**, which is not a conservative assumption for market orders on stocks that just
+moved 10% on 5× volume. Full method, tables and limitations are in the plan file the
+backtest produced; the limitations (9.1% sample, no news/sentiment gate applied,
+survivorship bias, stop fills at exactly their trigger price) all push the real result
+*worse*, not better.
+
+Two changes follow from it. The other two recommendations — model execution before going
+further, and do not go live — are not code changes and remain open.
+
+| Decision | Rationale |
+|---|---|
+| Added `screening.min_price` ($1) and `screening.min_dollar_volume` ($1M today) as a **gate ahead of enrichment**, not a fourth criterion | The candidate list was dominated by instruments the strategy was never meant to hold: warrants (`GIBOW` $0.025, `LVWR.WS`), SPAC units (`QETAU`, 20-session average volume of **15 shares**) and sub-$1 names (`ASBP`, 371 shares/day). `broker.TradableAssets` excludes OTC but not warrants, units or penny stocks, and removing the float criterion left nothing else keeping them out. |
+| Untradable symbols are dropped silently rather than shown as failing candidates | Tradability is not a momentum judgement. A $0.07 warrant is not a candidate that failed the screen; it is not a candidate. Showing it would bury the real names under noise the strategy will never act on. |
+| The gate runs before the news and average-volume lookups | Same reason the move filter does: those are the per-symbol calls that make a full-market scan expensive. Ordering it after would pay for data on names already excluded. |
+| Removed the MACD bearish-crossover exit, and with it `internal/strategy/macd.go` and `MarketData.IntradayBars` | It fired on **24.9% of trades for a mean of −0.08%** — statistically indistinguishable from not having it — while costing a bar request per open position per tick and carrying a 13-candle warm-up that left it unavailable before ~12:45pm ET. Retuning was rejected: nothing in the data suggested better periods existed, and the warm-up dead zone is structural to computing MACD inside one session. `IntradayBars` had no other caller. |
+| Exit priority is now three triggers: forced EOD, stop-loss, trailing stop | Unchanged relative order; only the removal. `risk.md`'s requirement that the stop-loss outrank the momentum signals still holds. |
+
+A correction to something said earlier in the session: I claimed the research
+"confirmed" that ranking candidates by *highest* relative volume is inverted. On the raw
+premise it looked that way (the 25–100× bucket returned −7.2%), but with the exits
+modelled the effect largely disappears and is not monotonic across buckets. The
+inversion is **not** supported once the full strategy is simulated, and the ranking was
+left alone.
+
+Verified by removing the floors from `gatherCandidates` and watching
+`TestUntradableMoversAreRejectedBeforeEnrichment` fail on all four assertions — including
+an order actually placed for the $0.07 warrant.
+
 ## Open items (not yet decided)
+
+- **The strategy has no demonstrated edge, and this is the load-bearing open item.** Screening floors and the MACD removal address composition and dead weight; neither creates an edge. Before any real money: measure realised slippage in paper trading, since that single number decides the outcome, and decide whether entries must be limit orders.
 
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.
 - **PDT rule resolution before going live** — fund above $25k, reduce trade frequency, or switch to a cash account; none chosen yet (`docs/operations.md`).

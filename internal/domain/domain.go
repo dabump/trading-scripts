@@ -40,10 +40,9 @@ const (
 type ExitReason string
 
 const (
-	ExitForcedEOD     ExitReason = "FORCED_EOD"
-	ExitStopLoss      ExitReason = "STOP_LOSS"
-	ExitTrailingStop  ExitReason = "TRAILING_STOP"
-	ExitMACDCrossover ExitReason = "MACD_BEARISH_CROSS"
+	ExitForcedEOD    ExitReason = "FORCED_EOD"
+	ExitStopLoss     ExitReason = "STOP_LOSS"
+	ExitTrailingStop ExitReason = "TRAILING_STOP"
 	// ExitReconciled is not a strategy exit: it records a position the broker no
 	// longer holds, found during restart reconciliation. Kept distinct so the
 	// end-of-day summary never attributes a disappearance to a strategy rule.

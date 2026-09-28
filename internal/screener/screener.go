@@ -16,7 +16,31 @@ const (
 	CriterionVolume = "Rel. volume"
 )
 
-// Input is the per-symbol data the four criteria are evaluated against.
+// Tradable reports whether a symbol is worth evaluating at all, given its price and
+// the dollar volume it has traded so far today.
+//
+// This is a floor on executability, deliberately separate from the momentum criteria.
+// Without it the screen surfaces instruments the strategy was never meant to hold: a
+// 2024-2026 backtest found warrants at $0.07, SPAC units whose 20-session average
+// volume was 15 shares, and sub-$1 names trading a few hundred shares a day. A position
+// of a few hundred dollars in those cannot be filled near the quoted price, and sub-$1
+// names were also the worst-performing price bucket measured.
+//
+// Both inputs come from the snapshot already fetched for the move filter, so rejecting
+// here costs nothing and saves the per-symbol news and average-volume lookups.
+func Tradable(price, dollarVolume float64, cfg *config.Config) (bool, string) {
+	if price < cfg.Screening.MinPrice {
+		return false, fmt.Sprintf("price $%.2f is below the $%.2f floor",
+			price, cfg.Screening.MinPrice)
+	}
+	if dollarVolume < cfg.Screening.MinDollarVolume {
+		return false, fmt.Sprintf("only $%.0f traded so far, below the $%.0f floor",
+			dollarVolume, cfg.Screening.MinDollarVolume)
+	}
+	return true, ""
+}
+
+// Input is the per-symbol data the three criteria are evaluated against.
 type Input struct {
 	Symbol      string
 	Price       float64

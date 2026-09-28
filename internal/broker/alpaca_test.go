@@ -94,29 +94,6 @@ func TestSnapshotsEmptyInputSkipsRequest(t *testing.T) {
 	}
 }
 
-func TestIntradayBarsDecoding(t *testing.T) {
-	a := stubAlpaca(t, map[string]string{
-		"/v2/stocks/ABCD/bars": `{"bars": [
-			{"t": "2026-09-28T13:30:00Z", "o": 4.0, "h": 4.2, "l": 3.9, "c": 4.1, "v": 50000},
-			{"t": "2026-09-28T13:45:00Z", "o": 4.1, "h": 4.4, "l": 4.05, "c": 4.35, "v": 61000}
-		]}`,
-	})
-
-	bars, err := a.IntradayBars(context.Background(), "ABCD", 15, time.Now().Add(-time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(bars) != 2 {
-		t.Fatalf("got %d bars, want 2", len(bars))
-	}
-	if bars[1].Close != 4.35 || bars[0].Volume != 50000 {
-		t.Errorf("bars decoded wrong: %+v", bars)
-	}
-	if bars[0].Time.After(bars[1].Time) {
-		t.Error("bars must stay in chronological order")
-	}
-}
-
 // The tradable universe drives the whole scan, so the filtering matters: OTC and
 // untradable assets must not reach the screener.
 func TestTradableAssetsFiltersVenueAndTradability(t *testing.T) {

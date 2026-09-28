@@ -23,8 +23,11 @@ func TestLoadShippedConfig(t *testing.T) {
 		t.Errorf("sizing = %v%% x %d, want 10%% x 5 (docs/risk.md)",
 			c.Risk.PositionSizePct, c.Risk.MaxConcurrentPositions)
 	}
-	if c.Exit.MACDIntervalMins != 15 {
-		t.Errorf("macd interval = %d, want 15 (docs/strategy.md §4)", c.Exit.MACDIntervalMins)
+	// Tradability floors: without them the screen selects warrants and sub-$1 names
+	// that cannot be filled (see docs/decisions.md).
+	if c.Screening.MinPrice <= 0 || c.Screening.MinDollarVolume <= 0 {
+		t.Errorf("tradability floors = $%v / $%v, both must be set",
+			c.Screening.MinPrice, c.Screening.MinDollarVolume)
 	}
 	// The full consolidated tape, without which the volume criterion is meaningless.
 	if c.MarketData.Feed != "sip" {
@@ -54,10 +57,10 @@ func valid() *Config {
 	c := &Config{}
 	c.MarketData = MarketData{Feed: "sip"}
 	c.Screening = Screening{MinIntradayPct: 10, MinVolumeMultiple: 5,
-		AvgVolumeLookbackDays: 20, MaxEnriched: 100, NewsLookback: 18 * time.Hour}
+		AvgVolumeLookbackDays: 20, MaxEnriched: 100, NewsLookback: 18 * time.Hour,
+		MinPrice: 1, MinDollarVolume: 1_000_000}
 	c.Risk = Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	c.Exit = Exit{ProfitTargetPct: 15, TrailingStopPct: 5, MACDFast: 5, MACDSlow: 10,
-		MACDSignal: 3, MACDIntervalMins: 15, EODExitOffsetMins: 30}
+	c.Exit = Exit{ProfitTargetPct: 15, TrailingStopPct: 5, EODExitOffsetMins: 30}
 	c.Timing = Timing{SentimentPollInterval: 600e9, SentimentWindow: 3600e9,
 		ScreenerScanInterval: 60e9, PositionPollInterval: 15e9}
 	c.Sentiment = Sentiment{Symbols: []string{"SPY"}, BearishAvgPct: -0.8}
@@ -86,11 +89,6 @@ func TestValidate(t *testing.T) {
 			"",
 		},
 		{
-			"macd fast must be below slow",
-			func(c *Config) { c.Exit.MACDFast = 10; c.Exit.MACDSlow = 10 },
-			"must be < exit.macd_slow",
-		},
-		{
 			"positive bearish threshold is rejected",
 			func(c *Config) { c.Sentiment.BearishAvgPct = 0.5 },
 			"must be negative",
@@ -99,6 +97,16 @@ func TestValidate(t *testing.T) {
 			"limit orders need a slip percentage",
 			func(c *Config) { c.Execution.OrderType = "limit" },
 			"limit_slip_pct",
+		},
+		{
+			"a zero price floor is rejected",
+			func(c *Config) { c.Screening.MinPrice = 0 },
+			"min_price",
+		},
+		{
+			"a zero dollar-volume floor is rejected",
+			func(c *Config) { c.Screening.MinDollarVolume = 0 },
+			"min_dollar_volume",
 		},
 		{
 			"stop loss of 100% is rejected",
@@ -140,15 +148,6 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tt.wantErr, err)
 			}
 		})
-	}
-}
-
-func TestMACDWarmupBars(t *testing.T) {
-	c := valid()
-	// slow=10 + signal=3 = 13 bars of 15 minutes = 3h15m after the open, which is
-	// later than the 2.5h docs/strategy.md §4 estimates.
-	if got := c.MACDWarmupBars(); got != 13 {
-		t.Errorf("warmup = %d bars, want 13", got)
 	}
 }
 

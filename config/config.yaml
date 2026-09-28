@@ -12,6 +12,12 @@ market_data:
   feed: sip
 
 screening:
+  # Tradability floors, not momentum criteria. A 2024-2026 backtest of this strategy
+  # found the screen dominated by warrants ($0.07), SPAC units averaging 15 shares a
+  # day, and sub-$1 names trading a few hundred shares — none fillable at a sensible
+  # price, and sub-$1 was also the worst-performing price bucket. PROPOSED values.
+  min_price: 1.0
+  min_dollar_volume: 1000000
   min_intraday_pct: 10.0            # docs/strategy.md §2
   min_volume_multiple: 5.0          # docs/strategy.md §2
   avg_volume_lookback_days: 20      # PROPOSED (docs left the lookback undecided)
@@ -30,12 +36,11 @@ risk:
   allow_same_day_reentry: false     # PROPOSED (docs left same-day re-entry undecided)
 
 exit:
+  # There is deliberately no MACD trigger. A 2024-2026 backtest measured it firing on
+  # 24.9% of trades for a mean return of -0.08% — it did no work, while costing a bar
+  # request per position per tick. See docs/decisions.md.
   profit_target_pct: 15.0           # PROPOSED (docs left this undecided)
   trailing_stop_pct: 5.0            # PROPOSED (docs left this undecided)
-  macd_fast: 5                      # docs/strategy.md §4
-  macd_slow: 10                     # docs/strategy.md §4
-  macd_signal: 3                    # docs/strategy.md §4
-  macd_interval_minutes: 15         # docs/strategy.md §4
   eod_exit_offset_minutes: 30       # docs/strategy.md §4
 
 timing:

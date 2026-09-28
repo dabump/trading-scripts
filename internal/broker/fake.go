@@ -18,7 +18,6 @@ type Fake struct {
 	acct      domain.Account
 	assets    []string
 	snaps     map[string]domain.Snapshot
-	bars      map[string][]domain.Bar
 	news      map[string]int
 	avgVolume map[string]float64
 	day       CalendarDay
@@ -38,7 +37,6 @@ func NewFake(acct domain.Account) *Fake {
 	return &Fake{
 		acct:      acct,
 		snaps:     map[string]domain.Snapshot{},
-		bars:      map[string][]domain.Bar{},
 		news:      map[string]int{},
 		avgVolume: map[string]float64{},
 		positions: map[string]BrokerPosition{},
@@ -153,19 +151,6 @@ func (f *Fake) SetPrice(symbol string, price float64) {
 	f.SetSnapshot(symbol, price, prev, vol)
 }
 
-func (f *Fake) SetBars(symbol string, closes []float64, start time.Time, intervalMins int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	bars := make([]domain.Bar, len(closes))
-	for i, c := range closes {
-		bars[i] = domain.Bar{
-			Time: start.Add(time.Duration(i*intervalMins) * time.Minute),
-			Open: c, High: c, Low: c, Close: c, Volume: 1000,
-		}
-	}
-	f.bars[symbol] = bars
-}
-
 func (f *Fake) SetNews(symbol string, count int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -192,15 +177,6 @@ func (f *Fake) Snapshots(_ context.Context, symbols []string) (map[string]domain
 		}
 	}
 	return out, nil
-}
-
-func (f *Fake) IntradayBars(_ context.Context, symbol string, _ int, _ time.Time) ([]domain.Bar, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return nil, f.err
-	}
-	return append([]domain.Bar(nil), f.bars[symbol]...), nil
 }
 
 func (f *Fake) AverageDailyVolume(_ context.Context, symbol string, _ int) (float64, error) {

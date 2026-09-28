@@ -41,10 +41,9 @@ func newHarness(t *testing.T) *harness {
 	cfg.MarketData = config.MarketData{Feed: "sip"}
 	cfg.Screening = config.Screening{MinIntradayPct: 10,
 		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
-		NewsLookback: 18 * time.Hour}
+		NewsLookback: 18 * time.Hour, MinPrice: 1, MinDollarVolume: 1_000_000}
 	cfg.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	cfg.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, MACDFast: 5, MACDSlow: 10,
-		MACDSignal: 3, MACDIntervalMins: 15, EODExitOffsetMins: 30}
+	cfg.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, EODExitOffsetMins: 30}
 	cfg.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute, SentimentWindow: time.Hour,
 		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
 	cfg.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"},
@@ -362,45 +361,6 @@ func TestStopLossExit(t *testing.T) {
 	}
 	if all[0].ExitReason != domain.ExitStopLoss {
 		t.Errorf("exit reason = %q, want STOP_LOSS", all[0].ExitReason)
-	}
-}
-
-// A MACD bearish crossover closes a position that no other rule would touch.
-func TestMACDExit(t *testing.T) {
-	h := newHarness(t)
-	h.setBullish()
-	h.addCandidate("ABCD", 5.00)
-
-	h.at(9, 30)
-	h.tick()
-	h.at(10, 25)
-	h.tick()
-	h.at(10, 35)
-	h.tick()
-	if len(h.openPositions()) != 1 {
-		t.Fatal("expected a position to be open")
-	}
-
-	// 13 rising bars (the warm-up) then one sharp down bar: the cross lands on the
-	// most recent candle. The price itself stays well inside the stop-loss and
-	// below the profit target, so only the MACD rule can fire.
-	closes := make([]float64, 13)
-	for i := range closes {
-		closes[i] = 5.00 + float64(i)*0.02
-	}
-	closes = append(closes, 4.95)
-	h.fake.SetBars("ABCD", closes, h.open, 15)
-
-	h.at(14, 0)
-	h.fake.SetPrice("ABCD", 4.95) // -1%: no stop, no target
-	h.tick()
-
-	all, _ := h.store.SessionPositions(h.date)
-	if len(all) != 1 || all[0].Open {
-		t.Fatalf("position should be closed by the MACD rule: %+v", all)
-	}
-	if all[0].ExitReason != domain.ExitMACDCrossover {
-		t.Errorf("exit reason = %q, want MACD_BEARISH_CROSS", all[0].ExitReason)
 	}
 }
 

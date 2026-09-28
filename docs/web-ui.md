@@ -107,10 +107,10 @@ drift this project has repeatedly had to correct in its own docs. Tuning
 Details that follow from that goal:
 
 - **Derived figures are computed the way the engine computes them.** Maximum exposure
-  is size × concurrency (the product config validation caps at 100%), and the MACD
-  warm-up is `slow + signal` candles × the interval — so the panel cannot disagree
-  with behaviour.
-- **Numbers are printed exactly, with only trailing zeros trimmed.** Fixed precision
+  is size × concurrency (the product config validation caps at 100%) — so the panel
+  cannot disagree with behaviour.
+- **Numbers are printed exactly, with only trailing zeros trimmed** (the dollar-volume
+  floor additionally gets thousands separators, which insert characters without rounding). Fixed precision
   would round a tuned `3.25` to `3.2` (Go rounds half to even), and someone who had
   just set 3.25 would reasonably conclude their change had not applied.
 - **Exits are listed in the order `strategy.EvaluateExit` checks them**, because the

@@ -54,10 +54,9 @@ func testConfig() *config.Config {
 	c.MarketData = config.MarketData{Feed: "sip"}
 	c.Screening = config.Screening{MinIntradayPct: 10,
 		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
-		NewsLookback: 18 * time.Hour}
+		NewsLookback: 18 * time.Hour, MinPrice: 1, MinDollarVolume: 1_000_000}
 	c.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	c.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, MACDFast: 5, MACDSlow: 10,
-		MACDSignal: 3, MACDIntervalMins: 15, EODExitOffsetMins: 30}
+	c.Exit = config.Exit{ProfitTargetPct: 15, TrailingStopPct: 5, EODExitOffsetMins: 30}
 	c.Timing = config.Timing{SentimentWindow: time.Hour, SentimentPollInterval: 10 * time.Minute,
 		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
 	c.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"}, BearishAvgPct: -0.8}

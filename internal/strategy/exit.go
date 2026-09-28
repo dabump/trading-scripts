@@ -33,22 +33,21 @@ func atOrAbove(price, threshold float64) bool {
 type ExitInput struct {
 	Position domain.Position
 	Price    float64
-	// Closes are the session's candle closes at the configured MACD interval,
-	// oldest first. Fewer than the warm-up length simply means the MACD trigger
-	// cannot fire yet.
-	Closes []float64
 	// EODReached is true once the clock passes the forced-exit mark.
 	EODReached bool
 }
 
-// EvaluateExit applies the four exit triggers from docs/strategy.md §4 in
-// priority order and reports the first that fires.
+// EvaluateExit applies the three exit triggers from docs/strategy.md §4 in priority
+// order and reports the first that fires.
 //
-// Order matters because it decides which reason gets recorded when several are
-// true at once. The forced end-of-day exit comes first because it is a hard
-// deadline. The stop-loss comes next: docs/risk.md requires it to take
-// precedence over the momentum-based signals so that a gap or bug in those
-// cannot turn into an unbounded loss.
+// Order matters because it decides which reason gets recorded when several are true at
+// once. The forced end-of-day exit comes first because it is a hard deadline. The
+// stop-loss comes next: docs/risk.md requires it to be a floor that cannot be bypassed.
+//
+// A MACD bearish-crossover trigger used to sit last. It was removed after a backtest
+// measured it firing on 24.9% of trades for a mean return of −0.08% — it was doing no
+// work, while costing a bar request per position per tick and carrying a 13-candle
+// warm-up that kept it inert until roughly 12:45 ET anyway.
 func EvaluateExit(in ExitInput, cfg *config.Config) ExitDecision {
 	if in.EODReached {
 		return ExitDecision{Exit: true, Reason: domain.ExitForcedEOD}
@@ -73,10 +72,6 @@ func EvaluateExit(in ExitInput, cfg *config.Config) ExitDecision {
 	armed := in.Position.TrailArmed || atOrAbove(peak, entry*(1+cfg.Exit.ProfitTargetPct/100))
 	if armed && atOrBelow(in.Price, peak*(1-cfg.Exit.TrailingStopPct/100)) {
 		return ExitDecision{Exit: true, Reason: domain.ExitTrailingStop}
-	}
-
-	if MACDBearishCross(in.Closes, cfg.Exit.MACDFast, cfg.Exit.MACDSlow, cfg.Exit.MACDSignal) {
-		return ExitDecision{Exit: true, Reason: domain.ExitMACDCrossover}
 	}
 
 	return ExitDecision{}

@@ -436,6 +436,16 @@ func strategySections(cfg *config.Config) []StrategySection {
 			"first, and only symbols clearing it incur the per-symbol lookups. Nothing here " +
 			"filters on company size.",
 		Rows: []StrategyRow{
+			{
+				Label: "Minimum price",
+				Value: "$" + trimNumber(cfg.Screening.MinPrice),
+				Note:  "a tradability floor, not a momentum criterion",
+			},
+			{
+				Label: "Minimum traded today",
+				Value: "$" + groupNumber(cfg.Screening.MinDollarVolume),
+				Note:  "dollar volume before entry; keeps unfillable names out",
+			},
 			{Label: "Intraday move", Value: "≥ " + pctOf(cfg.Screening.MinIntradayPct)},
 			{
 				Label: "Relative volume",
@@ -505,7 +515,6 @@ func strategySections(cfg *config.Config) []StrategySection {
 	// Listed in the order strategy.EvaluateExit checks them, because that order is
 	// the priority: the first match wins, and showing them in any other order would
 	// misrepresent which rule takes effect.
-	warmup := time.Duration(cfg.MACDWarmupBars()*cfg.Exit.MACDIntervalMins) * time.Minute
 	exits := StrategySection{
 		Title: "4 · Exits, in priority order",
 		Note:  "Whichever triggers first closes the position.",
@@ -530,14 +539,6 @@ func strategySections(cfg *config.Config) []StrategySection {
 				Value: pctOf(cfg.Exit.TrailingStopPct) + " below the peak",
 				Note:  "active only once the profit target has been reached",
 			},
-			{
-				Label: "MACD bearish cross",
-				Value: fmt.Sprintf("%d/%d/%d on %d-minute candles",
-					cfg.Exit.MACDFast, cfg.Exit.MACDSlow, cfg.Exit.MACDSignal,
-					cfg.Exit.MACDIntervalMins),
-				Note: fmt.Sprintf("needs %d candles (%s) of session data, so it cannot fire before then",
-					cfg.MACDWarmupBars(), durationText(warmup)),
-			},
 		},
 	}
 
@@ -552,6 +553,26 @@ func strategySections(cfg *config.Config) []StrategySection {
 // printing 10 rather than 10.0.
 func trimNumber(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// groupNumber is trimNumber with thousands separators. The dollar-volume floor is
+// the one setting large enough to be misread without them ("$1000000"), and grouping
+// only inserts separators — it never rounds, so the exactness trimNumber exists to
+// preserve still holds.
+func groupNumber(v float64) string {
+	s := trimNumber(v)
+	intPart, frac := s, ""
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		intPart, frac = s[:i], s[i:]
+	}
+	sign := ""
+	if strings.HasPrefix(intPart, "-") {
+		sign, intPart = "-", intPart[1:]
+	}
+	for i := len(intPart) - 3; i > 0; i -= 3 {
+		intPart = intPart[:i] + "," + intPart[i:]
+	}
+	return sign + intPart + frac
 }
 
 // durationText renders a config duration the way someone reading the page would say

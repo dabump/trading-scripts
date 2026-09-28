@@ -61,6 +61,14 @@ type MarketData interface {
 	AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error)
 	// NewsCounts reports how many stories each symbol has since the given time.
 	NewsCounts(ctx context.Context, symbols []string, since time.Time) (map[string]int, error)
+	// IntradayBars returns this session's candles for one symbol, oldest first, at
+	// the given interval and starting no earlier than `since`.
+	//
+	// This is the expensive call in the scan: one request per symbol. It is made only
+	// for candidates that have already passed all three screening criteria, which is
+	// a handful of names rather than the whole market — the setup detector needs a
+	// chart, and a chart cannot be batched across symbols.
+	IntradayBars(ctx context.Context, symbol string, interval time.Duration, since time.Time) ([]domain.Bar, error)
 }
 
 // Trading is the write side plus account and calendar queries.

@@ -24,6 +24,7 @@ type Fake struct {
 	nextDay   CalendarDay
 	positions map[string]BrokerPosition
 	placed    []OrderRequest
+	bars      map[string][]domain.Bar
 	err       error
 
 	// Call counters, so tests can assert the scan's cost profile: a full-market
@@ -40,6 +41,7 @@ func NewFake(acct domain.Account) *Fake {
 		news:      map[string]int{},
 		avgVolume: map[string]float64{},
 		positions: map[string]BrokerPosition{},
+		bars:      map[string][]domain.Bar{},
 
 		avgVolumeCalls: map[string]int{},
 	}
@@ -196,6 +198,64 @@ func (f *Fake) SetAverageVolume(symbol string, v float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.avgVolume[symbol] = v
+}
+
+// SetBars installs a symbol's intraday candles, for exercising the setup detector.
+func (f *Fake) SetBars(symbol string, bars []domain.Bar) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bars[symbol] = bars
+}
+
+// SetSetupBars builds a textbook pullback-and-resumption and installs it, so a test
+// does not have to hand-write a chart every time it wants a valid entry.
+//
+// The shape is: a rising run that establishes the pole, one flag bar that holds
+// below it, then a trigger bar closing above the pole high. Prices are scaled to
+// `top`, which becomes the trigger close.
+func (f *Fake) SetSetupBars(symbol string, top float64, start time.Time, interval time.Duration) {
+	// A rising ramp long enough for the EMA to warm up, so the close sits above it.
+	const ramp = 14
+	bars := make([]domain.Bar, 0, ramp+2)
+	base := top * 0.90
+	step := (top*0.985 - base) / float64(ramp-1)
+	for i := 0; i < ramp; i++ {
+		c := base + step*float64(i)
+		bars = append(bars, domain.Bar{
+			Time: start.Add(time.Duration(i) * interval),
+			Open: c - step/2, High: c + step/4, Low: c - step, Close: c, Volume: 50_000,
+		})
+	}
+	pole := bars[len(bars)-1].High
+	// One flag bar: it pulls back and stays under the pole high.
+	flagLow := pole * 0.985
+	bars = append(bars, domain.Bar{
+		Time: start.Add(time.Duration(ramp) * interval),
+		Open: pole * 0.995, High: pole * 0.998, Low: flagLow, Close: flagLow * 1.002,
+		Volume: 30_000,
+	})
+	// The trigger bar closes above the pole high.
+	bars = append(bars, domain.Bar{
+		Time: start.Add(time.Duration(ramp+1) * interval),
+		Open: flagLow * 1.004, High: top * 1.001, Low: flagLow * 1.001, Close: top,
+		Volume: 80_000,
+	})
+	f.SetBars(symbol, bars)
+}
+
+func (f *Fake) IntradayBars(_ context.Context, symbol string, _ time.Duration, since time.Time) ([]domain.Bar, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []domain.Bar
+	for _, b := range f.bars[symbol] {
+		if !b.Time.Before(since) {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 
 func (f *Fake) NewsCounts(_ context.Context, symbols []string, since time.Time) (map[string]int, error) {

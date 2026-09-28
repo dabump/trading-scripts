@@ -16,6 +16,7 @@ import (
 type Config struct {
 	MarketData MarketData `yaml:"market_data"`
 	Screening  Screening  `yaml:"screening"`
+	Entry      Entry      `yaml:"entry"`
 	Risk       Risk       `yaml:"risk"`
 	Exit       Exit       `yaml:"exit"`
 	Timing     Timing     `yaml:"timing"`
@@ -60,6 +61,11 @@ type Screening struct {
 	// measured. Both are checked from the snapshot, so they cost no extra API calls
 	// and reject candidates before the expensive per-symbol lookups.
 	MinPrice float64 `yaml:"min_price"`
+	// MaxPrice is the top of the price band. The strategy being followed trades
+	// roughly $1-$20: above that, a 10% intraday move on 5x volume is a different
+	// kind of event in a different kind of name, and the pullback entries below are
+	// not what moves it.
+	MaxPrice float64 `yaml:"max_price"`
 	// MinDollarVolume is price × volume traded so far today, at the moment of the
 	// decision — a liquidity measure, not a size one.
 	MinDollarVolume float64 `yaml:"min_dollar_volume"`
@@ -77,25 +83,102 @@ type Screening struct {
 	NewsLookback time.Duration `yaml:"news_lookback"`
 }
 
-type Risk struct {
-	PositionSizePct        float64 `yaml:"position_size_pct"`
-	MaxConcurrentPositions int     `yaml:"max_concurrent_positions"`
-	StopLossPct            float64 `yaml:"stop_loss_pct"`
-	AllowSameDayReentry    bool    `yaml:"allow_same_day_reentry"`
+// Entry is the setup gate: the pattern a screened candidate has to print before it
+// is bought.
+//
+// This is the difference between screening and trading. The three screening criteria
+// say a stock is *interesting*; they say nothing about whether this instant is a
+// sensible moment to buy it or where the risk sits. Buying on the screen alone means
+// buying extension at whatever price the scan happens to read, with a stop unrelated
+// to anything on the chart — which a one-year backtest measured as having no edge.
+type Entry struct {
+	// PatternInterval is the candle size the setup is read on.
+	PatternInterval time.Duration `yaml:"pattern_interval"`
+	// EMAPeriod is the trend reference the price must hold above.
+	EMAPeriod int `yaml:"ema_period"`
+	// RequireAboveVWAP additionally demands price above the session VWAP, which is
+	// the line that separates a stock being accumulated from one being distributed.
+	RequireAboveVWAP bool `yaml:"require_above_vwap"`
+	// MinPullbackBars and MaxPullbackBars bound the flag. One bar is the shallowest
+	// pullback worth calling one; too many and it is no longer a pause inside a
+	// move but a stalled trend.
+	MinPullbackBars int `yaml:"min_pullback_bars"`
+	MaxPullbackBars int `yaml:"max_pullback_bars"`
+	// StopBufferPct places the stop just under the flag's low rather than exactly on
+	// it, so the obvious price does not take the position out.
+	StopBufferPct float64 `yaml:"stop_buffer_pct"`
+	// MaxStopDistancePct refuses a setup whose stop is too far below entry. This is
+	// a real part of the strategy, not a safety rail: if the risk is wide the trade
+	// is not taken, because position size would have to shrink to the point where
+	// the winner cannot pay for the losers.
+	MaxStopDistancePct float64 `yaml:"max_stop_distance_pct"`
+	// MinStopDistancePct widens a stop that sits implausibly close to entry, where
+	// ordinary noise would trigger it.
+	MinStopDistancePct float64 `yaml:"min_stop_distance_pct"`
 }
 
-// Exit carries only the forced end-of-day deadline. The profit target and trailing
-// stop that used to live here were removed after measurement; see EvaluateExit in
-// internal/strategy and docs/decisions.md.
+type Risk struct {
+	// RiskPerTradePct is the core of the sizing rule: a fixed fraction of the
+	// account is put at risk on every trade, and the share count follows from how
+	// far away the stop is. Sizing by a fixed fraction of *portfolio value* instead
+	// makes the dollar risk swing with the stock's volatility, which is how a single
+	// wide-stop trade ends up costing several times what a narrow-stop one does.
+	RiskPerTradePct float64 `yaml:"risk_per_trade_pct"`
+	// MaxPositionPct caps one position's notional regardless of how tight its stop
+	// is. Without it a stop 0.5% away would size to a position larger than the
+	// account.
+	MaxPositionPct         float64 `yaml:"max_position_pct"`
+	MaxConcurrentPositions int     `yaml:"max_concurrent_positions"`
+	// StopLossPct is now a backstop, not the working stop. The working stop comes
+	// from the chart (see Entry.MaxStopDistancePct, which is tighter), so this only
+	// fires when price gaps straight through it.
+	StopLossPct         float64 `yaml:"stop_loss_pct"`
+	AllowSameDayReentry bool    `yaml:"allow_same_day_reentry"`
+}
+
+// Exit describes scaling out of a winner and the end-of-day deadline.
+//
+// FirstTargetR is expressed in multiples of the initial risk rather than a fixed
+// percentage, which is the point: a trade risking 2% and a trade risking 5% should
+// not take profit at the same price move. A fixed-percentage profit target with a
+// trailing stop used to live here and was removed after it measured a t-statistic of
+// -9.76 over 1,697 trades; scaling out part of a position and letting the rest run is
+// a different rule with a different payoff, and it is measured separately.
 type Exit struct {
-	EODExitOffsetMins int `yaml:"eod_exit_offset_minutes"`
+	// FirstTargetR is the first profit target, in multiples of initial risk.
+	FirstTargetR float64 `yaml:"first_target_r"`
+	// FirstTargetFraction is how much of the position is sold there. The remainder
+	// is the runner that pays for the losing trades.
+	FirstTargetFraction float64 `yaml:"first_target_fraction"`
+	// BreakevenAfterTarget moves the runner's stop to the entry price once the first
+	// target is banked, so a winner cannot become a loser.
+	BreakevenAfterTarget bool `yaml:"breakeven_after_target"`
+	EODExitOffsetMins    int  `yaml:"eod_exit_offset_minutes"`
 }
 
 type Timing struct {
 	SentimentPollInterval time.Duration `yaml:"sentiment_poll_interval"`
-	SentimentWindow       time.Duration `yaml:"sentiment_window"`
-	ScreenerScanInterval  time.Duration `yaml:"screener_scan_interval"`
-	PositionPollInterval  time.Duration `yaml:"position_poll_interval"`
+	// SentimentWindow is how long the gate takes to resolve after the open.
+	//
+	// It used to be an hour, during which no trading happened at all. That is the
+	// single worst hour to sit out for this strategy: the moves it looks for begin
+	// in the first fifteen minutes. The window is now short enough to keep the
+	// kill switch while giving most of the opening range back.
+	SentimentWindow time.Duration `yaml:"sentiment_window"`
+	// EntryWindow is how long after the open new positions may be opened. Positions
+	// already open are still managed to the close.
+	EntryWindow time.Duration `yaml:"entry_window"`
+	// EntryCutoffBuffer is quiet time between the last possible entry and the forced
+	// end-of-day exit, so nothing is bought that is about to be required to sell.
+	//
+	// It is a separate setting rather than arithmetic on EntryWindow because the two
+	// answer to different things: EntryWindow is measured from the open, the forced
+	// exit from the close, and on a half day those collide. Capping the window at the
+	// forced exit alone would let an early close open a position one minute before it
+	// had to be liquidated.
+	EntryCutoffBuffer    time.Duration `yaml:"entry_cutoff_buffer"`
+	ScreenerScanInterval time.Duration `yaml:"screener_scan_interval"`
+	PositionPollInterval time.Duration `yaml:"position_poll_interval"`
 }
 
 type Sentiment struct {
@@ -181,6 +264,42 @@ func (c *Config) Validate() error {
 	if c.Screening.MinDollarVolume <= 0 {
 		add("screening.min_dollar_volume must be > 0")
 	}
+	if c.Screening.MaxPrice <= c.Screening.MinPrice {
+		add("screening.max_price (%.2f) must be greater than screening.min_price (%.2f)",
+			c.Screening.MaxPrice, c.Screening.MinPrice)
+	}
+
+	if c.Entry.PatternInterval <= 0 {
+		add("entry.pattern_interval must be > 0")
+	}
+	if c.Entry.EMAPeriod < 2 {
+		add("entry.ema_period must be >= 2")
+	}
+	if c.Entry.MinPullbackBars < 1 {
+		add("entry.min_pullback_bars must be >= 1")
+	}
+	if c.Entry.MaxPullbackBars < c.Entry.MinPullbackBars {
+		add("entry.max_pullback_bars (%d) must be >= entry.min_pullback_bars (%d)",
+			c.Entry.MaxPullbackBars, c.Entry.MinPullbackBars)
+	}
+	if c.Entry.StopBufferPct < 0 || c.Entry.StopBufferPct >= 100 {
+		add("entry.stop_buffer_pct must be in [0, 100)")
+	}
+	if c.Entry.MinStopDistancePct <= 0 {
+		add("entry.min_stop_distance_pct must be > 0")
+	}
+	if c.Entry.MaxStopDistancePct <= c.Entry.MinStopDistancePct {
+		add("entry.max_stop_distance_pct (%.2f) must be greater than entry.min_stop_distance_pct (%.2f)",
+			c.Entry.MaxStopDistancePct, c.Entry.MinStopDistancePct)
+	}
+	// The chart stop is the working stop and the percentage stop is the backstop
+	// behind it. If the backstop were the tighter of the two it would fire first and
+	// the technical stop would never be reached, silently reverting the strategy to
+	// a fixed-percentage stop.
+	if c.Entry.MaxStopDistancePct >= c.Risk.StopLossPct {
+		add("entry.max_stop_distance_pct (%.2f) must be below risk.stop_loss_pct (%.2f), which is the gap backstop behind it",
+			c.Entry.MaxStopDistancePct, c.Risk.StopLossPct)
+	}
 	// Anything shorter than the trading day itself would start the search after the
 	// open, which is the bug this setting exists to prevent.
 	if c.Screening.NewsLookback < 7*time.Hour {
@@ -191,8 +310,11 @@ func (c *Config) Validate() error {
 	default:
 		add("market_data.feed must be one of: sip, iex")
 	}
-	if c.Risk.PositionSizePct <= 0 || c.Risk.PositionSizePct > 100 {
-		add("risk.position_size_pct must be in (0, 100]")
+	if c.Risk.RiskPerTradePct <= 0 || c.Risk.RiskPerTradePct > 100 {
+		add("risk.risk_per_trade_pct must be in (0, 100]")
+	}
+	if c.Risk.MaxPositionPct <= 0 || c.Risk.MaxPositionPct > 100 {
+		add("risk.max_position_pct must be in (0, 100]")
 	}
 	if c.Risk.MaxConcurrentPositions < 1 {
 		add("risk.max_concurrent_positions must be >= 1")
@@ -202,10 +324,21 @@ func (c *Config) Validate() error {
 	}
 	// Exposure above 100% would mean ordering with money the account does not
 	// have; the broker would reject the order mid-session.
-	if exposure := c.Risk.PositionSizePct * float64(c.Risk.MaxConcurrentPositions); exposure > 100 {
-		add("risk.position_size_pct * risk.max_concurrent_positions = %.0f%% exceeds 100%% of the portfolio", exposure)
+	if exposure := c.Risk.MaxPositionPct * float64(c.Risk.MaxConcurrentPositions); exposure > 100 {
+		add("risk.max_position_pct * risk.max_concurrent_positions = %.0f%% exceeds 100%% of the portfolio", exposure)
+	}
+	// Total risk is what actually matters for survival: five concurrent trades each
+	// risking 2% is 10% of the account on the line at once.
+	if atRisk := c.Risk.RiskPerTradePct * float64(c.Risk.MaxConcurrentPositions); atRisk > 25 {
+		add("risk.risk_per_trade_pct * risk.max_concurrent_positions = %.0f%% of the account at risk simultaneously, which exceeds the 25%% ceiling", atRisk)
 	}
 
+	if c.Exit.FirstTargetR <= 0 {
+		add("exit.first_target_r must be > 0")
+	}
+	if c.Exit.FirstTargetFraction <= 0 || c.Exit.FirstTargetFraction >= 1 {
+		add("exit.first_target_fraction must be in (0, 1) — 1 would sell the whole position and leave no runner")
+	}
 	if c.Exit.EODExitOffsetMins < 1 {
 		add("exit.eod_exit_offset_minutes must be >= 1")
 	}
@@ -215,6 +348,24 @@ func (c *Config) Validate() error {
 	}
 	if c.Timing.SentimentWindow <= 0 {
 		add("timing.sentiment_window must be > 0")
+	}
+	if c.Timing.EntryWindow <= 0 {
+		add("timing.entry_window must be > 0")
+	}
+	if c.Timing.EntryCutoffBuffer < 0 {
+		add("timing.entry_cutoff_buffer must be >= 0")
+	}
+	// A regular session is 6h30m. A buffer approaching that leaves no time to enter
+	// at all, which would look like a broken scanner rather than a setting.
+	if c.Timing.EntryCutoffBuffer >= 6*time.Hour {
+		add("timing.entry_cutoff_buffer (%s) leaves no usable entry window in a 6h30m session",
+			c.Timing.EntryCutoffBuffer)
+	}
+	// Entries have to be possible after the gate resolves, or the agent would screen
+	// all morning and never buy.
+	if c.Timing.EntryWindow <= c.Timing.SentimentWindow {
+		add("timing.entry_window (%s) must be longer than timing.sentiment_window (%s), or no entry is ever possible",
+			c.Timing.EntryWindow, c.Timing.SentimentWindow)
 	}
 	if c.Timing.ScreenerScanInterval <= 0 {
 		add("timing.screener_scan_interval must be > 0")

@@ -64,6 +64,16 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 A table of tickers currently being evaluated, with a per-criterion breakdown rather than a single pass/fail — this is what lets you see *why* a candidate did or didn't qualify:
 
 | Ticker | News catalyst today | ≥10% intraday move | ≥5x avg volume | Overall |
+
+The Action column carries the setup's verdict too, which is usually why a qualifying
+candidate was not bought: "no setup: close 9.93 has not cleared the 10.02 pullback
+high" is the common case, and seeing it is what distinguishes a quiet screen from a
+broken one.
+
+The open-positions table shows each position's **stop** and its **R multiple**, and a
+position that has scaled out shows what is still held with the banked profit beside
+it ("100 of 200, +$20.00"). Showing only the remaining share count would misreport
+both the exposure and any P&L a reader works out in their head.
 |---|---|---|---|---|
 | e.g. `ABCD` | ✅ 2 today | ✅ +14% | ✅ 6.1x | **Qualifies** |
 | e.g. `WXYZ` | ❌ 0 today | ✅ +11% | ✅ 5.3x | Fails (no news) |
@@ -96,10 +106,10 @@ Plus a totals row: net P&L for the day (aggregate $ and %) and a win/loss count,
 ## Active strategy section (bottom of the page)
 
 A four-part panel at the foot of the page describing the running strategy: the
-sentiment gate, the screening criteria, entry and sizing, and the exits. The exits
-section lists "Take profit: none" rather than omitting the row, because the absence is
-a deliberate measured choice and a reader checking the page should see that it was
-decided rather than forgotten.
+sentiment gate, the screening criteria, the entry setup and sizing, and the exits.
+The exits section lists the chart stop, the gap backstop behind it and the scale-out
+target separately, because which of the two stops fired is the difference between a
+normal loss and a gap.
 
 **Every value is read from the loaded configuration**, never written into the
 template. That is the whole point of the section: a hardcoded panel would pass a

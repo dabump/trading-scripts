@@ -12,8 +12,21 @@ import (
 func testCfg() *config.Config {
 	c := &config.Config{}
 	c.Risk.StopLossPct = 10
+	c.Risk.RiskPerTradePct = 1
+	c.Risk.MaxPositionPct = 33
+	c.Exit.FirstTargetR = 2
+	c.Exit.FirstTargetFraction = 0.5
+	c.Exit.BreakevenAfterTarget = true
 	c.Exit.EODExitOffsetMins = 30
+	c.Entry.PatternInterval = time.Minute
+	c.Entry.EMAPeriod = 9
+	c.Entry.MinPullbackBars = 1
+	c.Entry.MaxPullbackBars = 5
+	c.Entry.StopBufferPct = 0.1
+	c.Entry.MinStopDistancePct = 0.5
+	c.Entry.MaxStopDistancePct = 4
 	c.Screening.MinPrice = 1
+	c.Screening.MaxPrice = 1e6
 	c.Screening.MinDollarVolume = 1_000_000
 	c.Screening.MinIntradayPct = 10
 	c.Screening.MinVolumeMultiple = 5
@@ -27,37 +40,65 @@ func testCfg() *config.Config {
 func TestCheckExitResolvesABarAgainstTheTrader(t *testing.T) {
 	cfg := testCfg()
 
+	// entry 100, chart stop 96, so risk is 4 a share and the 2R target is 108.
+	newPos := func() *domain.Position {
+		return &domain.Position{EntryPrice: 100, PeakPrice: 100, Shares: 10,
+			SharesOpen: 10, StopPrice: 96, InitialRisk: 4}
+	}
+
 	t.Run("a bar that traded through the stop stops out", func(t *testing.T) {
-		pos := &domain.Position{EntryPrice: 100, PeakPrice: 100, Shares: 10}
-		reason, fill := checkExit(pos, Bar{O: 100, H: 120, L: 89, C: 118}, false, cfg)
-		if reason != domain.ExitStopLoss {
-			t.Fatalf("reason = %q, want %q", reason, domain.ExitStopLoss)
+		got := checkExit(newPos(), Bar{O: 100, H: 120, L: 95, C: 118}, false, cfg)
+		if got.reason != domain.ExitStopLoss {
+			t.Fatalf("reason = %q, want %q", got.reason, domain.ExitStopLoss)
 		}
-		if fill != 90 {
-			t.Errorf("fill = %v, want the 90 stop threshold", fill)
-		}
-	})
-
-	t.Run("a big pullback from the peak is held", func(t *testing.T) {
-		// Once a trailing-stop exit at 114; now only the 90 stop can close it.
-		pos := &domain.Position{EntryPrice: 100, PeakPrice: 120, Shares: 10}
-		if reason, _ := checkExit(pos, Bar{O: 118, H: 120, L: 113, C: 115}, false, cfg); reason != "" {
-			t.Fatalf("reason = %q, want the position held", reason)
+		if got.price != 96 {
+			t.Errorf("fill = %v, want the 96 chart stop", got.price)
 		}
 	})
 
-	t.Run("a bar that gapped below the threshold cannot fill at it", func(t *testing.T) {
-		pos := &domain.Position{EntryPrice: 100, PeakPrice: 100, Shares: 10}
-		_, fill := checkExit(pos, Bar{O: 85, H: 86, L: 80, C: 82}, false, cfg)
-		if fill != 85 {
-			t.Errorf("fill = %v, want the 85 open — the 90 stop was already gapped through", fill)
+	t.Run("the stop beats a target the same bar also reached", func(t *testing.T) {
+		// This bar traded both the 96 stop and the 108 target. Booking the target
+		// would flatter every wide bar in the sample.
+		got := checkExit(newPos(), Bar{O: 100, H: 115, L: 95, C: 110}, false, cfg)
+		if got.reason != domain.ExitStopLoss || got.scale != 0 {
+			t.Errorf("got %+v, want the stop to win", got)
+		}
+	})
+
+	t.Run("a bar reaching only the target scales out", func(t *testing.T) {
+		got := checkExit(newPos(), Bar{O: 104, H: 112, L: 103, C: 110}, false, cfg)
+		if got.scale != 5 {
+			t.Fatalf("scaled %d, want 5 of 10", got.scale)
+		}
+		if got.price != 108 {
+			t.Errorf("fill = %v, want the 108 target", got.price)
+		}
+		if got.newStop != 100 {
+			t.Errorf("new stop = %v, want breakeven at 100", got.newStop)
+		}
+	})
+
+	t.Run("a bar that gapped past the target fills at the open", func(t *testing.T) {
+		got := checkExit(newPos(), Bar{O: 130, H: 135, L: 129, C: 132}, false, cfg)
+		if got.scale == 0 {
+			t.Fatal("expected a scale-out")
+		}
+		if got.price != 130 {
+			t.Errorf("fill = %v, want the 130 open, not the 108 target it gapped past", got.price)
+		}
+	})
+
+	t.Run("a bar that gapped below the stop cannot fill at it", func(t *testing.T) {
+		got := checkExit(newPos(), Bar{O: 85, H: 86, L: 80, C: 82}, false, cfg)
+		if got.price != 85 {
+			t.Errorf("fill = %v, want the 85 open — the 96 stop was already gone", got.price)
 		}
 	})
 
 	t.Run("a quiet bar leaves the position open and raises the peak", func(t *testing.T) {
-		pos := &domain.Position{EntryPrice: 100, PeakPrice: 100, Shares: 10}
-		if reason, _ := checkExit(pos, Bar{O: 101, H: 106, L: 99, C: 104}, false, cfg); reason != "" {
-			t.Fatalf("reason = %q, want no exit", reason)
+		pos := newPos()
+		if got := checkExit(pos, Bar{O: 101, H: 106, L: 99, C: 104}, false, cfg); got.reason != "" || got.scale != 0 {
+			t.Fatalf("got %+v, want no action", got)
 		}
 		// The peak no longer drives an exit, but it is still recorded and shown.
 		if pos.PeakPrice != 106 {
@@ -66,10 +107,9 @@ func TestCheckExitResolvesABarAgainstTheTrader(t *testing.T) {
 	})
 
 	t.Run("the forced exit ignores price and fills at the bar open", func(t *testing.T) {
-		pos := &domain.Position{EntryPrice: 100, PeakPrice: 140, Shares: 10}
-		reason, fill := checkExit(pos, Bar{O: 137, H: 138, L: 130, C: 131}, true, cfg)
-		if reason != domain.ExitForcedEOD || fill != 137 {
-			t.Errorf("got %q at %v, want FORCED_EOD at 137", reason, fill)
+		got := checkExit(newPos(), Bar{O: 137, H: 138, L: 130, C: 131}, true, cfg)
+		if got.reason != domain.ExitForcedEOD || got.price != 137 {
+			t.Errorf("got %+v, want FORCED_EOD at 137", got)
 		}
 	})
 }
@@ -108,7 +148,8 @@ func TestExcursionsSplitAtTheExit(t *testing.T) {
 		bar(15, 130, 95, 128),  // after the exit: +30%
 		bar(20, 132, 120, 121), // last close +21%
 	}
-	pos := &domain.Position{EntryPrice: 100, PeakPrice: 100, EntryTime: day.Add(5 * time.Minute)}
+	pos := &domain.Position{EntryPrice: 100, PeakPrice: 100, Shares: 1, SharesOpen: 1,
+		EntryTime: day.Add(5 * time.Minute)}
 	exitAt := day.Add(15 * time.Minute)
 
 	mfe, mae, before, after, held := excursions(bars, pos, exitAt)

@@ -70,17 +70,22 @@ func TestEnrichmentBudgetKeepsBusiestNotBiggestMovers(t *testing.T) {
 	h.setBullish()
 	h.cfg.Screening.MaxEnriched = 2
 
-	// THIN has by far the biggest percentage move but trades almost nothing.
-	h.fake.SetSnapshot("THIN", 2.00, 1.00, 50_000) // +100%, $100k traded
+	// All three sit inside the price band and clear the dollar-volume floor, so the
+	// enrichment budget is the only thing that can exclude any of them. That matters:
+	// with a sub-floor "thin" name the test would pass whether the budget worked or
+	// not.
+	//
+	// THIN has by far the biggest percentage move but trades the least.
+	h.fake.SetSnapshot("THIN", 2.00, 1.00, 1_000_000) // +100%, $2m traded
 	h.fake.SetAverageVolume("THIN", 5_000)
 	h.fake.SetNews("THIN", 1)
 
 	// These two move less but trade enormously.
-	h.fake.SetSnapshot("BUSY1", 22.00, 20.00, 40_000_000) // +10%, $880m
+	h.fake.SetSnapshot("BUSY1", 11.00, 10.00, 40_000_000) // +10%, $440m
 	h.fake.SetAverageVolume("BUSY1", 4_000_000)
 	h.fake.SetNews("BUSY1", 1)
 
-	h.fake.SetSnapshot("BUSY2", 33.00, 30.00, 20_000_000) // +10%, $660m
+	h.fake.SetSnapshot("BUSY2", 15.00, 13.50, 20_000_000) // +11%, $300m
 	h.fake.SetAverageVolume("BUSY2", 2_000_000)
 	h.fake.SetNews("BUSY2", 1)
 

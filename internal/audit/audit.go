@@ -26,10 +26,14 @@ const (
 	GateResolved   Kind = "GATE_RESOLVED"
 	TradingHalted  Kind = "TRADING_HALTED"
 	PositionOpened Kind = "POSITION_OPENED"
-	PositionClosed Kind = "POSITION_CLOSED"
-	EntrySkipped   Kind = "ENTRY_SKIPPED"
-	Reconciled     Kind = "RECONCILED"
-	Fault          Kind = "FAULT"
+	// PositionScaledOut is a partial sale at the first profit target. Distinct from
+	// PositionClosed because the position is still open afterwards, and an end-of-day
+	// summary that counted it as a close would double-count the trade.
+	PositionScaledOut Kind = "POSITION_SCALED_OUT"
+	PositionClosed    Kind = "POSITION_CLOSED"
+	EntrySkipped      Kind = "ENTRY_SKIPPED"
+	Reconciled        Kind = "RECONCILED"
+	Fault             Kind = "FAULT"
 )
 
 // Event is one audited decision or action.

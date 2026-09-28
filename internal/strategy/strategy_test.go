@@ -10,11 +10,23 @@ import (
 func cfg() *config.Config {
 	c := &config.Config{}
 	c.Risk.StopLossPct = 10
+	c.Exit.FirstTargetR = 2
+	c.Exit.FirstTargetFraction = 0.5
+	c.Exit.BreakevenAfterTarget = true
 	return c
 }
 
+// pos builds an open position with a chart stop, which is now the normal shape: entry
+// 100, stop 96, so initial risk is 4 a share and 1R is 4 of price.
+func pos(shares int) domain.Position {
+	return domain.Position{
+		Symbol: "ABCD", Shares: shares, SharesOpen: shares,
+		EntryPrice: 100, PeakPrice: 100, StopPrice: 96, InitialRisk: 4,
+	}
+}
+
 func TestEvaluateExitPriority(t *testing.T) {
-	base := domain.Position{Symbol: "ABCD", Shares: 10, EntryPrice: 100, PeakPrice: 100}
+	base := pos(10)
 
 	tests := []struct {
 		name       string
@@ -29,43 +41,58 @@ func TestEvaluateExitPriority(t *testing.T) {
 			wantReason: domain.ExitForcedEOD,
 		},
 		{
-			name:       "stop loss at exactly -10%",
-			in:         ExitInput{Position: base, Price: 90},
+			// The chart stop, not the percentage backstop: 96 is where the setup put
+			// it, and it is what fires.
+			name:       "the chart stop at exactly its price",
+			in:         ExitInput{Position: base, Price: 96},
 			wantExit:   true,
 			wantReason: domain.ExitStopLoss,
 		},
 		{
-			name:     "just above the stop stays open",
-			in:       ExitInput{Position: base, Price: 90.01},
+			name:     "a cent above the chart stop stays open",
+			in:       ExitInput{Position: base, Price: 96.01},
 			wantExit: false,
 		},
 		{
-			// The removed trailing stop would have closed this at +14%. Nothing may
-			// now take a winner off the table before the bell: the strategy's whole
-			// return is in the right tail, and a rule that trims it was measured
-			// turning a positive per-trade mean negative.
-			name: "a position well off its peak is still held",
+			// With no chart stop — a position opened by an older version, or adopted
+			// during reconciliation — the percentage backstop is the only floor.
+			name: "the percentage backstop catches a position with no chart stop",
 			in: ExitInput{
-				Position: domain.Position{EntryPrice: 100, PeakPrice: 160},
-				Price:    120,
+				Position: domain.Position{Shares: 10, SharesOpen: 10, EntryPrice: 100,
+					PeakPrice: 100},
+				Price: 90,
+			},
+			wantExit:   true,
+			wantReason: domain.ExitStopLoss,
+		},
+		{
+			// The removed trailing stop would have closed this. Nothing may now take
+			// a whole winner off the table before the bell: the strategy's return is
+			// in the right tail, and a rule that trims it was measured turning a
+			// positive per-trade mean negative.
+			name: "a runner well off its peak is still held",
+			in: ExitInput{
+				Position: func() domain.Position {
+					p := pos(10)
+					p.PeakPrice, p.TargetHit, p.SharesOpen = 160, true, 5
+					p.StopPrice = 100 // moved to breakeven after the target
+					return p
+				}(),
+				Price: 120,
 			},
 			wantExit: false,
 		},
 		{
-			name: "a large gain is held to the close",
+			// The breakeven stop is a stop like any other: it fires.
+			name: "a runner falling back to breakeven stops out",
 			in: ExitInput{
-				Position: domain.Position{EntryPrice: 100, PeakPrice: 250},
-				Price:    250,
-			},
-			wantExit: false,
-		},
-		{
-			// Only the stop-loss reads the peak-independent floor, so a position
-			// that peaked high and then collapsed past the stop still stops out.
-			name: "a collapse past the stop still exits on the stop",
-			in: ExitInput{
-				Position: domain.Position{EntryPrice: 100, PeakPrice: 200},
-				Price:    89,
+				Position: func() domain.Position {
+					p := pos(10)
+					p.PeakPrice, p.TargetHit, p.SharesOpen = 160, true, 5
+					p.StopPrice = 100
+					return p
+				}(),
+				Price: 100,
 			},
 			wantExit:   true,
 			wantReason: domain.ExitStopLoss,
@@ -98,23 +125,27 @@ func TestExitThresholdsTriggerAtExactBoundaries(t *testing.T) {
 		wantReason domain.ExitReason
 	}{
 		{
+			// The backstop path: no chart stop, so entry*0.9 is the floor. 4.20*0.9
+			// evaluates to 3.7800000000000002, so an exact 3.78 reads as above it
+			// without the epsilon.
 			name:       "exactly 10% below a 4.20 entry",
-			pos:        domain.Position{EntryPrice: 4.20, PeakPrice: 4.20},
+			pos:        domain.Position{Shares: 1, SharesOpen: 1, EntryPrice: 4.20, PeakPrice: 4.20},
 			price:      3.78,
 			wantReason: domain.ExitStopLoss,
 		},
 		{
-			// 1.00 * 0.9 is 0.9000000000000001 in binary, so an exact 0.90 reads as
-			// above the stop without the epsilon.
 			name:       "exactly 10% below a 1.00 entry",
-			pos:        domain.Position{EntryPrice: 1.00, PeakPrice: 1.00},
+			pos:        domain.Position{Shares: 1, SharesOpen: 1, EntryPrice: 1.00, PeakPrice: 1.00},
 			price:      0.90,
 			wantReason: domain.ExitStopLoss,
 		},
 		{
-			name:       "exactly 10% below a 33.33 entry",
-			pos:        domain.Position{EntryPrice: 33.33, PeakPrice: 40.00},
-			price:      29.997,
+			// The chart-stop path at its exact price, where the stop is a product of
+			// a percentage buffer and just as unrepresentable.
+			name: "exactly on a chart stop derived from a buffer",
+			pos: domain.Position{Shares: 1, SharesOpen: 1, EntryPrice: 10.00,
+				PeakPrice: 10.00, StopPrice: 9.87 * (1 - 0.1/100), InitialRisk: 0.14},
+			price:      9.87 * (1 - 0.1/100),
 			wantReason: domain.ExitStopLoss,
 		},
 	}
@@ -130,9 +161,109 @@ func TestExitThresholdsTriggerAtExactBoundaries(t *testing.T) {
 	// The tolerance must not swallow a genuine move: a cent above the stop stays
 	// open.
 	got := EvaluateExit(ExitInput{
-		Position: domain.Position{EntryPrice: 4.20, PeakPrice: 4.20}, Price: 3.79,
+		Position: domain.Position{Shares: 1, SharesOpen: 1, EntryPrice: 4.20, PeakPrice: 4.20},
+		Price:    3.79,
 	}, c)
 	if got.Exit {
 		t.Errorf("a price above the stop must not exit: %+v", got)
 	}
+}
+
+// Scaling out is the rule that replaced the removed profit target, and the thing that
+// makes it different is that it leaves a runner. A rule that sold everything at the
+// target would be the old mistake wearing a new name.
+func TestScaleOutAtTheFirstTarget(t *testing.T) {
+	c := cfg() // 2R target, sell half, then breakeven
+
+	t.Run("half is sold at 2R and the rest keeps running", func(t *testing.T) {
+		// Entry 100, risk 4 a share, so 2R is 108.
+		got := EvaluateExit(ExitInput{Position: pos(100), Price: 108}, c)
+		if got.Exit {
+			t.Fatal("the target must not close the position")
+		}
+		if !got.Scale {
+			t.Fatal("the target must scale out")
+		}
+		if got.ScaleShares != 50 {
+			t.Errorf("scaled %d shares, want 50 of 100", got.ScaleShares)
+		}
+		if got.NewStop != 100 {
+			t.Errorf("new stop = %v, want the 100 entry price", got.NewStop)
+		}
+	})
+
+	t.Run("a cent below the target does nothing", func(t *testing.T) {
+		if got := EvaluateExit(ExitInput{Position: pos(100), Price: 107.99}, c); got.Scale {
+			t.Error("scaled out below the target")
+		}
+	})
+
+	t.Run("the target only pays once", func(t *testing.T) {
+		p := pos(100)
+		p.TargetHit, p.SharesOpen = true, 50
+		if got := EvaluateExit(ExitInput{Position: p, Price: 130}, c); got.Scale {
+			t.Error("a latched target must not scale out again")
+		}
+	})
+
+	t.Run("the stop wins on a price that is both", func(t *testing.T) {
+		// Cannot happen from one price, but the caller passes the bar's low and high
+		// separately and the stop has to take priority when both are true.
+		p := pos(100)
+		if got := EvaluateExit(ExitInput{Position: p, Price: 96}, c); !got.Exit || got.Scale {
+			t.Errorf("got %+v, want the stop to close it", got)
+		}
+	})
+
+	t.Run("the forced exit outranks the target", func(t *testing.T) {
+		got := EvaluateExit(ExitInput{Position: pos(100), Price: 130, EODReached: true}, c)
+		if !got.Exit || got.Reason != domain.ExitForcedEOD || got.Scale {
+			t.Errorf("got %+v, want a forced close", got)
+		}
+	})
+
+	t.Run("breakeven can be turned off", func(t *testing.T) {
+		noBE := cfg()
+		noBE.Exit.BreakevenAfterTarget = false
+		if got := EvaluateExit(ExitInput{Position: pos(100), Price: 108}, noBE); got.NewStop != 0 {
+			t.Errorf("new stop = %v, want none when breakeven is disabled", got.NewStop)
+		}
+	})
+
+	t.Run("a position with no initial risk cannot have a target", func(t *testing.T) {
+		p := pos(100)
+		p.InitialRisk = 0
+		if got := EvaluateExit(ExitInput{Position: p, Price: 500}, c); got.Scale {
+			t.Error("without an initial risk there is no R to measure a target in")
+		}
+	})
+}
+
+// A position too small to split must run rather than being closed at the target,
+// because closing it whole is exactly the truncation the strategy cannot afford.
+func TestScaleOutOnTinyPositions(t *testing.T) {
+	c := cfg()
+
+	t.Run("a single share is never scaled or closed at the target", func(t *testing.T) {
+		got := EvaluateExit(ExitInput{Position: pos(1), Price: 200}, c)
+		if got.Scale || got.Exit {
+			t.Errorf("got %+v, want it left alone to run", got)
+		}
+	})
+
+	t.Run("two shares sell one and keep one", func(t *testing.T) {
+		got := EvaluateExit(ExitInput{Position: pos(2), Price: 108}, c)
+		if !got.Scale || got.ScaleShares != 1 {
+			t.Errorf("got %+v, want one of two shares sold", got)
+		}
+	})
+
+	t.Run("a fraction that rounds to everything still leaves one share", func(t *testing.T) {
+		greedy := cfg()
+		greedy.Exit.FirstTargetFraction = 0.99
+		got := EvaluateExit(ExitInput{Position: pos(3), Price: 108}, greedy)
+		if !got.Scale || got.ScaleShares != 2 {
+			t.Errorf("got %+v, want 2 of 3 sold so a runner survives", got)
+		}
+	})
 }

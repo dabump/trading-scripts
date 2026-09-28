@@ -5,95 +5,18 @@ import (
 	"testing"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
-	"github.com/martincoetzee/trading-agent/internal/domain"
 )
 
 func cfg() *config.Config {
 	c := &config.Config{}
-	c.Risk.PositionSizePct = 10
+	c.Risk.RiskPerTradePct = 1
+	c.Risk.MaxPositionPct = 20
 	c.Risk.MaxConcurrentPositions = 5
 	c.Risk.StopLossPct = 10
 	return c
 }
 
-func TestSize(t *testing.T) {
-	tests := []struct {
-		name       string
-		acct       domain.Account
-		price      float64
-		wantOK     bool
-		wantShares int
-		wantReason string
-	}{
-		{
-			name:       "10% of a 100k portfolio at $50",
-			acct:       domain.Account{PortfolioValue: 100_000, Cash: 100_000},
-			price:      50,
-			wantOK:     true,
-			wantShares: 200,
-		},
-		{
-			name:       "fractional allocation rounds down to whole shares",
-			acct:       domain.Account{PortfolioValue: 10_000, Cash: 10_000},
-			price:      333,
-			wantOK:     true,
-			wantShares: 3, // $1000 / $333 = 3.003
-		},
-		{
-			name: "clamped to cash when the account is mostly deployed",
-			// 10% of 100k is 10k, but only 4k of cash remains.
-			acct:       domain.Account{PortfolioValue: 100_000, Cash: 4_000},
-			price:      100,
-			wantOK:     true,
-			wantShares: 40,
-		},
-		{
-			name:       "share price above the whole allocation is refused",
-			acct:       domain.Account{PortfolioValue: 10_000, Cash: 10_000},
-			price:      1_500, // allocation is $1000
-			wantReason: "below one share",
-		},
-		{
-			name:       "no cash is refused",
-			acct:       domain.Account{PortfolioValue: 100_000, Cash: 0},
-			price:      10,
-			wantReason: "no cash",
-		},
-		{
-			name:       "zero price is refused",
-			acct:       domain.Account{PortfolioValue: 100_000, Cash: 100_000},
-			price:      0,
-			wantReason: "no valid price",
-		},
-		{
-			name:       "empty portfolio is refused",
-			acct:       domain.Account{},
-			price:      10,
-			wantReason: "portfolio value is zero",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := Size(tt.acct, tt.price, cfg())
-			if got.OK != tt.wantOK {
-				t.Fatalf("OK = %v, want %v (reason %q)", got.OK, tt.wantOK, got.Reason)
-			}
-			if tt.wantOK {
-				if got.Shares != tt.wantShares {
-					t.Errorf("Shares = %d, want %d", got.Shares, tt.wantShares)
-				}
-				if want := float64(tt.wantShares) * tt.price; got.Dollars != want {
-					t.Errorf("Dollars = %.2f, want %.2f", got.Dollars, want)
-				}
-			} else if !strings.Contains(got.Reason, tt.wantReason) {
-				t.Errorf("Reason = %q, want it to contain %q", got.Reason, tt.wantReason)
-			}
-		})
-	}
-}
-
-// Five positions at 10% each is the documented cap; the sixth must be refused.
+// Five concurrent positions is the documented cap; the sixth must be refused.
 func TestConcurrencyCap(t *testing.T) {
 	c := cfg()
 	for open := 0; open < 5; open++ {

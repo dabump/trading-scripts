@@ -151,6 +151,7 @@ func TestVolumeMultiple(t *testing.T) {
 func TestTradableFloors(t *testing.T) {
 	c := cfg()
 	c.Screening.MinPrice = 1
+	c.Screening.MaxPrice = 20
 	c.Screening.MinDollarVolume = 1_000_000
 
 	tests := []struct {
@@ -160,8 +161,11 @@ func TestTradableFloors(t *testing.T) {
 		wantOK       bool
 		wantReason   string
 	}{
-		{"clears both floors", 4.20, 25_000_000, true, ""},
-		{"exactly at both floors", 1.00, 1_000_000, true, ""},
+		{"inside the band and above the floor", 4.20, 25_000_000, true, ""},
+		{"exactly on both lower bounds", 1.00, 1_000_000, true, ""},
+		{"exactly on the price ceiling", 20.00, 25_000_000, true, ""},
+		{"above the price ceiling", 20.01, 25_000_000, false, "above the $20.00 ceiling"},
+		{"a mega-cap far above the band", 340.00, 900_000_000, false, "above the $20.00 ceiling"},
 		{"a warrant priced at $0.07", 0.07, 50_000_000, false, "below the $1.00 floor"},
 		{"a cent below the price floor", 0.99, 50_000_000, false, "below the $1.00 floor"},
 		{"a SPAC unit trading 15 shares", 9.80, 147, false, "below the $1000000 floor"},

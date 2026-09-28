@@ -72,10 +72,37 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			wantValue: "42 symbols",
 		},
 		{
-			name:      "position size",
-			label:     "Position size",
-			mutate:    func(f *fixture) { f.cfg.Risk.PositionSizePct = 4 },
-			wantValue: "4% of portfolio",
+			name:      "risk per trade",
+			label:     "Risk per trade",
+			mutate:    func(f *fixture) { f.cfg.Risk.RiskPerTradePct = 0.75 },
+			wantValue: "0.75% of the account",
+		},
+		{
+			name:      "entry window",
+			label:     "Entry window",
+			mutate:    func(f *fixture) { f.cfg.Timing.EntryWindow = 90 * time.Minute },
+			wantValue: "first 1h 30m after the open",
+		},
+		{
+			name:  "trend filter period",
+			label: "Trend filter",
+			mutate: func(f *fixture) {
+				f.cfg.Entry.EMAPeriod = 20
+				f.cfg.Entry.RequireAboveVWAP = true
+			},
+			wantValue: "above the 20-period EMA and VWAP",
+		},
+		{
+			name:      "maximum stop distance",
+			label:     "Stop",
+			mutate:    func(f *fixture) { f.cfg.Entry.MaxStopDistancePct = 2.5 },
+			wantValue: "just below the pullback low",
+		},
+		{
+			name:      "first target",
+			label:     "First target",
+			mutate:    func(f *fixture) { f.cfg.Exit.FirstTargetR = 3 },
+			wantValue: "3R — sell 50%",
 		},
 		{
 			name:      "concurrent positions",
@@ -84,8 +111,8 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			wantValue: "up to 3",
 		},
 		{
-			name:      "stop loss",
-			label:     "Stop-loss",
+			name:      "gap backstop",
+			label:     "Gap backstop",
 			mutate:    func(f *fixture) { f.cfg.Risk.StopLossPct = 6.5 },
 			wantValue: "−6.5% from entry",
 		},
@@ -96,10 +123,10 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			wantValue: "45 min before close",
 		},
 		{
-			name:      "minimum price floor",
-			label:     "Minimum price",
+			name:      "price band",
+			label:     "Price band",
 			mutate:    func(f *fixture) { f.cfg.Screening.MinPrice = 2.5 },
-			wantValue: "$2.5",
+			wantValue: "$2.5 – $20",
 		},
 		{
 			name:      "minimum dollar volume floor",
@@ -163,13 +190,42 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 // Derived figures must be computed the same way the engine computes them, or the panel
 // and the behaviour disagree.
 func TestStrategyPanelDerivesValues(t *testing.T) {
-	t.Run("maximum exposure is size times concurrency", func(t *testing.T) {
+	t.Run("maximum exposure is the position cap times concurrency", func(t *testing.T) {
 		f := newFixture(t)
-		f.cfg.Risk.PositionSizePct = 7
+		f.cfg.Risk.MaxPositionPct = 7
 		f.cfg.Risk.MaxConcurrentPositions = 4
 
 		if got, _ := rowValue(t, f, "Maximum exposure"); got != "28%" {
 			t.Errorf("exposure = %q, want 28%% (7 × 4)", got)
+		}
+	})
+
+	t.Run("most at risk at once is risk per trade times concurrency", func(t *testing.T) {
+		f := newFixture(t)
+		f.cfg.Risk.RiskPerTradePct = 1.5
+		f.cfg.Risk.MaxConcurrentPositions = 4
+
+		if got, _ := rowValue(t, f, "Most at risk at once"); got != "6%" {
+			t.Errorf("at risk = %q, want 6%% (1.5 × 4)", got)
+		}
+	})
+
+	t.Run("the setup warm-up follows the interval and the EMA period", func(t *testing.T) {
+		f := newFixture(t)
+		f.cfg.Entry.EMAPeriod = 9
+		f.cfg.Entry.MinPullbackBars = 1
+		f.cfg.Entry.PatternInterval = time.Minute
+		// 9 + 1 + 2 = 12 bars of one minute.
+		if got, _ := rowValue(t, f, "Setup warm-up"); got != "12m" {
+			t.Errorf("warm-up = %q, want 12m", got)
+		}
+
+		f2 := newFixture(t)
+		f2.cfg.Entry.EMAPeriod = 9
+		f2.cfg.Entry.MinPullbackBars = 1
+		f2.cfg.Entry.PatternInterval = 5 * time.Minute
+		if got, _ := rowValue(t, f2, "Setup warm-up"); got != "1h" {
+			t.Errorf("warm-up at 5m candles = %q, want 1h", got)
 		}
 	})
 
@@ -254,7 +310,7 @@ func TestStrategyPanelListsExitsInPriorityOrder(t *testing.T) {
 	f := newFixture(t)
 	_, body := f.get(t, "/")
 
-	want := []string{"Forced end-of-day", "Stop-loss", "Take profit"}
+	want := []string{"Forced end-of-day", "Chart stop", "Gap backstop", "First target"}
 	prev := -1
 	for _, label := range want {
 		at := strings.Index(body, label)

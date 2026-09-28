@@ -54,11 +54,18 @@ func testConfig() *config.Config {
 	c.MarketData = config.MarketData{Feed: "sip"}
 	c.Screening = config.Screening{MinIntradayPct: 10,
 		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
-		NewsLookback: 18 * time.Hour, MinPrice: 1, MinDollarVolume: 1_000_000}
-	c.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	c.Exit = config.Exit{EODExitOffsetMins: 30}
+		NewsLookback: 18 * time.Hour, MinPrice: 1, MaxPrice: 20,
+		MinDollarVolume: 1_000_000}
+	c.Risk = config.Risk{RiskPerTradePct: 1, MaxPositionPct: 33,
+		MaxConcurrentPositions: 3, StopLossPct: 10}
+	c.Exit = config.Exit{FirstTargetR: 2, FirstTargetFraction: 0.5,
+		BreakevenAfterTarget: true, EODExitOffsetMins: 30}
+	c.Entry = config.Entry{PatternInterval: time.Minute, EMAPeriod: 9,
+		MinPullbackBars: 1, MaxPullbackBars: 5, StopBufferPct: 0.1,
+		MinStopDistancePct: 0.5, MaxStopDistancePct: 4}
 	c.Timing = config.Timing{SentimentWindow: time.Hour, SentimentPollInterval: 10 * time.Minute,
-		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
+		EntryWindow: 4 * time.Hour, ScreenerScanInterval: time.Minute,
+		PositionPollInterval: 15 * time.Second}
 	c.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"}, BearishAvgPct: -0.8}
 	c.Web = config.Web{ListenAddr: ":0", PollInterval: 12 * time.Second}
 	return c
@@ -251,7 +258,7 @@ func TestOpenPositionsShowLivePnL(t *testing.T) {
 			t.Errorf("positions table missing %q", want)
 		}
 	}
-	if !strings.Contains(body, "1 of 5 slots") {
+	if !strings.Contains(body, "1 of 3 slots") {
 		t.Error("exposure summary missing")
 	}
 }

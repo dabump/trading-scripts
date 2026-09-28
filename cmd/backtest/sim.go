@@ -29,20 +29,32 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/strategy"
 )
 
-// qualifier is one candidate that passed all three criteria at one instant, with
-// the price a scan at that instant would have read.
+// qualifier is one candidate that passed all three screening criteria *and* printed
+// a setup at one instant, with the stop that setup put on the chart.
+//
+// Screening alone is not enough to be a qualifier any more, which is the point of the
+// change being measured: the stop comes from the pattern, and the position size comes
+// from the stop.
 type qualifier struct {
-	Symbol  string
-	Price   float64
-	VolMult float64
-	MovePct float64
+	Symbol string
+	// SetupClose is the trigger bar's close — what the daemon would size from. The
+	// backtest fills at the next bar's open instead, so this is recorded only for
+	// comparison.
+	SetupClose float64
+	Stop       float64
+	StopPct    float64
+	FlagBars   int
+	VolMult    float64
+	MovePct    float64
 }
 
 // preparedDay is one session reduced to the decisions the screen produced, plus
 // the bar data the exit rules need.
 type preparedDay struct {
-	Date        string
-	EODAt       time.Time
+	Date  string
+	EODAt time.Time
+	// EntryEndAt is the last instant a new position may be opened.
+	EntryEndAt  time.Time
 	LastBarAt   time.Time
 	Boundaries  []time.Time
 	GateBearish bool
@@ -71,6 +83,11 @@ type funnel struct {
 	EverPassedMove int
 	EverPassedVol  int
 	EverQualified  int
+	// EverSetUp counts symbol-days that qualified on the screen *and* printed a
+	// setup. The gap between EverQualified and EverSetUp is what the setup gate
+	// costs in candidates, which is the first thing to look at if trade count
+	// collapses.
+	EverSetUp int
 }
 
 // prepare applies the sentiment gate and the three screening criteria to every
@@ -87,6 +104,10 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 			EODAt:  sess.close.Add(-time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute),
 			bars:   map[string]map[int64]Bar{},
 			series: day.Intraday,
+		}
+		p.EntryEndAt = sess.open.Add(cfg.Timing.EntryWindow)
+		if p.EntryEndAt.After(p.EODAt) {
+			p.EntryEndAt = p.EODAt
 		}
 		for sym, bs := range day.Intraday {
 			idx := make(map[int64]Bar, len(bs))
@@ -137,17 +158,21 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 		}
 
 		cumVol := map[string]float64{}
-		type flags struct{ tradable, news, move, vol, qualified bool }
+		type flags struct{ tradable, news, move, vol, qualified, setUp bool }
 		seen := map[string]*flags{}
 		for sym := range cands {
 			seen[sym] = &flags{}
 		}
+		// Per-symbol cursor into its bar series, advanced with the clock so the setup
+		// detector only ever sees bars that had already closed.
+		cursor := map[string]int{}
 
 		p.qualifiers = make([][]qualifier, len(p.Boundaries))
 		for i, t := range p.Boundaries {
 			if !t.Before(p.EODAt) {
 				// Past the forced-exit mark the agent only closes positions.
 				advanceVolume(p, cands, cumVol, t)
+				advanceCursor(day, cands, cursor, t)
 				continue
 			}
 			evals := make([]domain.Evaluation, 0, len(cands))
@@ -193,13 +218,26 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 				prices[sym] = price
 				moves[sym] = in.IntradayPct
 			}
-			for _, e := range screener.Qualifying(evals) {
-				p.qualifiers[i] = append(p.qualifiers[i], qualifier{
-					Symbol: e.Symbol, Price: prices[e.Symbol], VolMult: e.VolumeMultiple,
-					MovePct: moves[e.Symbol],
-				})
+			// The setup gate, on bars that had closed by t. Entries are also only
+			// possible inside the entry window; after it the screen still runs, which
+			// is what keeps the funnel counts comparable across the whole session.
+			if t.Before(p.EntryEndAt) {
+				for _, e := range screener.Qualifying(evals) {
+					closed := day.Intraday[e.Symbol][:cursor[e.Symbol]]
+					setup := strategy.FindSetup(toDomainBars(closed), cfg)
+					if !setup.Triggered {
+						continue
+					}
+					seen[e.Symbol].setUp = true
+					p.qualifiers[i] = append(p.qualifiers[i], qualifier{
+						Symbol: e.Symbol, SetupClose: setup.Entry, Stop: setup.Stop,
+						StopPct: setup.StopDistancePct, FlagBars: setup.FlagBars,
+						VolMult: e.VolumeMultiple, MovePct: moves[e.Symbol],
+					})
+				}
 			}
 			advanceVolume(p, cands, cumVol, t)
+			advanceCursor(day, cands, cursor, t)
 		}
 
 		for _, f := range seen {
@@ -219,6 +257,9 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 			}
 			if f.qualified {
 				p.funnel.EverQualified++
+			}
+			if f.setUp {
+				p.funnel.EverSetUp++
 			}
 		}
 		out = append(out, p)
@@ -242,11 +283,16 @@ type Trade struct {
 	ExitTime   time.Time
 	ExitPrice  float64
 	Reason     domain.ExitReason
-	ReturnPct  float64
-	PnL        float64
-	VolMult    float64
-	MovePct    float64
-	HoldMins   float64
+	// Scaled records that the first target was banked before this exit, so the
+	// return below is a blend of two fills rather than one price move.
+	Scaled    bool
+	StopPrice float64
+	RMultiple float64
+	ReturnPct float64
+	PnL       float64
+	VolMult   float64
+	MovePct   float64
+	HoldMins  float64
 
 	// MFE/MAE are the best and worst the position reached, measured to the end of
 	// the session rather than only up to the exit. MFEAfterExit − ReturnPct is how
@@ -269,9 +315,9 @@ type Stats struct {
 	TradingDays   int
 	HaltedDays    int
 	SkippedNoData int
-	// PositionSizePct is echoed from the config so the report can label the
-	// affordability gate with the size actually used rather than a literal.
-	PositionSizePct float64
+	// RiskPerTradePct is echoed from the config so the report can label the
+	// affordability gate with the figure actually used rather than a literal.
+	RiskPerTradePct float64
 
 	Funnel funnel
 	// Blocked* count symbol-days that qualified at some point but were never
@@ -282,6 +328,7 @@ type Stats struct {
 	BlockedByCash   int
 	BlockedSameDay  int
 	BlockedHeld     int
+	ScaleOuts       int
 	MaxDayTrades5Bd int
 }
 
@@ -293,7 +340,7 @@ type Stats struct {
 func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stats {
 	const startEquity = 10_000.0
 
-	st := Stats{StartEquity: startEquity, PositionSizePct: cfg.Risk.PositionSizePct}
+	st := Stats{StartEquity: startEquity, RiskPerTradePct: cfg.Risk.RiskPerTradePct}
 	cash := startEquity
 	peakEquity := startEquity
 	dayTrades := map[string]int{}
@@ -313,6 +360,7 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 		st.Funnel.EverPassedMove += day.funnel.EverPassedMove
 		st.Funnel.EverPassedVol += day.funnel.EverPassedVol
 		st.Funnel.EverQualified += day.funnel.EverQualified
+		st.Funnel.EverSetUp += day.funnel.EverSetUp
 
 		if day.GateBearish {
 			st.HaltedDays++
@@ -336,9 +384,24 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 					continue
 				}
 				forced := !t.Before(day.EODAt)
-				if reason, price := checkExit(pos, bar, forced, cfg); reason != "" {
+				act := checkExit(pos, bar, forced, cfg)
+				switch {
+				case act.scale > 0:
+					// Bank part of the position at the target and keep the runner. The
+					// fill is the target price, which is inside the bar by construction.
+					proceeds := act.price * (1 - slippagePct/100)
+					cash += proceeds * float64(act.scale)
+					pos.BankedDollars += (proceeds - pos.EntryPrice) * float64(act.scale)
+					pos.SharesOpen -= act.scale
+					pos.TargetHit = true
+					if act.newStop > pos.StopPrice {
+						pos.StopPrice = act.newStop
+					}
+					st.ScaleOuts++
+				case act.reason != "":
 					st.Trades = append(st.Trades, closeTrade(&cash, day, sym, pos,
-						price*(1-slippagePct/100), t, reason, volMult[sym], movePct[sym]))
+						act.price*(1-slippagePct/100), t, act.reason,
+						volMult[sym], movePct[sym]))
 					delete(open, sym)
 					dayTrades[day.Date]++
 				}
@@ -357,22 +420,38 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 					}
 					continue
 				}
+				// The setup was read from bars that closed before t, so the fill is
+				// the open of the bar at t: the first price obtainable after the
+				// decision. Sizing uses that fill rather than the trigger close, so
+				// the risk per share is the risk actually taken on.
+				entryBar, ok := day.barAt(q.Symbol, t)
+				if !ok {
+					continue
+				}
+				fill := entryBar.O * (1 + slippagePct/100)
+				if fill <= q.Stop {
+					// The stop was already gone by the time the order could fill.
+					if _, seen := firstBlock[q.Symbol]; !seen {
+						firstBlock[q.Symbol] = "unaffordable: gapped through its stop before filling"
+					}
+					continue
+				}
 				equity := cash + marketValue(open, day, t)
-				sz := risk.Size(domain.Account{
+				sz := risk.SizeForRisk(domain.Account{
 					PortfolioValue: equity, Cash: cash, Equity: equity,
-				}, q.Price, cfg)
+				}, fill, q.Stop, cfg)
 				if !sz.OK {
 					if _, seen := firstBlock[q.Symbol]; !seen {
 						firstBlock[q.Symbol] = "unaffordable: " + sz.Reason
 					}
 					continue
 				}
-				fill := q.Price * (1 + slippagePct/100)
 				cash -= fill * float64(sz.Shares)
 				open[q.Symbol] = &domain.Position{
 					SessionDate: day.Date, Symbol: q.Symbol, Shares: sz.Shares,
-					EntryPrice: fill, EntryTime: t, PeakPrice: fill, LastPrice: fill,
-					Open: true,
+					SharesOpen: sz.Shares, EntryPrice: fill, EntryTime: t,
+					PeakPrice: fill, LastPrice: fill,
+					StopPrice: q.Stop, InitialRisk: fill - q.Stop, Open: true,
 				}
 				volMult[q.Symbol] = q.VolMult
 				movePct[q.Symbol] = q.MovePct
@@ -426,40 +505,94 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 	return st
 }
 
-// checkExit asks strategy.EvaluateExit about one bar, testing the bar's low so an
-// intrabar trigger is not missed, and returns the price the fill is modelled at.
+// action is what one bar asks of one position.
+type action struct {
+	reason  domain.ExitReason
+	price   float64
+	scale   int
+	newStop float64
+}
+
+// checkExit asks strategy.EvaluateExit about one bar, testing the bar's extremes so an
+// intrabar trigger is not missed.
 //
-// The low is tested before the peak is raised, which is the unfavourable ordering:
-// within a single bar the adverse extreme is assumed to come first.
-func checkExit(pos *domain.Position, bar Bar, forced bool, cfg *config.Config) (domain.ExitReason, float64) {
+// The low is tested first, which is the ordering unfavourable to the trader: on a bar
+// that traded through both the stop and the profit target, the stop is what is
+// recorded. Assuming the reverse would let every wide bar bank a target it might never
+// have reached first.
+func checkExit(pos *domain.Position, bar Bar, forced bool, cfg *config.Config) action {
 	if forced {
-		return domain.ExitForcedEOD, bar.O
+		return action{reason: domain.ExitForcedEOD, price: bar.O}
 	}
+
 	if d := strategy.EvaluateExit(strategy.ExitInput{Position: *pos, Price: bar.L}, cfg); d.Exit {
-		return d.Reason, thresholdPrice(pos, d.Reason, cfg, bar)
+		return action{reason: d.Reason, price: thresholdPrice(pos, d.Reason, cfg, bar)}
 	}
-	// The peak has no role in an exit any more, but it is still what the daemon
-	// records and what the status page shows, so it is still tracked here.
+
+	// Only then the favourable extreme, for the profit target.
+	if d := strategy.EvaluateExit(strategy.ExitInput{Position: *pos, Price: bar.H}, cfg); d.Scale {
+		target := pos.EntryPrice + pos.InitialRisk*cfg.Exit.FirstTargetR
+		if bar.O > target {
+			// It gapped past the target: the fill is the open, not the target.
+			target = bar.O
+		}
+		return action{scale: d.ScaleShares, price: target, newStop: d.NewStop}
+	}
+
+	// The peak drives no exit, but it is what the daemon records and the page shows.
 	if bar.H > pos.PeakPrice {
 		pos.PeakPrice = bar.H
 	}
 	pos.LastPrice = bar.C
-	return "", 0
+	return action{}
 }
 
 // thresholdPrice is the price a trigger is modelled as filling at: the stop itself,
 // not the bar's low. A real stop gaps through, which is what the slippage sweep
 // exists to bound.
+//
+// The stop used has to be the same one EvaluateExit applied — the chart stop, or the
+// percentage backstop when it is higher. Filling at the backstop when the chart stop
+// fired would credit the trade with a loss it never took.
 func thresholdPrice(pos *domain.Position, reason domain.ExitReason, cfg *config.Config, bar Bar) float64 {
 	px := bar.C
 	if reason == domain.ExitStopLoss {
-		px = pos.EntryPrice * (1 - cfg.Risk.StopLossPct/100)
+		px = pos.StopPrice
+		if backstop := pos.EntryPrice * (1 - cfg.Risk.StopLossPct/100); backstop > px {
+			px = backstop
+		}
 	}
 	// A bar that opened below the threshold could not have filled at it.
 	if bar.O < px {
 		px = bar.O
 	}
 	return px
+}
+
+// toDomainBars converts the backtest's wire type to the domain candle the setup
+// detector takes. The conversion exists so cmd/backtest can keep decoding Alpaca's
+// compact field names while strategy code sees a named struct.
+func toDomainBars(bars []Bar) []domain.Bar {
+	out := make([]domain.Bar, len(bars))
+	for i, b := range bars {
+		out[i] = domain.Bar{
+			Time: b.T, Open: b.O, High: b.H, Low: b.L, Close: b.C, Volume: b.V,
+		}
+	}
+	return out
+}
+
+// advanceCursor moves each symbol's cursor past every bar that has closed by t, so a
+// setup is only ever read from completed candles.
+func advanceCursor(day *DayData, cands map[string]CandidateDay, cursor map[string]int, t time.Time) {
+	for sym := range cands {
+		bars := day.Intraday[sym]
+		i := cursor[sym]
+		for i < len(bars) && !bars[i].T.In(scheduler.ET).After(t) {
+			i++
+		}
+		cursor[sym] = i
+	}
 }
 
 // capped drops qualifiers whose move at entry exceeds pct, which is how a ceiling on
@@ -505,13 +638,27 @@ func reranked(days []*preparedDay, less func(a, b qualifier) bool) []*preparedDa
 func closeTrade(cash *float64, day *preparedDay, sym string, pos *domain.Position,
 	fill float64, at time.Time, reason domain.ExitReason, volMult, movePct float64) Trade {
 
-	*cash += fill * float64(pos.Shares)
+	*cash += fill * float64(pos.SharesOpen)
 	mfe, mae, mfeBefore, mfeAfter, closeIfHeld := excursions(day.series[sym], pos, at)
+
+	// Total P&L over the whole trade, including anything banked by scaling out, as a
+	// percentage of the capital the position committed. With partial sales the price
+	// move from entry to final exit is no longer the trade's return.
+	pnl := pos.BankedDollars + (fill-pos.EntryPrice)*float64(pos.SharesOpen)
+	committed := pos.EntryPrice * float64(pos.Shares)
+	ret := 0.0
+	if committed > 0 {
+		ret = pnl / committed * 100
+	}
+
 	return Trade{
 		Symbol: sym, Date: day.Date, EntryTime: pos.EntryTime, EntryPrice: pos.EntryPrice,
 		Shares: pos.Shares, ExitTime: at, ExitPrice: fill, Reason: reason,
-		ReturnPct: (fill - pos.EntryPrice) / pos.EntryPrice * 100,
-		PnL:       (fill - pos.EntryPrice) * float64(pos.Shares),
+		Scaled:    pos.TargetHit,
+		StopPrice: pos.StopPrice,
+		RMultiple: pos.RMultiple(fill),
+		ReturnPct: ret,
+		PnL:       pnl,
 		VolMult:   volMult,
 		MovePct:   movePct,
 		HoldMins:  at.Sub(pos.EntryTime).Minutes(),

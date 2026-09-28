@@ -41,10 +41,17 @@ func newHarness(t *testing.T) *harness {
 	cfg.MarketData = config.MarketData{Feed: "sip"}
 	cfg.Screening = config.Screening{MinIntradayPct: 10,
 		MinVolumeMultiple: 5, AvgVolumeLookbackDays: 20, MaxEnriched: 100,
-		NewsLookback: 18 * time.Hour, MinPrice: 1, MinDollarVolume: 1_000_000}
-	cfg.Risk = config.Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	cfg.Exit = config.Exit{EODExitOffsetMins: 30}
-	cfg.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute, SentimentWindow: time.Hour,
+		NewsLookback: 18 * time.Hour, MinPrice: 1, MaxPrice: 20,
+		MinDollarVolume: 1_000_000}
+	cfg.Risk = config.Risk{RiskPerTradePct: 1, MaxPositionPct: 33,
+		MaxConcurrentPositions: 3, StopLossPct: 10}
+	cfg.Exit = config.Exit{FirstTargetR: 2, FirstTargetFraction: 0.5,
+		BreakevenAfterTarget: true, EODExitOffsetMins: 30}
+	cfg.Entry = config.Entry{PatternInterval: time.Minute, EMAPeriod: 9,
+		MinPullbackBars: 1, MaxPullbackBars: 5, StopBufferPct: 0.1,
+		MinStopDistancePct: 0.5, MaxStopDistancePct: 4}
+	cfg.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute,
+		SentimentWindow: time.Hour, EntryWindow: 4 * time.Hour,
 		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
 	cfg.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"},
 		BearishAvgPct: -0.8, RequireAllNegative: true}
@@ -102,10 +109,23 @@ func (h *harness) setBearish() {
 	}
 }
 
-// addCandidate registers a symbol that clears all four screening criteria.
+// addCandidate registers a symbol that clears every screening criterion and also
+// prints a valid setup, so it is actually buyable.
+//
+// Screening alone is no longer enough to produce an entry: the chart has to show a
+// pullback and resumption, which is what defines the stop and therefore the size.
 func (h *harness) addCandidate(symbol string, price float64) {
 	h.fake.SetSnapshot(symbol, price, price/1.14, 6_000_000) // +14%
 	h.fake.SetAverageVolume(symbol, 1_000_000)               // 6x
+	h.fake.SetNews(symbol, 2)
+	h.fake.SetSetupBars(symbol, price, h.open, h.cfg.Entry.PatternInterval)
+}
+
+// addScreenedOnly registers a symbol that passes the screen but never sets up, for
+// asserting that the setup gate is what stops it being bought.
+func (h *harness) addScreenedOnly(symbol string, price float64) {
+	h.fake.SetSnapshot(symbol, price, price/1.14, 6_000_000)
+	h.fake.SetAverageVolume(symbol, 1_000_000)
 	h.fake.SetNews(symbol, 2)
 }
 
@@ -173,30 +193,70 @@ func TestFullBullishDay(t *testing.T) {
 	if len(pos) != 1 {
 		t.Fatalf("got %d positions after the gate opened, want 1", len(pos))
 	}
-	// 10% of a $100k portfolio at $5.00 is 2000 shares.
-	if pos[0].Symbol != "ABCD" || pos[0].Shares != 2000 {
-		t.Errorf("position = %s x%d, want ABCD x2000", pos[0].Symbol, pos[0].Shares)
+	// Sized from the stop, then capped: 1% of $100k is $1,000 of risk, and the
+	// setup's stop is about $0.146 below the $5.00 entry, which asks for ~6,800
+	// shares — more than the 33% notional cap allows, so the cap decides at 6,600.
+	if pos[0].Symbol != "ABCD" {
+		t.Fatalf("position = %s, want ABCD", pos[0].Symbol)
 	}
+	if got := float64(pos[0].Shares) * pos[0].EntryPrice; got > 33_000.01 {
+		t.Errorf("notional $%.2f exceeds the 33%% position cap", got)
+	}
+	if pos[0].StopPrice <= 0 || pos[0].StopPrice >= pos[0].EntryPrice {
+		t.Errorf("stop = %v, want it below the %v entry — the setup has to define it",
+			pos[0].StopPrice, pos[0].EntryPrice)
+	}
+	if pos[0].InitialRisk <= 0 {
+		t.Error("initial risk must be recorded, or profit targets have no unit")
+	}
+	entryShares := pos[0].Shares
+	entryStop := pos[0].StopPrice
 
-	// Runs up well past what the removed profit target would have been, and then
-	// gives back more than the removed trailing stop would have tolerated. Neither
-	// may close it: the only exits left are the stop-loss and the bell.
+	// Runs well past the first target. Half is banked and the stop moves to
+	// breakeven; the rest keeps running, which is the whole point of scaling rather
+	// than taking a fixed profit.
 	h.at(11, 0)
-	h.fake.SetPrice("ABCD", 6.00) // +20%
+	h.fake.SetPrice("ABCD", 6.00) // far beyond 2R
 	h.tick()
 	pos = h.openPositions()
 	if len(pos) != 1 {
-		t.Fatalf("position closed too early: %d open", len(pos))
+		t.Fatalf("scaling out must not close the position: %d open", len(pos))
+	}
+	if pos[0].Shares != entryShares {
+		t.Errorf("original size = %d, want it preserved at %d", pos[0].Shares, entryShares)
+	}
+	if pos[0].SharesOpen != entryShares/2 {
+		t.Errorf("shares open = %d, want half of %d", pos[0].SharesOpen, entryShares)
+	}
+	if !pos[0].TargetHit {
+		t.Error("the target must latch so it cannot be banked twice")
+	}
+	if pos[0].BankedDollars <= 0 {
+		t.Errorf("banked = %v, want the scale-out profit recorded", pos[0].BankedDollars)
+	}
+	if pos[0].StopPrice != pos[0].EntryPrice {
+		t.Errorf("stop = %v, want it moved to the %v entry after the target",
+			pos[0].StopPrice, pos[0].EntryPrice)
+	}
+	if pos[0].StopPrice <= entryStop {
+		t.Error("the stop must have moved up, not down")
 	}
 	if pos[0].PeakPrice != 6.00 {
 		t.Errorf("peak = %v, want 6.00", pos[0].PeakPrice)
 	}
 
+	// A second tick at the same price must not bank the target again.
+	h.at(11, 15)
+	h.tick()
+	if got := h.openPositions()[0].SharesOpen; got != entryShares/2 {
+		t.Errorf("shares open = %d, want the target to pay only once", got)
+	}
+
 	h.at(11, 30)
-	h.fake.SetPrice("ABCD", 5.70) // 5% off the peak, once a trailing-stop exit
+	h.fake.SetPrice("ABCD", 5.70) // well above breakeven: the runner stays
 	h.tick()
 	if got := len(h.openPositions()); got != 1 {
-		t.Fatalf("a 5%% pullback from the peak must no longer close a position: %d open", got)
+		t.Fatalf("the runner must survive a pullback that holds above breakeven: %d open", got)
 	}
 
 	// Letting it run is the point of removing those rules: the rest of the move is
@@ -228,10 +288,16 @@ func TestFullBullishDay(t *testing.T) {
 	if all[0].ExitReason != domain.ExitForcedEOD {
 		t.Errorf("exit reason = %q, want FORCED_EOD", all[0].ExitReason)
 	}
-	// 2000 shares from $5.00 to $7.00 is +$4000 — versus the $1400 the trailing
-	// stop would have booked at $5.70.
-	if got := all[0].RealizedDollars(); got < 3999.9 || got > 4000.1 {
-		t.Errorf("realized = $%.2f, want $4000", got)
+	// Half was banked near 2R and half rode to $7.00, so the realised total is the
+	// sum of two fills rather than one price move.
+	half := float64(entryShares / 2)
+	wantRunner := half * (7.00 - all[0].EntryPrice)
+	if got := all[0].RealizedDollars(); got <= wantRunner {
+		t.Errorf("realized $%.2f, want more than the $%.2f runner alone — the banked half is missing",
+			got, wantRunner)
+	}
+	if all[0].SharesOpen != 0 {
+		t.Errorf("shares open = %d after close, want 0", all[0].SharesOpen)
 	}
 
 	// After the close the agent is idle again.
@@ -330,8 +396,9 @@ func TestExposureCapAndRanking(t *testing.T) {
 	h.tick()
 
 	pos := h.openPositions()
-	if len(pos) != 5 {
-		t.Fatalf("got %d positions, want exactly 5 (the documented cap)", len(pos))
+	if len(pos) != h.cfg.Risk.MaxConcurrentPositions {
+		t.Fatalf("got %d positions, want exactly %d (the documented cap)",
+			len(pos), h.cfg.Risk.MaxConcurrentPositions)
 	}
 	held := map[string]bool{}
 	for _, p := range pos {

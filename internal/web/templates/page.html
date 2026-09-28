@@ -334,18 +334,20 @@ setInterval(refresh, POLL_MS);
     <thead>
       <tr>
         <th>Symbol</th><th class="num">Shares</th><th class="num">Entry</th>
-        <th class="num">Current</th><th class="num">Peak</th>
-        <th class="num">P&amp;L</th><th class="num">P&amp;L %</th>
+        <th class="num">Stop</th><th class="num">Current</th><th class="num">Peak</th>
+        <th class="num">R</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th>
       </tr>
     </thead>
     <tbody>
       {{range .Positions}}
       <tr>
         <td class="sym">{{.Symbol}}</td>
-        <td class="num">{{.Shares}}</td>
+        <td class="num">{{.Shares}}{{if .SharesNote}}<span class="meta"> {{.SharesNote}}</span>{{end}}</td>
         <td class="num muted">{{.Entry}}</td>
+        <td class="num muted">{{.Stop}}</td>
         <td class="num">{{.Current}}</td>
         <td class="num muted">{{.Peak}}</td>
+        <td class="num muted">{{.RMultiple}}</td>
         <td class="num {{.Tone}}">{{.PnLDollars}}</td>
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
       </tr>

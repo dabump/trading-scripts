@@ -486,7 +486,80 @@ them.
 **The PDT blocker is unchanged.** The worst rolling five-session day-trade count is
 **63** against a limit of 3 for a sub-$25k margin account.
 
+## 2026-09-28 — Aligned with the discretionary small-cap momentum approach
+
+The strategy's screen was always modelled on the well-known small-cap momentum
+approach, but its *execution* was not: it bought extension at whatever price the scan
+read, stopped out at a fixed percentage, sized by a fixed fraction of the portfolio
+and sat out the first hour. Those are the parts where the approach's claimed edge would
+live, and a one-year backtest of the screen-only version measured no edge at all.
+Float is excluded throughout — Alpaca has no float data, and it stays an open item.
+
+| Decision | Rationale |
+|---|---|
+| **A setup gate before any entry** (`strategy.FindSetup`): a 1–5 bar pullback whose high the next bar closes above, with price over the 9-EMA and the session VWAP | This is the change everything else hangs off. Screening says a name is interesting; the pattern says whether now is the moment. Its real output is not the entry price but **the stop** — the flag's low — which is what makes risk per share knowable before sizing. |
+| **The stop comes from the chart**, capped at `entry.max_stop_distance_pct` (4%), and a wider setup is **refused** rather than sized around | Refusing is part of the approach, not a safety rail: with risk that wide the size has to shrink until a winner cannot pay for the losers. `risk.stop_loss_pct` (10%) demotes to a gap backstop, and validation requires it to stay the wider of the two or it would fire first and silently restore a fixed-percentage stop. |
+| **Sizing from the stop** (`risk.SizeForRisk`): `shares = (equity × 1%) ÷ (entry − stop)` | Fixed-fraction sizing makes dollar risk swing with volatility, so the account's worst days are decided by which setups happened to be wide. The notional cap had to move to 33% — below `risk_per_trade ÷ max_stop_distance` (25%) it binds on every trade and sizing quietly reverts to a fixed fraction. A test in `internal/config` guards that ratio. |
+| **Concurrency 5 → 3** | The approach runs a few positions at a time, not a basket. Also what makes the 33% notional cap fit under 100% exposure. |
+| **Scale out at 2R, keep the runner**, stop to breakeven | The approach takes partial profits into strength. Stated in multiples of the trade's own risk rather than a fixed percentage, because a trade risking 2% and one risking 4% should not take profit at the same price move. Deliberately *not* the whole-position target that measured t = −9.76: a position too small to split is left to run for the same reason. |
+| **Sentiment window 1h → 5m**, and a new `timing.entry_window` (2h) | An hour of kill switch meant sitting out the single most important hour: these moves begin in the first fifteen minutes. 09:30–09:35 is still not tradeable, which is a real and deliberate cost. The window then *stops buying but not screening*, so the afternoon page still shows what is setting up. |
+| **A price ceiling** (`screening.max_price`, $20) | The band the approach trades. Above it a 10% move on 5× volume is a different event that a pullback entry does not describe. |
+| **`MarketData.IntradayBars` re-added** | Deleted when MACD went; the setup needs a chart, and a chart cannot be batched across symbols. It runs only on candidates that already cleared all three criteria — a handful of names, not the market. |
+| **Not automated, and not automatable here:** the Level 2 and time-and-sales reading this pattern is normally traded with | If a meaningful part of the edge lives in tape reading, this implementation cannot capture it. That is a limitation of automating the approach, not something tuning fixes, and it is the most likely explanation for any gap between published discretionary results and what follows. |
+
+### What it measures
+
+Same method as the run above, but replayed on **1-minute** bars because that is the
+candle the setup is defined on — replaying at any other size measures a different
+strategy, so `cmd/backtest` now defaults its bar size to `entry.pattern_interval`.
+
+**The setup gate is brutally selective, and that is the headline.** Of 4,569
+symbol-days clearing the tradability band, 2,144 passed all three screening criteria
+at some point — and **55** printed a setup inside the entry window. The gate rejects
+97.4% of screen-qualifying candidates, taking the year from 1,591 trades to 55. The
+conjunction is what does it: three criteria true at the same minute, *and* a 1–5 bar
+flag reclaiming the high of day, *and* price over EMA and VWAP, *and* a stop inside
+4%, *and* all of it before 11:30.
+
+| | before (screen-only) | after (aligned) |
+|---|---|---|
+| Trades | 1,591 | **55** |
+| Mean / trade | +0.76% | **−0.28%** |
+| t-statistic | 1.20 | **−0.53** |
+| Median | −3.91% | −1.59% |
+| Win rate | 35.1% | 36.4% |
+| Worst trade | −42.2% | **−4.7%** |
+| Max drawdown | 38.4% | **11.0%** |
+| Equity from $10k | $16,453 | $9,623 |
+| Worst 5-session day-trade count | 63 | **4** (limit 3) |
+
+**Risk control improved enormously; expectancy did not.** Stop-losses now average
+−1.19% instead of −10.65%, the worst trade in the year is −4.7% instead of −42%, and
+drawdown fell by three quarters. The PDT problem went from structurally impossible (63
+day trades per five sessions) to nearly compliant (4 against a limit of 3). But the
+per-trade mean is slightly *negative*, and at 55 trades nothing here is
+distinguishable from zero in either direction.
+
+**The entry window is supported.** Concentrating early is measurably better: 2h ends
+at $8,871 against 4h at $7,162 and all-day at $5,582 (t = −4.24). Trading later in the
+day is the clearly worse choice.
+
+**No configuration tested is profitable.** Stop width 2–8%, risk 0.5–3%, target
+1.5–5R, scale-out fraction 25–90%, five entry windows, five tie-breaks, seven move
+ceilings — the best cell ends at $9,741. Nothing was tuned toward those numbers.
+
+| Decision | Rationale |
+|---|---|
+| Settings left at their stated values despite better-looking cells | A 3% stop ($9,631) and a +35% move ceiling ($9,741) both beat the current configuration, and both are inside noise at n = 55. Tuning to them would repeat exactly the mistake recorded above, where a well-powered finding derived under one rule set reversed when the rules changed. |
+| The scale-out fraction stays at 50% even though selling more measured better | Selling 90% at the target ends at $9,217 against 50% at $8,871 — the *opposite* of the earlier finding that truncating gains is fatal, and for a coherent reason: with a 3–4% chart stop and a breakeven stop behind it, the runner is usually stopped before a tail develops, so there is less tail to protect. Interesting, not significant, and recorded rather than acted on. |
+
 ## Open items (not yet decided)
+
+- **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
+- **Float is still absent and still matters.** Low float is the mechanism that makes these moves extend, and it is the one part of the approach that could not be aligned. It needs a fundamentals provider Alpaca does not offer; no provider has been chosen.
+- **Tape reading is not automated and cannot be.** Any comparison against published discretionary results has to carry that caveat.
+- **Still no demonstrated edge, and still not a candidate for live capital.** t = −0.53. The risk profile is now defensible where it was not; the expectancy is not.
+- **Measure realised slippage in paper trading.** At 55 trades a year the slippage sensitivity is mild in absolute terms, but `execution.order_type` supports limit orders and the entry is now a defined price rather than "whatever the scan read", which makes a limit order far more usable than before.
 
 - **Measure realised slippage in paper trading, then decide on limit orders.** It is now the single largest unknown: the strategy is profitable at 0.10% per side and unprofitable at 0.50%. `execution.order_type` supports `limit` with `limit_slip_pct` already.
 - **Still no demonstrated edge, and still not a candidate for live capital.** t = 1.20 is not significance. The survivorship bias in the universe and the optimistic stop fills both push the true figure down, not up.

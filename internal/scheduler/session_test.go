@@ -106,3 +106,67 @@ func TestSessionDateUsesExchangeTimezone(t *testing.T) {
 		t.Errorf("SessionDate = %s, want 2026-09-28", got)
 	}
 }
+
+// The entry window closes early enough to leave quiet time before the forced exit,
+// and it is the *earlier* of the two limits that wins. Getting this wrong on a short
+// session means buying something the agent is about to be required to sell.
+func TestEntryWindowLeavesQuietTimeBeforeTheForcedExit(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Timing.SentimentWindow = 5 * time.Minute
+	cfg.Timing.EntryWindow = 5*time.Hour + 30*time.Minute
+	cfg.Timing.EntryCutoffBuffer = 30 * time.Minute
+	cfg.Exit.EODExitOffsetMins = 30
+
+	at := func(h, m int) time.Time { return time.Date(2026, 9, 28, h, m, 0, 0, ET) }
+
+	t.Run("a regular session: the window from the open is the binding limit", func(t *testing.T) {
+		b := Bounds(Session{Date: "2026-09-28", Open: at(9, 30), Close: at(16, 0)}, cfg)
+		if !b.EODExit.Equal(at(15, 30)) {
+			t.Fatalf("forced exit = %s, want 15:30", b.EODExit.Format("15:04"))
+		}
+		// 09:30 + 5h30m = 15:00, which already clears the 30-minute buffer.
+		if !b.EntryWindowEnd.Equal(at(15, 0)) {
+			t.Errorf("entry window ends %s, want 15:00", b.EntryWindowEnd.Format("15:04"))
+		}
+		if gap := b.EODExit.Sub(b.EntryWindowEnd); gap != 30*time.Minute {
+			t.Errorf("gap before the forced exit = %s, want 30m", gap)
+		}
+	})
+
+	t.Run("a half day: the buffer is the binding limit", func(t *testing.T) {
+		// Close at 13:00, so the forced exit is 12:30. Measured from the open the
+		// window would run to 15:00 — two and a half hours after the position had to
+		// be flat.
+		b := Bounds(Session{Date: "2026-11-27", Open: at(9, 30), Close: at(13, 0)}, cfg)
+		if !b.EODExit.Equal(at(12, 30)) {
+			t.Fatalf("forced exit = %s, want 12:30", b.EODExit.Format("15:04"))
+		}
+		if !b.EntryWindowEnd.Equal(at(12, 0)) {
+			t.Errorf("entry window ends %s, want 12:00 — the buffer must still hold",
+				b.EntryWindowEnd.Format("15:04"))
+		}
+		if gap := b.EODExit.Sub(b.EntryWindowEnd); gap != 30*time.Minute {
+			t.Errorf("gap on a half day = %s, want the same 30m", gap)
+		}
+	})
+
+	t.Run("a session shorter than the buffer yields no entry window, not a negative one", func(t *testing.T) {
+		// Contrived, but a calendar oddity must not produce a window running backwards.
+		b := Bounds(Session{Date: "2026-12-24", Open: at(9, 30), Close: at(10, 0)}, cfg)
+		if b.EntryWindowEnd.Before(b.Open) {
+			t.Errorf("entry window ends %s, before the %s open",
+				b.EntryWindowEnd.Format("15:04"), b.Open.Format("15:04"))
+		}
+	})
+
+	t.Run("a zero buffer puts the last entry on the forced exit", func(t *testing.T) {
+		noBuf := *cfg
+		noBuf.Timing.EntryCutoffBuffer = 0
+		noBuf.Timing.EntryWindow = 12 * time.Hour // deliberately past the close
+		b := Bounds(Session{Date: "2026-09-28", Open: at(9, 30), Close: at(16, 0)}, &noBuf)
+		if !b.EntryWindowEnd.Equal(b.EODExit) {
+			t.Errorf("entry window ends %s, want it clamped to the %s forced exit",
+				b.EntryWindowEnd.Format("15:04"), b.EODExit.Format("15:04"))
+		}
+	})
+}

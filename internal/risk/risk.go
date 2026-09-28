@@ -3,10 +3,8 @@ package risk
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
-	"github.com/martincoetzee/trading-agent/internal/domain"
 )
 
 // Sizing is the outcome of sizing one prospective position.
@@ -14,38 +12,13 @@ type Sizing struct {
 	OK      bool
 	Shares  int
 	Dollars float64
+	// RiskDollar is what the position loses if the stop fills at its price. It is
+	// recorded so the audit trail can show that risk really was held constant across
+	// trades of very different sizes.
+	RiskDollar float64
 	// Reason explains a refusal, so the log says why a qualifying candidate was
 	// skipped rather than silently dropping it.
 	Reason string
-}
-
-// Size allocates the configured share of the portfolio to one position.
-//
-// The allocation is clamped to available cash: the target is a percentage of
-// total portfolio value, but portfolio value includes the market value of
-// positions already held, so on a fully-deployed account the untouched
-// percentage could still exceed the cash left to spend. Submitting an order the
-// account cannot fund just earns a broker rejection mid-session.
-func Size(acct domain.Account, price float64, cfg *config.Config) Sizing {
-	if price <= 0 {
-		return Sizing{Reason: "no valid price"}
-	}
-	if acct.PortfolioValue <= 0 {
-		return Sizing{Reason: "portfolio value is zero"}
-	}
-
-	target := acct.PortfolioValue * cfg.Risk.PositionSizePct / 100
-	spend := math.Min(target, acct.Cash)
-	if spend <= 0 {
-		return Sizing{Reason: "no cash available"}
-	}
-
-	shares := int(math.Floor(spend / price))
-	if shares < 1 {
-		return Sizing{Reason: fmt.Sprintf(
-			"allocation $%.2f is below one share at $%.2f", spend, price)}
-	}
-	return Sizing{OK: true, Shares: shares, Dollars: float64(shares) * price}
 }
 
 // CanOpen reports whether another position fits under the concurrency cap.

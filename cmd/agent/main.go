@@ -98,12 +98,15 @@ func run() error {
 		cfg.Timing.SentimentPollInterval = 10 * time.Second
 		cfg.Timing.ScreenerScanInterval = 5 * time.Second
 		cfg.Timing.PositionPollInterval = 2 * time.Second
+		// The entry window has to stay open for most of the compressed session, or
+		// the demo would screen and never buy.
+		cfg.Timing.EntryWindow = 10 * time.Minute
 		cfg.Exit.EODExitOffsetMins = 15
 		logger.Warn("offline mode: session timings compressed",
 			"sentiment_window", cfg.Timing.SentimentWindow,
 			"scan_interval", cfg.Timing.ScreenerScanInterval)
 
-		fake := seedFake(time.Now())
+		fake := seedFake(time.Now(), cfg)
 		data, trading = fake, fake
 	} else {
 		secrets, err := config.LoadSecrets()
@@ -153,7 +156,15 @@ func run() error {
 			"avg_volume_lookback_days": cfg.Screening.AvgVolumeLookbackDays,
 			"news_lookback":            cfg.Screening.NewsLookback.String(),
 			"max_enriched":             cfg.Screening.MaxEnriched,
-			"position_size_pct":        cfg.Risk.PositionSizePct,
+			"max_price":                cfg.Screening.MaxPrice,
+			"risk_per_trade_pct":       cfg.Risk.RiskPerTradePct,
+			"max_position_pct":         cfg.Risk.MaxPositionPct,
+			"entry_pattern_interval":   cfg.Entry.PatternInterval.String(),
+			"entry_ema_period":         cfg.Entry.EMAPeriod,
+			"entry_max_stop_pct":       cfg.Entry.MaxStopDistancePct,
+			"first_target_r":           cfg.Exit.FirstTargetR,
+			"first_target_fraction":    cfg.Exit.FirstTargetFraction,
+			"entry_window":             cfg.Timing.EntryWindow.String(),
 			"max_concurrent_positions": cfg.Risk.MaxConcurrentPositions,
 			"stop_loss_pct":            cfg.Risk.StopLossPct,
 			"min_price":                cfg.Screening.MinPrice,
@@ -297,7 +308,7 @@ func isCleanShutdown(err error) bool {
 // seedFake builds an offline broker with a plausible session and one candidate
 // that clears every screening criterion, so the daemon and its page can be
 // exercised end to end without credentials.
-func seedFake(now time.Time) *broker.Fake {
+func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	// Anchored to now rather than 09:30-16:00 so offline mode is demonstrable
 	// whatever the wall clock says. With the compressed timings set by the caller
 	// this yields a ~30s sentiment window, ~4.5 minutes of trading, then the EOD
@@ -334,6 +345,15 @@ func seedFake(now time.Time) *broker.Fake {
 	fake.SetSnapshot("DEMO", 4.56, 4.00, 6_100_000)
 	fake.SetAverageVolume("DEMO", 1_000_000)
 	fake.SetNews("DEMO", 2)
+	// Clearing the screen is no longer enough to be bought: the chart has to print a
+	// pullback and resumption. DEMO gets one, so the demo reaches an actual entry.
+	fake.SetSetupBars("DEMO", 4.56, open, cfg.Entry.PatternInterval)
+
+	// SETUPLESS clears every screening criterion but never sets up, which is the
+	// common real-world case and the one the page's Action column exists to explain.
+	fake.SetSnapshot("SETUPLESS", 3.40, 3.00, 7_000_000)
+	fake.SetAverageVolume("SETUPLESS", 1_100_000)
+	fake.SetNews("SETUPLESS", 1)
 
 	fake.SetSnapshot("NONEWS", 2.30, 2.06, 5_400_000)
 	fake.SetAverageVolume("NONEWS", 1_000_000)

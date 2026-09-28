@@ -36,9 +36,11 @@ func main() {
 		fromFlag  = flag.String("from", "", "first session (YYYY-MM-DD); defaults to one year before -to")
 		toFlag    = flag.String("to", "", "last session (YYYY-MM-DD); defaults to today")
 		cacheDir  = flag.String("cache", "/tmp/backtest-cache", "directory for cached market data")
-		timeframe = flag.String("timeframe", "5Min", "intraday bar size used to replay each session")
-		limit     = flag.Int("symbols", 0, "cap the universe (0 = every tradable US equity)")
-		grid      = flag.Bool("grid", true, "sweep exit parameters and report the surface")
+		timeframe = flag.String("timeframe", "",
+			"intraday bar size used to replay each session; defaults to entry.pattern_interval, "+
+				"which is the only size the setup detector's answers are valid at")
+		limit = flag.Int("symbols", 0, "cap the universe (0 = every tradable US equity)")
+		grid  = flag.Bool("grid", true, "sweep exit parameters and report the surface")
 	)
 	flag.Parse()
 
@@ -69,6 +71,17 @@ func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid 
 		if from, err = time.ParseInLocation("2006-01-02", fromFlag, scheduler.ET); err != nil {
 			return err
 		}
+	}
+
+	// The setup is defined on a particular candle size, so replaying at any other
+	// size measures a different strategy. Defaulting to the configured interval
+	// removes the chance of quietly doing that.
+	if timeframe == "" {
+		tf, err := barTimeframeOf(cfg.Entry.PatternInterval)
+		if err != nil {
+			return err
+		}
+		timeframe = tf
 	}
 
 	c := &client{
@@ -152,6 +165,8 @@ func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid 
 	if grid {
 		reportSweep(cfg, prepared)
 		reportRankings(cfg, prepared)
+		reportStopWidth(cfg, days, benchPrev)
+		reportEntryWindow(cfg, days, benchPrev)
 		reportMoveCaps(cfg, prepared)
 	}
 	return nil
@@ -196,13 +211,14 @@ func reportFunnel(s Stats, sessions int) {
 	fmt.Printf("  intraday move                                     %d\n", f.EverPassedMove)
 	fmt.Printf("  relative volume                                   %d\n", f.EverPassedVol)
 	fmt.Printf("  all three at once (qualified)                     %d\n", f.EverQualified)
+	fmt.Printf("  and then printed a setup                          %d\n", f.EverSetUp)
 	fmt.Printf("Entries taken                                       %d\n", len(s.Trades))
 	fmt.Printf("Qualified but never bought, by first gate hit:\n")
 	fmt.Printf("  concurrency cap                                   %d\n", s.BlockedByCap)
 	fmt.Printf("  already holding it                                %d\n", s.BlockedHeld)
 	fmt.Printf("  same-day re-entry                                 %d\n", s.BlockedSameDay)
-	fmt.Printf("  unaffordable at %-4s of equity                     %d\n",
-		trimPct(s.PositionSizePct), s.BlockedByCash)
+	fmt.Printf("  unsizable at %-4s risk per trade                    %d\n",
+		trimPct(s.RiskPerTradePct), s.BlockedByCash)
 	fmt.Printf("Worst rolling 5-session day-trade count             %d (PDT limit is 3)\n", s.MaxDayTrades5Bd)
 }
 
@@ -377,33 +393,115 @@ func reportExitQuality(s Stats) {
 	}
 }
 
-// reportSweep sweeps what is still tunable now that the profit target and trailing
-// stop are gone: the stop distance and the position size.
+// reportSweep sweeps what is tunable now that the stop comes from the chart and the
+// size comes from the stop.
 //
-// It cannot sweep cfg.Screening, because screening results are precomputed once per
-// session; a screening change needs reportMoveCaps, which re-prepares.
+// It cannot sweep cfg.Entry or cfg.Screening: both are baked into the prepared
+// sessions, because changing either changes which candidates set up at all. Those are
+// what reportStopWidth and reportMoveCaps re-prepare for.
 func reportSweep(base *config.Config, days []*preparedDay) {
-	fmt.Printf("\n## Stop distance x position size (0.25%% slippage per side)\n\n")
-	fmt.Printf("%-8s", "stop")
-	sizes := []float64{2, 5, 10, 20}
-	for _, sz := range sizes {
-		fmt.Printf(" %13s", fmt.Sprintf("%.0f%% size", sz))
+	fmt.Printf("\n## Risk per trade x first target (0.25%% slippage per side)\n\n")
+	targets := []float64{1.5, 2, 3, 5}
+	fmt.Printf("%-10s", "risk")
+	for _, r := range targets {
+		fmt.Printf(" %15s", fmt.Sprintf("%.1fR target", r))
 	}
 	fmt.Println()
 
-	for _, stop := range []float64{5, 8, 10, 15, 20, 30} {
-		fmt.Printf("%-8s", fmt.Sprintf("%.0f%%", stop))
-		for _, sz := range sizes {
+	for _, rp := range []float64{0.5, 1, 2, 3} {
+		fmt.Printf("%-10s", fmt.Sprintf("%.1f%%", rp))
+		for _, r := range targets {
 			cfg := *base
-			cfg.Risk.StopLossPct = stop
-			cfg.Risk.PositionSizePct = sz
+			cfg.Risk.RiskPerTradePct = rp
+			cfg.Exit.FirstTargetR = r
 			s := simulate(&cfg, days, 0.25)
-			fmt.Printf(" %13s", fmt.Sprintf("$%.0f/%.0f%%dd", s.EndEquity, s.MaxDrawdownPc))
+			fmt.Printf(" %15s", fmt.Sprintf("$%.0f/%.0f%%dd", s.EndEquity, s.MaxDrawdownPc))
 		}
 		fmt.Println()
 	}
-	fmt.Println("\nCell is end equity from $10,000 and max drawdown. Per-trade mean barely")
-	fmt.Println("moves with size; the account does, because a fixed fraction compounds.")
+	fmt.Println("\nCell is end equity from $10,000 and max drawdown. Risk per trade moves the")
+	fmt.Println("account without moving per-trade expectancy; the target moves both.")
+
+	// Whether to keep a runner at all is the question the removed profit target got
+	// wrong, so it is worth re-testing directly rather than assuming.
+	fmt.Printf("\n%-38s %7s %9s %7s %9s\n", "scale-out fraction", "trades", "mean", "t", "equity")
+	for _, f := range []float64{0.25, 0.5, 0.75, 0.9} {
+		cfg := *base
+		cfg.Exit.FirstTargetFraction = f
+		s := simulate(&cfg, days, 0.25)
+		r := returns(s.Trades)
+		if len(r) == 0 {
+			continue
+		}
+		fmt.Printf("sell %-33s %7d %8.2f%% %7.2f %9.0f\n",
+			fmt.Sprintf("%.0f%% at the target", f*100), len(r), mean(r), tStat(r), s.EndEquity)
+	}
+	// And the no-target baseline: hold everything to the stop or the bell.
+	cfg := *base
+	cfg.Exit.FirstTargetR = 1e6
+	s := simulate(&cfg, days, 0.25)
+	if r := returns(s.Trades); len(r) > 0 {
+		fmt.Printf("%-38s %7d %8.2f%% %7.2f %9.0f\n",
+			"no target at all (runner only)", len(r), mean(r), tStat(r), s.EndEquity)
+	}
+}
+
+// reportStopWidth re-prepares at several stop-distance limits. Widening the limit
+// admits setups whose risk is further away, so it changes the candidate set and not
+// just the sizing — which is why it cannot live in the sweep above.
+func reportStopWidth(base *config.Config, raw []*DayData, benchPrev map[string]map[string]float64) {
+	fmt.Printf("\n## Maximum stop distance (0.25%% slippage per side)\n\n")
+	fmt.Printf("%-12s %7s %9s %7s %9s %9s %7s\n",
+		"max stop", "trades", "mean", "t", "median", "equity", "maxDD")
+	for _, d := range []float64{2, 3, 4, 6, 8} {
+		cfg := *base
+		cfg.Entry.MaxStopDistancePct = d
+		// The percentage backstop has to stay behind the chart stop, or it would fire
+		// first and silently turn this back into a fixed-percentage stop.
+		if cfg.Risk.StopLossPct <= d {
+			cfg.Risk.StopLossPct = d * 2.5
+		}
+		s := simulate(&cfg, prepare(&cfg, raw, benchPrev), 0.25)
+		r := returns(s.Trades)
+		if len(r) == 0 {
+			fmt.Printf("%-12s %7d\n", fmt.Sprintf("%.0f%%", d), 0)
+			continue
+		}
+		fmt.Printf("%-12s %7d %8.2f%% %7.2f %8.2f%% %9.0f %6.1f%%\n",
+			fmt.Sprintf("%.0f%%", d), len(r), mean(r), tStat(r), median(r),
+			s.EndEquity, s.MaxDrawdownPc)
+	}
+}
+
+// reportEntryWindow re-prepares at several entry-window lengths. The strategy being
+// followed concentrates on the first couple of hours; this is the direct test of that
+// claim on this data.
+func reportEntryWindow(base *config.Config, raw []*DayData, benchPrev map[string]map[string]float64) {
+	fmt.Printf("\n## Entry window after the open (0.25%% slippage per side)\n\n")
+	fmt.Printf("%-12s %7s %9s %7s %9s %9s %7s\n",
+		"window", "trades", "mean", "t", "median", "equity", "maxDD")
+	for _, w := range []time.Duration{30 * time.Minute, time.Hour, 2 * time.Hour,
+		4 * time.Hour, 7 * time.Hour} {
+		cfg := *base
+		cfg.Timing.EntryWindow = w
+		s := simulate(&cfg, prepare(&cfg, raw, benchPrev), 0.25)
+		r := returns(s.Trades)
+		if len(r) == 0 {
+			continue
+		}
+		fmt.Printf("%-12s %7d %8.2f%% %7.2f %8.2f%% %9.0f %6.1f%%\n",
+			durationLabel(w), len(r), mean(r), tStat(r), median(r), s.EndEquity, s.MaxDrawdownPc)
+	}
+}
+
+func durationLabel(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	}
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	return d.String()
 }
 
 // reportMoveCaps measures what a ceiling on the entry move would do. There is no
@@ -450,7 +548,7 @@ func reportRankings(base *config.Config, days []*preparedDay) {
 		{"lowest relative volume", func(a, b qualifier) bool { return a.VolMult < b.VolMult }},
 		{"smallest move so far", func(a, b qualifier) bool { return a.MovePct < b.MovePct }},
 		{"largest move so far", func(a, b qualifier) bool { return a.MovePct > b.MovePct }},
-		{"highest price", func(a, b qualifier) bool { return a.Price > b.Price }},
+		{"tightest stop", func(a, b qualifier) bool { return a.StopPct < b.StopPct }},
 	}
 	for _, o := range orders {
 		s := simulate(base, reranked(days, o.less), 0.25)
@@ -476,6 +574,21 @@ func tStat(v []float64) float64 {
 		return 0
 	}
 	return mean(v) / (sd / math.Sqrt(float64(len(v))))
+}
+
+// barTimeframeOf renders a duration in Alpaca's timeframe notation, mirroring
+// broker.barTimeframe (which is unexported).
+func barTimeframeOf(d time.Duration) (string, error) {
+	switch {
+	case d <= 0:
+		return "", fmt.Errorf("entry.pattern_interval must be positive, got %s", d)
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dHour", int(d/time.Hour)), nil
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dMin", int(d/time.Minute)), nil
+	default:
+		return "", fmt.Errorf("entry.pattern_interval %s is not a whole number of minutes", d)
+	}
 }
 
 func returns(ts []Trade) []float64 {

@@ -51,18 +51,38 @@ func (s Session) IsEarlyClose() bool {
 type Boundaries struct {
 	Open         time.Time
 	FirstHourEnd time.Time
-	EODExit      time.Time
-	Close        time.Time
+	// EntryWindowEnd is the last moment a new position may be opened. Screening
+	// continues after it — the page still shows what is setting up — but nothing is
+	// bought. It is the earlier of `open + entry_window` and
+	// `EODExit − entry_cutoff_buffer`, so a short session tightens it rather than
+	// letting an entry land on top of the forced exit.
+	EntryWindowEnd time.Time
+	EODExit        time.Time
+	Close          time.Time
 }
 
 // Bounds derives the session's decision points from config.
 func Bounds(s Session, cfg *config.Config) Boundaries {
-	return Boundaries{
-		Open:         s.Open,
-		FirstHourEnd: s.Open.Add(cfg.Timing.SentimentWindow),
-		EODExit:      s.Close.Add(-time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute),
-		Close:        s.Close,
+	b := Boundaries{
+		Open:           s.Open,
+		FirstHourEnd:   s.Open.Add(cfg.Timing.SentimentWindow),
+		EntryWindowEnd: s.Open.Add(cfg.Timing.EntryWindow),
+		EODExit:        s.Close.Add(-time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute),
+		Close:          s.Close,
 	}
+	// Keep quiet time before the forced exit. Without this a half day — where the
+	// close, and therefore the forced exit, arrives hours earlier than the entry
+	// window measured from the open — would let the agent buy something it was about
+	// to be required to sell.
+	if cutoff := b.EODExit.Add(-cfg.Timing.EntryCutoffBuffer); b.EntryWindowEnd.After(cutoff) {
+		b.EntryWindowEnd = cutoff
+	}
+	// A session so short that the cutoff precedes the open leaves no entry window at
+	// all rather than a window running backwards.
+	if b.EntryWindowEnd.Before(b.Open) {
+		b.EntryWindowEnd = b.Open
+	}
+	return b
 }
 
 // PhaseAt reports where the given instant sits within the session.

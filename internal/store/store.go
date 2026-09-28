@@ -26,6 +26,11 @@ var migrationsFS embed.FS
 // symbol is attempted.
 var ErrDuplicateOpenPosition = errors.New("a position in this symbol is already open")
 
+// ErrScaleOutNotApplicable means the partial sale changed nothing: the position was
+// already closed, had already banked its target, or has too few shares left to split.
+// Treated as benign by callers — it is what a duplicate attempt looks like.
+var ErrScaleOutNotApplicable = errors.New("position cannot be scaled out of")
+
 type Store struct {
 	db *sql.DB
 }
@@ -224,10 +229,11 @@ func (s *Store) InsertPosition(p domain.Position) (int64, error) {
 	// mark for a position opened between two trading-loop ticks.
 	res, err := s.db.Exec(
 		`INSERT INTO positions
-		 (session_date, symbol, shares, entry_price, entry_time, peak_price, last_price, is_open)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
-		p.SessionDate, p.Symbol, p.Shares, p.EntryPrice, formatTime(p.EntryTime),
-		peak, p.EntryPrice)
+		 (session_date, symbol, shares, shares_open, entry_price, entry_time, peak_price,
+		  last_price, stop_price, initial_risk, is_open)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+		p.SessionDate, p.Symbol, p.Shares, p.Shares, p.EntryPrice, formatTime(p.EntryTime),
+		peak, p.EntryPrice, p.StopPrice, p.InitialRisk)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, fmt.Errorf("%w: %s", ErrDuplicateOpenPosition, p.Symbol)
@@ -250,14 +256,62 @@ func (s *Store) UpdateMark(id int64, lastPrice, peak float64) error {
 	return nil
 }
 
-// ClosePosition marks a position closed with its realized outcome.
+// ScaleOut records a partial sale: shares leave the position, their profit or loss
+// is banked, and the position stays open.
+//
+// The share count is decremented rather than set, and `target_hit` is latched here
+// rather than by the caller, so two ticks racing on the same target cannot bank the
+// same shares twice. The WHERE clause is what enforces it: the second update matches
+// nothing once the first has latched the flag.
+func (s *Store) ScaleOut(id int64, shares int, price float64, newStop float64) error {
+	if shares < 1 {
+		return fmt.Errorf("scale out: %d shares is not a partial sale", shares)
+	}
+	res, err := s.db.Exec(
+		`UPDATE positions
+		 SET shares_open    = shares_open - ?,
+		     banked_dollars = banked_dollars + (? - entry_price) * ?,
+		     stop_price     = MAX(stop_price, ?),
+		     target_hit     = 1,
+		     last_price     = ?
+		 WHERE id = ? AND is_open = 1 AND target_hit = 0 AND shares_open > ?`,
+		shares, price, shares, newStop, price, id, shares)
+	if err != nil {
+		return fmt.Errorf("scale out: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("%w: position %d", ErrScaleOutNotApplicable, id)
+	}
+	return nil
+}
+
+// ClosePosition marks a position closed with its realized outcome, folding the final
+// leg into whatever earlier partial sales already banked.
 func (s *Store) ClosePosition(id int64, exitPrice float64, exitTime time.Time, reason domain.ExitReason) error {
 	_, err := s.db.Exec(
-		`UPDATE positions SET is_open = 0, exit_price = ?, exit_time = ?, exit_reason = ?
+		`UPDATE positions
+		 SET is_open        = 0,
+		     banked_dollars = banked_dollars + (? - entry_price) * shares_open,
+		     shares_open    = 0,
+		     exit_price     = ?,
+		     exit_time      = ?,
+		     exit_reason    = ?
 		 WHERE id = ? AND is_open = 1`,
-		exitPrice, formatTime(exitTime), string(reason), id)
+		exitPrice, exitPrice, formatTime(exitTime), string(reason), id)
 	if err != nil {
 		return fmt.Errorf("close position: %w", err)
+	}
+	return nil
+}
+
+// MoveStop raises a position's working stop. It never lowers one: a stop that could
+// move down would let a losing position keep giving ground.
+func (s *Store) MoveStop(id int64, stop float64) error {
+	_, err := s.db.Exec(
+		`UPDATE positions SET stop_price = MAX(stop_price, ?) WHERE id = ? AND is_open = 1`,
+		stop, id)
+	if err != nil {
+		return fmt.Errorf("move stop: %w", err)
 	}
 	return nil
 }
@@ -268,22 +322,25 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 	for rows.Next() {
 		var p domain.Position
 		var entryTime, exitTime string
-		var isOpen int
-		if err := rows.Scan(&p.ID, &p.SessionDate, &p.Symbol, &p.Shares, &p.EntryPrice,
-			&entryTime, &p.PeakPrice, &p.LastPrice, &isOpen, &p.ExitPrice,
+		var isOpen, targetHit int
+		if err := rows.Scan(&p.ID, &p.SessionDate, &p.Symbol, &p.Shares, &p.SharesOpen,
+			&p.EntryPrice, &entryTime, &p.PeakPrice, &p.LastPrice, &p.StopPrice,
+			&p.InitialRisk, &targetHit, &p.BankedDollars, &isOpen, &p.ExitPrice,
 			&exitTime, &p.ExitReason); err != nil {
 			return nil, err
 		}
 		p.EntryTime = parseTime(entryTime)
 		p.ExitTime = parseTime(exitTime)
+		p.TargetHit = targetHit == 1
 		p.Open = isOpen == 1
 		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
-const positionColumns = `id, session_date, symbol, shares, entry_price, entry_time,
-	peak_price, last_price, is_open, exit_price, exit_time, exit_reason`
+const positionColumns = `id, session_date, symbol, shares, shares_open, entry_price,
+	entry_time, peak_price, last_price, stop_price, initial_risk, target_hit,
+	banked_dollars, is_open, exit_price, exit_time, exit_reason`
 
 // OpenPositions returns every currently-held position, regardless of session.
 func (s *Store) OpenPositions() ([]domain.Position, error) {

@@ -12,6 +12,7 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
 	"github.com/martincoetzee/trading-agent/internal/store"
+	"github.com/martincoetzee/trading-agent/internal/strategy"
 )
 
 // LegendEntry describes one agent state for the page's legend.
@@ -67,11 +68,17 @@ type ScreenRow struct {
 }
 
 type PositionRow struct {
-	Symbol     string
+	Symbol string
+	// Shares is what is still held. SharesNote says so when the position has been
+	// partly sold, because "200" against an entry of 400 would otherwise misreport
+	// both the exposure and the P&L a reader computes in their head.
 	Shares     int
+	SharesNote string
 	Entry      string
+	Stop       string
 	Current    string
 	Peak       string
+	RMultiple  string
 	PnLDollars string
 	PnLPct     string
 	Tone       string
@@ -349,15 +356,25 @@ func BuildView(
 			current = p.EntryPrice
 		}
 		pnl := p.UnrealizedDollars(current)
-		exposure += current * float64(p.Shares)
-		v.Positions = append(v.Positions, PositionRow{
-			Symbol: p.Symbol, Shares: p.Shares,
-			Entry: money(p.EntryPrice), Current: money(current), Peak: money(p.PeakPrice),
+		exposure += current * float64(p.SharesOpen)
+
+		row := PositionRow{
+			Symbol: p.Symbol, Shares: p.SharesOpen,
+			Entry: money(p.EntryPrice), Stop: money(p.StopPrice),
+			Current: money(current), Peak: money(p.PeakPrice),
 			PnLDollars: signedMoney(pnl), PnLPct: pct(p.UnrealizedPct(current)),
 			Tone: toneForPnL(pnl),
-		})
+		}
+		if p.SharesOpen != p.Shares {
+			row.SharesNote = fmt.Sprintf("of %d, %s banked",
+				p.Shares, signedMoney(p.BankedDollars))
+		}
+		if p.InitialRisk > 0 {
+			row.RMultiple = fmt.Sprintf("%.1fR", p.RMultiple(current))
+		}
+		v.Positions = append(v.Positions, row)
 	}
-	v.ExposureText = fmt.Sprintf("%d of %d slots · %s at risk",
+	v.ExposureText = fmt.Sprintf("%d of %d slots · %s deployed",
 		len(open), cfg.Risk.MaxConcurrentPositions, money(exposure))
 	if len(open) == 0 {
 		v.PositionsNote = "No open positions."
@@ -436,9 +453,9 @@ func strategySections(cfg *config.Config) []StrategySection {
 			"filters on company size.",
 		Rows: []StrategyRow{
 			{
-				Label: "Minimum price",
-				Value: "$" + trimNumber(cfg.Screening.MinPrice),
-				Note:  "a tradability floor, not a momentum criterion",
+				Label: "Price band",
+				Value: "$" + trimNumber(cfg.Screening.MinPrice) + " – $" + trimNumber(cfg.Screening.MaxPrice),
+				Note:  "a tradability floor and the band the strategy trades, not momentum criteria",
 			},
 			{
 				Label: "Minimum traded today",
@@ -478,23 +495,61 @@ func strategySections(cfg *config.Config) []StrategySection {
 		},
 	}
 
-	// Derived the same way risk.Size and config validation do, so the figure shown is
-	// the figure enforced.
-	maxExposure := cfg.Risk.PositionSizePct * float64(cfg.Risk.MaxConcurrentPositions)
+	// Derived the same way risk.SizeForRisk and config validation do, so the figures
+	// shown are the figures enforced.
+	maxExposure := cfg.Risk.MaxPositionPct * float64(cfg.Risk.MaxConcurrentPositions)
+	maxAtRisk := cfg.Risk.RiskPerTradePct * float64(cfg.Risk.MaxConcurrentPositions)
 	entry := StrategySection{
-		Title: "3 · Entry",
-		Note:  "Day-trade only; nothing is held overnight.",
+		Title: "3 · Entry — setup, then size",
+		Note: "Screening says a name is interesting; the setup says whether now is the " +
+			"moment and where the risk sits. Day-trade only; nothing is held overnight.",
 		Rows: []StrategyRow{
 			{
-				Label: "Position size",
-				Value: pctOf(cfg.Risk.PositionSizePct) + " of portfolio",
-				Note:  "clamped to available cash, rounded down to whole shares",
+				Label: "Setup",
+				Value: "pullback, then a close back above its high",
+				Note: fmt.Sprintf("%d–%d %s pullback bars, on %s candles",
+					cfg.Entry.MinPullbackBars, cfg.Entry.MaxPullbackBars,
+					"consecutive", durationText(cfg.Entry.PatternInterval)),
+			},
+			{
+				Label: "Trend filter",
+				Value: fmt.Sprintf("above the %d-period EMA", cfg.Entry.EMAPeriod) +
+					map[bool]string{true: " and VWAP", false: ""}[cfg.Entry.RequireAboveVWAP],
+				Note: "the strategy only buys strength",
+			},
+			{
+				Label: "Stop",
+				Value: "just below the pullback low",
+				Note: fmt.Sprintf("placed %s under it, and refused beyond %s away",
+					pctOf(cfg.Entry.StopBufferPct), pctOf(cfg.Entry.MaxStopDistancePct)),
+			},
+			{
+				Label: "Setup warm-up",
+				Value: durationText(strategy.WarmupDuration(cfg)),
+				Note:  "after the open, before enough candles exist to read a setup",
+			},
+			{
+				Label: "Risk per trade",
+				Value: pctOf(cfg.Risk.RiskPerTradePct) + " of the account",
+				Note:  "shares = risk budget ÷ distance to the stop, so every trade risks the same",
 			},
 			{Label: "Concurrent positions", Value: fmt.Sprintf("up to %d", cfg.Risk.MaxConcurrentPositions)},
 			{
+				Label: "Most at risk at once",
+				Value: pctOf(maxAtRisk),
+				Note:  "risk per trade × concurrency, if every stop filled",
+			},
+			{
 				Label: "Maximum exposure",
 				Value: pctOf(maxExposure),
-				Note:  "size × concurrency",
+				Note:  "position cap × concurrency",
+			},
+			{
+				Label: "Entry window",
+				Value: "first " + durationText(cfg.Timing.EntryWindow) + " after the open",
+				Note: "screening continues afterwards, buying does not; it also closes " +
+					durationText(cfg.Timing.EntryCutoffBuffer) + " before the forced exit, " +
+					"whichever comes first",
 			},
 			{Label: "Ranking", Value: "highest relative volume first"},
 			{
@@ -528,16 +583,29 @@ func strategySections(cfg *config.Config) []StrategySection {
 				Note:  "unconditional, regardless of P&L",
 			},
 			{
-				Label: "Stop-loss",
-				Value: "−" + pctOf(cfg.Risk.StopLossPct) + " from entry",
-				Note:  "a hard floor, checked ahead of the momentum signals",
+				Label: "Chart stop",
+				Value: "the setup's stop",
+				Note:  "from the pullback low, and moved to entry once the first target is banked",
 			},
 			{
-				Label: "Take profit",
-				Value: "none",
-				Note: "removed on measurement: a profit target with a trailing stop " +
-					"capped gains at +9% while losses ran to −10%, and the return lives " +
-					"in the tail it was cutting",
+				Label: "Gap backstop",
+				Value: "−" + pctOf(cfg.Risk.StopLossPct) + " from entry",
+				Note:  "only reachable if price gaps straight through the chart stop",
+			},
+			{
+				Label: "First target",
+				Value: fmt.Sprintf("%sR — sell %s", trimNumber(cfg.Exit.FirstTargetR),
+					pctOf(cfg.Exit.FirstTargetFraction*100)),
+				Note: map[bool]string{
+					true:  "the rest runs to the close with its stop at breakeven",
+					false: "the rest runs to the close",
+				}[cfg.Exit.BreakevenAfterTarget],
+			},
+			{
+				Label: "Runner",
+				Value: "held to the forced exit",
+				Note: "no fixed profit target on it: a +15% target with a 5% trailing stop " +
+					"was measured capping gains at +9% while losses ran to −10%",
 			},
 		},
 	}

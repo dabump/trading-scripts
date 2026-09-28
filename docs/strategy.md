@@ -40,46 +40,147 @@ News headlines come from Alpaca's news endpoint and are counted per symbol for t
 
 **Tie-break (PROPOSED):** when more candidates qualify than there are free position slots, they are ranked by relative volume, highest first. It is the criterion that best separates a genuine, liquid move from a thin drift.
 
-## 3. Entry
+## 3. Entry — the setup gate
+
+Screening says a name is *interesting*. It says nothing about whether this instant is
+a sensible moment to buy it, or where the risk sits. Those are the entry's job, and
+they are what changed when the strategy was aligned with the discretionary small-cap
+momentum approach it was always modelled on.
 
 Entry uses **the same evaluation** the status page displays — one `screener.Evaluate`
 pass per scan feeds both, so the two can never disagree about what qualifies.
 
-- Day-trade only — no overnight holds.
-- On a qualifying candidate: buy sized at 5% of portfolio (see [`risk.md`](./risk.md) for sizing and exposure cap interaction; it was 10% until measurement showed the drawdown that implied).
+### The pattern
 
-**Qualifying is not the same as being bought.** Four further gates apply only at
-entry, and candidates are taken in relative-volume order until slots run out:
+A qualifying candidate is bought only when its chart prints a **pullback and
+resumption** (`strategy.FindSetup`), read on `entry.pattern_interval` candles:
 
-1. the concurrent-position cap,
-2. not already holding the symbol,
-3. the same-day re-entry rule,
-4. sizing being able to afford at least one share from available cash.
+```
+         ← pole: the session's high so far
+        /|
+       / |  ‾\__   ← flag: one to a few bars that stay below the pole
+      /  |      \__
+  ___/                ▲ trigger: a bar closes back above the pole high
+```
 
-Each qualifying candidate's outcome ("bought 2192 @ $4.56", "position cap reached",
-"already traded today", …) is recorded and shown in the status page's Action column,
-so the gap between qualifying and buying is visible rather than log-only.
+Plus two trend filters, because the strategy only buys strength: price must be above
+its `entry.ema_period` EMA, and above the session VWAP — the line separating a name
+being accumulated from one being distributed into.
 
-A failure affecting one candidate — an unavailable price, a rejected order — skips
-that candidate and the pass continues. Aborting would discard the remaining
-qualifiers, which at a one-minute cadence means a transient blip on one symbol
-silently costs the others their entry. Failures that are not candidate-specific (a
-store error, say) still stop the pass and surface as `ERROR`.
+### Why the pattern matters more than the pattern
+
+The setup's real output is not the entry price, it is **the stop**. The flag's low is
+the price that says the pullback was not a pullback, so it is where the stop belongs —
+and that means *risk per share is known before the position is sized*. Buying on the
+screen alone gives neither: there is no reference price, so the stop has to be an
+arbitrary percentage of entry and the size an arbitrary fraction of the account.
+
+A setup whose stop is further than `entry.max_stop_distance_pct` away is **refused
+outright**, not sized around. That is part of the strategy rather than a safety rail:
+with risk that wide the size has to shrink until a winner cannot pay for the losers.
+A stop closer than `entry.min_stop_distance_pct` is widened to it instead, because
+ordinary noise would otherwise trigger it immediately.
+
+### Sizing follows the stop
+
+```
+shares = (portfolio value × risk.risk_per_trade_pct) ÷ (entry − stop)
+```
+
+Every trade risks the same fraction of the account (`risk.SizeForRisk`). Sizing by a
+fixed fraction of portfolio value instead — which is what this project did before —
+makes the dollar risk swing with the stock's volatility, so the account's worst days
+are decided by which setups happened to be wide rather than by any decision anyone
+made.
+
+Two caps bound it: `risk.max_position_pct` on one position's notional, and available
+cash. The notional cap **does** bind on tight stops, and when it does the trade risks
+*less* than the nominal figure — conservative, and worth knowing when reading the
+audit trail. It has to sit above `risk_per_trade_pct ÷ max_stop_distance_pct` or it
+binds on every trade and sizing silently reverts to a fixed fraction.
+
+### The entry window
+
+New positions are only opened while **both** of these hold:
+
+- it is within `timing.entry_window` of the open — 5h30m, so from a 09:30 open the last entry is **15:00**; and
+- it is at least `timing.entry_cutoff_buffer` (30m) before the forced end-of-day exit.
+
+The second is not arithmetic on the first, and it matters on a short session: the entry
+window is measured from the open while the forced exit is measured from the close, so on
+a half day (13:00 close, 12:30 forced exit) the buffer becomes the binding limit and the
+last entry moves back to 12:00. Capping at the forced exit alone would let an early close
+open a position a minute before it had to be liquidated.
+
+**Screening continues after the window closes and the page keeps showing what is setting
+up** — an empty afternoon table would read as a broken scanner rather than a deliberate
+stand-down. Positions already held are managed to the close as normal.
+
+The window used to be 2h. It was widened deliberately, against the measurement: on the
+backtested year later entries were worse, and a 2h window ended at $8,871 where 4h ended
+at $7,162 and all-day at $5,582 (t = −4.24). Trading more of the day buys opportunity at
+a measured cost; see [`decisions.md`](./decisions.md).
+
+The sentiment gate was shortened from an hour to `timing.sentiment_window` for the
+same reason: an hour of kill-switch meant sitting out the single most important hour
+of the day, since the moves this strategy looks for begin in the first fifteen
+minutes. 09:30 to 09:35 is still not tradeable, which is a real cost and a deliberate
+one.
+
+**Qualifying is not the same as being bought.** These gates apply only at entry, and
+candidates are taken in relative-volume order until slots run out:
+
+1. the setup having triggered at all,
+2. the entry window still being open,
+3. the concurrent-position cap,
+4. not already holding the symbol,
+5. the same-day re-entry rule,
+6. sizing being able to afford at least one share from available cash.
+
+Each qualifying candidate's outcome ("bought 6600 @ $5.00, stop $4.85", "no setup:
+close 9.93 has not cleared the 10.02 pullback high", "entry window closed", …) is
+recorded and shown in the status page's Action column, so the gap between qualifying
+and buying is visible rather than log-only.
+
+A failure affecting one candidate — unavailable bars, a rejected order — skips that
+candidate and the pass continues. Aborting would discard the remaining qualifiers,
+which at a one-minute cadence means a transient blip on one symbol silently costs the
+others their entry. Failures that are not candidate-specific (a store error, say)
+still stop the pass and surface as `ERROR`.
+
+**Not automated:** the discretionary reading this pattern is normally traded with —
+Level 2, time and sales, the feel of a tape — has no mechanical equivalent here. If a
+meaningful part of the edge lives there, this implementation cannot capture it, and
+that is a limitation of automating the approach rather than something tuning will fix.
 
 ## 4. Exit
 
-A position exits on whichever of these triggers first — and there are only two:
+Three things can close or reduce a position, checked in this order:
 
-1. **Hard stop-loss** at −10% (settled — see [`risk.md`](./risk.md)).
-2. **Forced end-of-day exit** at 30 minutes before market close, regardless of P&L — settled, no exceptions.
+1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, no exceptions.
+2. **The stop.** The working stop is the chart stop the setup defined, moved up to the entry price once the first target is banked. Behind it sits `risk.stop_loss_pct` as a **gap backstop**, reachable only when price jumps straight through the chart stop. Config validation requires the backstop to be the wider of the two, or it would fire first and silently turn this back into a fixed-percentage stop.
+3. **The first profit target**, at `exit.first_target_r` multiples of *this trade's own initial risk*. `exit.first_target_fraction` of the position is sold there and the rest keeps running, with its stop at breakeven.
 
-Both are checked continuously once a position is open. In code, `strategy.EvaluateExit` returns the *first* match and the order it checks them in **is** the priority: forced EOD, then stop-loss. Nothing follows the stop, so a winner runs until the bell.
+Risk before reward: on a bar that traded through both the stop and the target, the
+stop is what is recorded. `strategy.EvaluateExit` returns the first action due, and
+the order it checks them in **is** the priority.
 
-**Removed: the profit target and trailing stop.** A +15% target arming a 5% trailing stop was the first exit rule until 2026-09-28, and it was the single most expensive thing in the strategy. A trail armed at +15% and trailing 5% cannot mathematically exit above +9.25%, and in practice exited at **+9.31%** — while those same positions went on to average **+53%**. It capped the right tail at +9% and left the left tail at −10.7%, which at a 42% win rate cannot be profitable. Over one year and 1,697 trades, removing it moved the per-trade mean from **−2.13% to +0.18%** and a $10,000 account from **$289 to $8,483**. A 150-cell sweep of stop × target × trail found no combination that made money. See [`decisions.md`](./decisions.md).
+### Why the target is a fraction and a multiple of risk
 
-**Removed earlier: the MACD bearish crossover.** A 15-minute MACD cross (fast=5, slow=10, signal=3) was a trigger until the same day's earlier change. Backtesting showed it firing on **24.9% of trades for a mean return of −0.08%** — indistinguishable from not having it, while costing an intraday-bar request per open position per tick and carrying a 13-candle warm-up that made it unavailable before roughly 12:45pm ET anyway. `internal/strategy/macd.go` and `MarketData.IntradayBars` went with it.
+Two exit rules were removed from here on evidence, and the shape of what replaced them
+is not an accident:
 
-The pattern in both removals is the same and worth stating once: this strategy's return lives in a thin right tail, so **any rule that truncates a gain is taking the part that pays for all the losses**. A new exit trigger needs evidence that it pays for itself before it goes in.
+- **A MACD bearish crossover** fired on 24.9% of trades for a mean of −0.08% — no work, at the cost of a bar request per position per tick and a 13-candle warm-up.
+- **A fixed +15% profit target arming a fixed 5% trailing stop.** Armed at +15% and trailing 5% it could not mathematically exit above +9.25%, and in practice exited at **+9.31%** — while those same positions went on to average **+53%**. It capped the right tail at +9% and left the left tail at −10.7%, which at a 42% win rate cannot be profitable. Over one year and 1,697 trades it turned a per-trade mean of **+0.18% into −2.13%**, a t-statistic of −9.76. A 150-cell sweep of stop × target × trail found no combination that made money.
+
+The lesson generalises, and it is why the current rule sells only *part* of the
+position: **this strategy's return lives in a thin right tail, so any rule that
+truncates a gain takes the part that pays for all the losses.** A position too small to
+split is left to run rather than closed at the target, for exactly that reason.
+
+Stating the target in multiples of risk rather than as a percentage follows from
+sizing: a trade risking 2% and one risking 4% should not take profit at the same price
+move.
 
 ## Same-day re-entry
 

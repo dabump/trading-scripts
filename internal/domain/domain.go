@@ -35,13 +35,19 @@ const (
 	VerdictBearish Verdict = "OVERWHELMINGLY_BEARISH"
 )
 
-// ExitReason records why a position was closed. Mirrors the four exit triggers
-// in docs/strategy.md §4.
+// ExitReason records why a position was closed. Mirrors the exit triggers in
+// docs/strategy.md §4.
 type ExitReason string
 
 const (
 	ExitForcedEOD ExitReason = "FORCED_EOD"
-	ExitStopLoss  ExitReason = "STOP_LOSS"
+	// ExitStopLoss covers both the chart stop the setup defined and the percentage
+	// backstop behind it. The stop price recorded on the position says which fired.
+	ExitStopLoss ExitReason = "STOP_LOSS"
+	// ExitScaleOut is never a position's final ExitReason: it labels the partial
+	// sale at the first profit target, which banks part of the trade and leaves a
+	// runner open.
+	ExitScaleOut ExitReason = "SCALE_OUT"
 	// ExitReconciled is not a strategy exit: it records a position the broker no
 	// longer holds, found during restart reconciliation. Kept distinct so the
 	// end-of-day summary never attributes a disappearance to a strategy rule.
@@ -75,14 +81,36 @@ type Snapshot struct {
 }
 
 // Position is a holding, open or closed.
+//
+// A position can be reduced before it is closed, because the strategy scales out of
+// a winner at its first target and lets the rest run. Shares is therefore what was
+// bought and SharesOpen is what is still held; BankedDollars accumulates the profit
+// and loss already taken off the table.
 type Position struct {
 	ID          int64
 	SessionDate string
 	Symbol      string
-	Shares      int
-	EntryPrice  float64
-	EntryTime   time.Time
-	PeakPrice   float64
+	// Shares is the original size, kept for the record even after scaling out.
+	Shares int
+	// SharesOpen is what is still held: equal to Shares until the first target is
+	// hit, and zero once the position is closed.
+	SharesOpen int
+	EntryPrice float64
+	EntryTime  time.Time
+	PeakPrice  float64
+	// StopPrice is the working stop, in dollars rather than a percentage, because
+	// the setup derives it from the chart. It moves up to the entry price once the
+	// first target is banked.
+	StopPrice float64
+	// InitialRisk is EntryPrice − the first StopPrice, in dollars per share. Profit
+	// targets are multiples of it, so it has to survive the stop being moved.
+	InitialRisk float64
+	// TargetHit latches once the first profit target has been taken, so a position
+	// oscillating around the target is not scaled out of repeatedly.
+	TargetHit bool
+	// BankedDollars is profit and loss already realised on this position through
+	// partial sales.
+	BankedDollars float64
 	// LastPrice is the most recent mark recorded by the trading loop, used by the
 	// status page so it never has to call the market data API itself.
 	LastPrice  float64
@@ -90,6 +118,15 @@ type Position struct {
 	ExitPrice  float64
 	ExitTime   time.Time
 	ExitReason ExitReason
+}
+
+// RMultiple expresses a price as a multiple of the position's initial risk, which
+// is the unit the exit targets are stated in.
+func (p Position) RMultiple(current float64) float64 {
+	if p.InitialRisk <= 0 {
+		return 0
+	}
+	return (current - p.EntryPrice) / p.InitialRisk
 }
 
 // UnrealizedPct is the position's P&L percentage at the given price.
@@ -100,22 +137,31 @@ func (p Position) UnrealizedPct(current float64) float64 {
 	return (current - p.EntryPrice) / p.EntryPrice * 100
 }
 
-// UnrealizedDollars is the position's P&L in dollars at the given price.
+// UnrealizedDollars is the position's total P&L in dollars at the given price:
+// what is already banked from scaling out, plus the mark on what is still held.
 func (p Position) UnrealizedDollars(current float64) float64 {
-	return (current - p.EntryPrice) * float64(p.Shares)
+	return p.BankedDollars + (current-p.EntryPrice)*float64(p.SharesOpen)
 }
 
-// RealizedPct is the closed position's P&L percentage.
+// RealizedPct is the closed position's P&L as a percentage of the capital it
+// committed.
+//
+// This is deliberately not the price move from entry to final exit. Once a position
+// can be scaled out of, those are different numbers: half sold at +20% and half at
+// −2% did not return −2%. Measuring against entry price × original shares gives the
+// return on what was actually put at risk.
 func (p Position) RealizedPct() float64 {
-	if p.EntryPrice == 0 {
+	committed := p.EntryPrice * float64(p.Shares)
+	if committed == 0 {
 		return 0
 	}
-	return (p.ExitPrice - p.EntryPrice) / p.EntryPrice * 100
+	return p.BankedDollars / committed * 100
 }
 
-// RealizedDollars is the closed position's P&L in dollars.
+// RealizedDollars is the closed position's P&L in dollars, including every partial
+// sale along the way.
 func (p Position) RealizedDollars() float64 {
-	return (p.ExitPrice - p.EntryPrice) * float64(p.Shares)
+	return p.BankedDollars
 }
 
 // Criterion is one screening rule's outcome for one symbol. Display carries the

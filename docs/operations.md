@@ -32,19 +32,33 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 |---|---|---|
 | `market_data.feed` | `sip` | Full consolidated tape. `iex` is accepted but the relative-volume criterion is not meaningful on it |
 | `screening.min_price` | 1.0 | `strategy.md` §2 — tradability floor, not a momentum criterion; validated > 0 |
+| `screening.max_price` | 20.0 | `strategy.md` §2 — the band the strategy trades; validated > `min_price` |
 | `screening.min_dollar_volume` | 1000000 | `strategy.md` §2 — dollar volume traded today; validated > 0 |
 | `screening.min_intraday_pct` | 10.0 | `strategy.md` §2 |
 | `screening.min_volume_multiple` | 5.0 | `strategy.md` §2 |
 | `screening.avg_volume_lookback_days` | 20 | **PROPOSED** — excludes today |
 | `screening.max_enriched` | 100 | **PROPOSED** — caps the per-symbol lookups after the move filter, not the scan itself |
 | `screening.news_lookback` | 18h | **PROPOSED** — must reach back past the open so pre-market catalysts are visible; validated to be ≥7h |
-| `risk.position_size_pct` | 5.0 | `risk.md`; reduced from 10.0 on measurement — same expectancy, far less drawdown |
+| `entry.pattern_interval` | 1m | `strategy.md` §3 — the candle the setup is read on |
+| `entry.ema_period` | 9 | `strategy.md` §3 — trend filter |
+| `entry.require_above_vwap` | `true` | `strategy.md` §3 |
+| `entry.min_pullback_bars` / `max_pullback_bars` | 1 / 5 | `strategy.md` §3; validated max ≥ min |
+| `entry.stop_buffer_pct` | 0.1 | `strategy.md` §3 — the stop sits under the flag low, not on it |
+| `entry.min_stop_distance_pct` | 0.5 | `strategy.md` §3 — a nearer stop is widened to this |
+| `entry.max_stop_distance_pct` | 4.0 | `strategy.md` §3 — a wider setup is refused; validated below `risk.stop_loss_pct` |
+| `risk.risk_per_trade_pct` | 1.0 | `risk.md` — the account fraction put at risk per trade; sizing follows from the stop |
+| `risk.max_position_pct` | 33.0 | `risk.md` — notional cap; must exceed `risk_per_trade_pct ÷ entry.max_stop_distance_pct` or it binds on every trade |
 | `risk.max_concurrent_positions` | 5 | `risk.md`; validated so sizing × concurrency cannot exceed 100% |
 | `risk.stop_loss_pct` | 10.0 | `risk.md` |
 | `risk.allow_same_day_reentry` | `false` | **PROPOSED** |
+| `exit.first_target_r` | 2.0 | `strategy.md` §4 — in multiples of the trade's own initial risk |
+| `exit.first_target_fraction` | 0.5 | `strategy.md` §4 — validated in (0, 1): selling all of it is the rule that measured t = −9.76 |
+| `exit.breakeven_after_target` | `true` | `strategy.md` §4 |
 | `exit.eod_exit_offset_minutes` | 30 | `strategy.md` §4 |
-| `timing.sentiment_poll_interval` | 10m | `strategy.md` §1 |
-| `timing.sentiment_window` | 1h | `strategy.md` §1 |
+| `timing.sentiment_poll_interval` | 2m | `strategy.md` §1 — tightened with the shorter gate window |
+| `timing.sentiment_window` | 5m | `strategy.md` §1 — shortened from 1h so the opening range is tradeable |
+| `timing.entry_window` | 5h30m | `strategy.md` §3 — from a 09:30 open the last entry is 15:00; validated longer than `sentiment_window` |
+| `timing.entry_cutoff_buffer` | 30m | `strategy.md` §3 — quiet time before the forced exit, enforced against the close so a half day tightens the window rather than collapsing the gap |
 | `timing.screener_scan_interval` | 1m | `strategy.md` §2 |
 | `timing.position_poll_interval` | 15s | **PROPOSED** — how often open positions are re-marked |
 | `sentiment.symbols` | SPY, QQQ, IWM | IWM included because the strategy trades small caps |
@@ -58,7 +72,9 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `audit.directory` | `logs` | Append-only JSONL trail, one file per session date; gitignored |
 
 Invalid configurations are rejected at startup rather than mid-session: unknown
-keys, a non-negative bearish threshold, a non-positive screening floor, and total
+keys, a non-negative bearish threshold, a non-positive screening floor, a chart stop
+wider than the gap backstop behind it, a profit target that would sell the whole
+position, an entry window that closes before the sentiment gate opens, and total
 exposure over 100% all fail fast, because discovering them with real positions open is the
 expensive way to find out.
 

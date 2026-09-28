@@ -17,71 +17,124 @@ screening:
   # day, and sub-$1 names trading a few hundred shares — none fillable at a sensible
   # price, and sub-$1 was also the worst-performing price bucket. PROPOSED values.
   min_price: 1.0
+  # The band the strategy trades. Above roughly $20 a 10% move on 5x volume is a
+  # different kind of event in a different kind of name, and the pullback entry below
+  # is not what moves it. PROPOSED.
+  max_price: 20.0
   min_dollar_volume: 1000000
   # A floor with deliberately no ceiling. A max_intraday_pct was tried and removed:
   # under the old profit-target/trailing-stop exits the widest gaps were the worst
   # trades, but once winners were allowed to run the extreme movers became the right
   # tail the strategy depends on, and capping at +50% cost about half the terminal
   # equity over a year. See docs/decisions.md.
-  min_intraday_pct: 10.0            # docs/strategy.md §2
-  min_volume_multiple: 5.0          # docs/strategy.md §2
-  avg_volume_lookback_days: 20      # PROPOSED (docs left the lookback undecided)
+  min_intraday_pct: 10.0 # docs/strategy.md §2
+  min_volume_multiple: 5.0 # docs/strategy.md §2
+  avg_volume_lookback_days: 20 # PROPOSED (docs left the lookback undecided)
   # The whole tradable universe is scanned each pass; this only bounds how many of
   # the symbols that clear min_intraday_pct get the expensive per-symbol lookups.
-  max_enriched: 100                 # PROPOSED
+  max_enriched: 100 # PROPOSED
   # Must reach back past the market open: a gap-up's catalyst almost always breaks
   # overnight or pre-market, so searching only from 09:30 would miss it. 18h covers
   # the prior evening through this morning's pre-market. PROPOSED.
   news_lookback: 18h
 
+# The setup gate: what a screened candidate has to print before it is bought. All
+# PROPOSED — these are the mechanical reading of a discretionary pattern, and the
+# numbers are the ones the strategy is usually described with, not measured optima.
+entry:
+  pattern_interval: 1m # the candle the setup is read on
+  ema_period: 9 # the trend line price must hold above
+  require_above_vwap: true # accumulation, not distribution
+  min_pullback_bars: 1 # the shallowest pullback worth calling one
+  max_pullback_bars: 5 # beyond this the move has stalled, not paused
+  stop_buffer_pct: 0.1 # placed just under the pullback low, not on it
+  min_stop_distance_pct: 0.5 # nearer than this and ordinary noise triggers it
+  # If the chart stop is further away than this, the trade is not taken at all. This
+  # is part of the strategy rather than a safety rail: with risk that wide the size
+  # has to shrink until the winner cannot pay for the losers.
+  max_stop_distance_pct: 4.0
+
 risk:
-  # 5%, not the 10% originally specified. Per-trade expectancy barely changes with
-  # size, but the account does, because a fixed fraction of a moving balance
-  # compounds: over the measured year 10% ended at $8,483 with a 79% max drawdown
-  # while 5% ended at $11,237 with 48%. See docs/risk.md and docs/decisions.md.
-  position_size_pct: 5.0
-  max_concurrent_positions: 5       # docs/risk.md
-  stop_loss_pct: 10.0               # docs/risk.md
-  allow_same_day_reentry: false     # PROPOSED (docs left same-day re-entry undecided)
+  # Fixed risk per trade, not a fixed slice of the portfolio. The share count comes
+  # from how far the stop is: shares = (equity x risk_per_trade_pct) / (entry - stop).
+  # Sizing by portfolio fraction instead makes the dollar risk swing with the stock's
+  # volatility, so a wide-stop trade quietly costs several times a tight-stop one.
+  risk_per_trade_pct: 1.0
+  # A cap on one position's notional regardless of how tight its stop is; without it a
+  # stop 0.5% away would size to more than the whole account.
+  #
+  # It has to sit above risk_per_trade_pct / max_stop_distance_pct, or it binds on
+  # every single trade and sizing quietly reverts to a fixed fraction of the account.
+  # At 1% risk and a 4% maximum stop that ratio is 25%, so 33% leaves the risk rule in
+  # charge for the wider setups. On a very tight stop the cap still binds and the trade
+  # risks less than 1% — conservative, and worth knowing when reading the audit trail.
+  max_position_pct: 33.0
+  # Three, not five. The strategy being followed runs a small number of positions at
+  # a time rather than a basket; five concurrent microcap momentum trades is a
+  # different risk profile from the one it describes. Three at 33% also keeps maximum
+  # exposure just under fully invested.
+  max_concurrent_positions: 3
+  stop_loss_pct: 10.0 # docs/risk.md
+  allow_same_day_reentry: false # PROPOSED (docs left same-day re-entry undecided)
 
 exit:
-  # Two triggers were removed on measurement and should not return without evidence.
+  # Scale out of a winner, keep a runner. The target is in multiples of the trade's
+  # own initial risk, not a fixed percentage: a trade risking 2% and one risking 4%
+  # should not take profit at the same price move.
   #
-  # There is no MACD trigger: a 2024-2026 backtest measured it firing on 24.9% of
-  # trades for a mean of -0.08%, doing no work while costing a bar request per
-  # position per tick.
-  #
-  # There is no profit target or trailing stop either, and that one mattered. Armed at
-  # +15% and trailing 5% it could not exit above +9.25%, while those same positions
-  # went on to average +53%. Over 1,697 trades it turned a per-trade mean of +0.18%
-  # into -2.13% (t = -9.76), and a 150-cell sweep of stop x target x trail found no
-  # combination that made money. The return lives in a thin right tail, so truncating
-  # gains removes what pays for the losses. See docs/decisions.md.
-  eod_exit_offset_minutes: 30       # docs/strategy.md §4
+  # This is deliberately not the rule that was removed. A fixed +15% target arming a
+  # 5% trailing stop could not exit above +9.25% while those positions went on to
+  # average +53% -- over 1,697 trades it turned a per-trade mean of +0.18% into
+  # -2.13% (t = -9.76). Selling a fraction and letting the rest run keeps the right
+  # tail open, which is where this strategy's entire return lives. There is also no
+  # MACD trigger: it fired on 24.9% of trades for a mean of -0.08%. See
+  # docs/decisions.md. PROPOSED.
+  first_target_r: 2.0
+  first_target_fraction: 0.5
+  breakeven_after_target: true
+  eod_exit_offset_minutes: 30 # docs/strategy.md §4
 
 timing:
-  sentiment_poll_interval: 10m      # docs/strategy.md §1
-  sentiment_window: 1h              # docs/strategy.md §1
-  screener_scan_interval: 1m        # docs/strategy.md §2
-  position_poll_interval: 15s       # PROPOSED: how often open positions are re-checked
+  sentiment_poll_interval: 2m # docs/strategy.md §1
+  # Five minutes, not the hour originally specified. The kill switch is worth keeping,
+  # but an hour of it meant sitting out the single most important hour of the day for
+  # this strategy: the moves it looks for begin in the first fifteen minutes. 09:30
+  # to 09:35 is still not tradeable, which is a real cost and a deliberate one.
+  sentiment_window: 5m
+  # New positions are only opened in this window after the open; positions already
+  # held are still managed to the close. 5h30m from a 09:30 open puts the last entry
+  # at 15:00, leaving the buffer below before the 15:30 forced exit.
+  #
+  # Measured caveat, recorded in docs/decisions.md: on the backtested year, later
+  # entries were worse. A 2h window ended at $8,871 against 4h at $7,162 and all-day
+  # at $5,582 (t = -4.24). This value trades that away for more opportunity, which is
+  # a deliberate choice and not a measured improvement.
+  entry_window: 5h30m
+  # Quiet time between the last entry and the forced exit, so nothing is bought that
+  # is about to be sold. Enforced against the forced-exit mark rather than assumed
+  # from entry_window, so an early close tightens the window instead of collapsing
+  # the gap.
+  entry_cutoff_buffer: 30m
+  screener_scan_interval: 1m # docs/strategy.md §2
+  position_poll_interval: 15s # PROPOSED: how often open positions are re-checked
 
 sentiment:
   # IWM is included because the strategy trades small caps; SPY/QQQ alone would
   # describe a different slice of the market than the one being traded.
   symbols: ["SPY", "QQQ", "IWM"]
-  bearish_avg_pct: -0.8             # PROPOSED (docs left the thresholds undecided)
-  require_all_negative: true        # PROPOSED
+  bearish_avg_pct: -0.8 # PROPOSED (docs left the thresholds undecided)
+  require_all_negative: true # PROPOSED
 
 execution:
-  order_type: market                # PROPOSED (docs left order type undecided)
-  limit_slip_pct: 0.5               # only used when order_type is limit
+  order_type: market # PROPOSED (docs left order type undecided)
+  limit_slip_pct: 0.5 # only used when order_type is limit
 
 web:
   listen_addr: ":8080"
-  poll_interval: 12s                # docs/web-ui.md: ~10-15s
+  poll_interval: 12s # docs/web-ui.md: ~10-15s
 
 storage:
-  database_path: data/agent.db      # docs/operations.md
+  database_path: data/agent.db # docs/operations.md
 
 audit:
   # Append-only JSON-lines trail of decisions and actions, one file per session

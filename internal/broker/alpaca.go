@@ -205,6 +205,56 @@ func (a *Alpaca) snapshotBatch(ctx context.Context, symbols []string) (map[strin
 	return out, nil
 }
 
+// barTimeframe renders a duration in Alpaca's timeframe notation. Only whole
+// minutes and hours are expressible, which is all the setup detector needs.
+func barTimeframe(d time.Duration) (string, error) {
+	switch {
+	case d <= 0:
+		return "", fmt.Errorf("bar interval must be positive, got %s", d)
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dHour", int(d/time.Hour)), nil
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dMin", int(d/time.Minute)), nil
+	default:
+		return "", fmt.Errorf("bar interval %s is not a whole number of minutes", d)
+	}
+}
+
+// IntradayBars fetches one symbol's candles from `since` onward, following
+// next_page_token so a full session at one-minute resolution is not silently
+// truncated at the page limit.
+func (a *Alpaca) IntradayBars(ctx context.Context, symbol string, interval time.Duration, since time.Time) ([]domain.Bar, error) {
+	tf, err := barTimeframe(interval)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []domain.Bar
+	token := ""
+	for {
+		u := fmt.Sprintf("%s/v2/stocks/%s/bars?timeframe=%s&start=%s&limit=10000&adjustment=raw&feed=%s&sort=asc",
+			a.dataURL, url.PathEscape(symbol), url.QueryEscape(tf),
+			url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(a.feed))
+		if token != "" {
+			u += "&page_token=" + url.QueryEscape(token)
+		}
+		var resp struct {
+			Bars          []alpacaBar `json:"bars"`
+			NextPageToken *string     `json:"next_page_token"`
+		}
+		if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+			return nil, err
+		}
+		for _, b := range resp.Bars {
+			out = append(out, b.toDomain())
+		}
+		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
+			return out, nil
+		}
+		token = *resp.NextPageToken
+	}
+}
+
 func (a *Alpaca) AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error) {
 	// Request a wider window than `days` because weekends and holidays mean
 	// calendar days and trading days differ.

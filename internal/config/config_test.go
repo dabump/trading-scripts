@@ -19,15 +19,32 @@ func TestLoadShippedConfig(t *testing.T) {
 		t.Errorf("screen thresholds = %v%% / %vx, want 10%% / 5x (docs/strategy.md §2)",
 			c.Screening.MinIntradayPct, c.Screening.MinVolumeMultiple)
 	}
-	if c.Risk.PositionSizePct != 5 || c.Risk.MaxConcurrentPositions != 5 {
-		t.Errorf("sizing = %v%% x %d, want 5%% x 5 (docs/risk.md)",
-			c.Risk.PositionSizePct, c.Risk.MaxConcurrentPositions)
+	if c.Risk.RiskPerTradePct != 1 || c.Risk.MaxConcurrentPositions != 3 {
+		t.Errorf("risk = %v%% x %d positions, want 1%% x 3 (docs/risk.md)",
+			c.Risk.RiskPerTradePct, c.Risk.MaxConcurrentPositions)
+	}
+	// The notional cap has to sit above risk_per_trade / max_stop_distance, or it
+	// binds on every trade and sizing silently reverts to a fixed fraction of the
+	// account — the very thing sizing from the stop is meant to replace.
+	if ratio := c.Risk.RiskPerTradePct / c.Entry.MaxStopDistancePct * 100; c.Risk.MaxPositionPct <= ratio {
+		t.Errorf("max_position_pct %.0f%% is at or below %.0f%%, so the cap binds on every setup",
+			c.Risk.MaxPositionPct, ratio)
 	}
 	// The exits are the stop-loss and the forced end-of-day deadline, and nothing
 	// else. A profit target or trailing stop here would reintroduce the single
 	// largest measured loss in the strategy's history (docs/decisions.md).
 	if c.Exit.EODExitOffsetMins != 30 {
 		t.Errorf("eod offset = %d, want 30 (docs/strategy.md §4)", c.Exit.EODExitOffsetMins)
+	}
+	// A whole-position profit target is the rule that measured t = -9.76. Scaling out
+	// must leave a runner behind.
+	if c.Exit.FirstTargetFraction >= 1 {
+		t.Errorf("first_target_fraction = %v, which sells the whole position",
+			c.Exit.FirstTargetFraction)
+	}
+	// The setup gate is what makes this a pullback strategy rather than a screen.
+	if c.Entry.PatternInterval <= 0 || c.Entry.EMAPeriod < 2 {
+		t.Errorf("entry pattern settings look unset: %+v", c.Entry)
 	}
 	// Tradability floors: without them the screen selects warrants and sub-$1 names
 	// that cannot be filled (see docs/decisions.md).
@@ -64,10 +81,16 @@ func valid() *Config {
 	c.MarketData = MarketData{Feed: "sip"}
 	c.Screening = Screening{MinIntradayPct: 10, MinVolumeMultiple: 5,
 		AvgVolumeLookbackDays: 20, MaxEnriched: 100, NewsLookback: 18 * time.Hour,
-		MinPrice: 1, MinDollarVolume: 1_000_000}
-	c.Risk = Risk{PositionSizePct: 10, MaxConcurrentPositions: 5, StopLossPct: 10}
-	c.Exit = Exit{EODExitOffsetMins: 30}
-	c.Timing = Timing{SentimentPollInterval: 600e9, SentimentWindow: 3600e9,
+		MinPrice: 1, MaxPrice: 20, MinDollarVolume: 1_000_000}
+	c.Entry = Entry{PatternInterval: time.Minute, EMAPeriod: 9, RequireAboveVWAP: true,
+		MinPullbackBars: 1, MaxPullbackBars: 5, StopBufferPct: 0.1,
+		MinStopDistancePct: 0.5, MaxStopDistancePct: 4}
+	c.Risk = Risk{RiskPerTradePct: 1, MaxPositionPct: 33, MaxConcurrentPositions: 3,
+		StopLossPct: 10}
+	c.Exit = Exit{FirstTargetR: 2, FirstTargetFraction: 0.5, BreakevenAfterTarget: true,
+		EODExitOffsetMins: 30}
+	c.Timing = Timing{SentimentPollInterval: 120e9, SentimentWindow: 300e9,
+		EntryWindow: 2 * 3600e9, EntryCutoffBuffer: 1800e9,
 		ScreenerScanInterval: 60e9, PositionPollInterval: 15e9}
 	c.Sentiment = Sentiment{Symbols: []string{"SPY"}, BearishAvgPct: -0.8}
 	c.Execution = Execution{OrderType: "market"}
@@ -86,13 +109,55 @@ func TestValidate(t *testing.T) {
 		{"baseline is valid", func(*Config) {}, ""},
 		{
 			"exposure over 100% is rejected",
-			func(c *Config) { c.Risk.PositionSizePct = 25; c.Risk.MaxConcurrentPositions = 5 },
+			func(c *Config) { c.Risk.MaxPositionPct = 25; c.Risk.MaxConcurrentPositions = 5 },
 			"exceeds 100%",
 		},
 		{
 			"exposure exactly 100% is allowed",
-			func(c *Config) { c.Risk.PositionSizePct = 20; c.Risk.MaxConcurrentPositions = 5 },
+			func(c *Config) { c.Risk.MaxPositionPct = 20; c.Risk.MaxConcurrentPositions = 5 },
 			"",
+		},
+		{
+			// Five concurrent trades each risking 6% puts 30% of the account on the
+			// line at once, which is the number that actually decides survival.
+			"too much simultaneous risk is rejected",
+			func(c *Config) { c.Risk.RiskPerTradePct = 6; c.Risk.MaxConcurrentPositions = 5 },
+			"at risk simultaneously",
+		},
+		{
+			"a chart stop wider than the backstop is rejected",
+			func(c *Config) { c.Entry.MaxStopDistancePct = 12 },
+			"must be below risk.stop_loss_pct",
+		},
+		{
+			"a pullback range that cannot be satisfied is rejected",
+			func(c *Config) { c.Entry.MinPullbackBars = 6; c.Entry.MaxPullbackBars = 3 },
+			"max_pullback_bars",
+		},
+		{
+			"selling the whole position at the target is rejected",
+			func(c *Config) { c.Exit.FirstTargetFraction = 1 },
+			"leave no runner",
+		},
+		{
+			"a price band with no width is rejected",
+			func(c *Config) { c.Screening.MaxPrice = 1 },
+			"must be greater than screening.min_price",
+		},
+		{
+			"an entry window inside the sentiment window is rejected",
+			func(c *Config) { c.Timing.EntryWindow = 2 * time.Minute },
+			"no entry is ever possible",
+		},
+		{
+			"a negative entry cutoff buffer is rejected",
+			func(c *Config) { c.Timing.EntryCutoffBuffer = -time.Minute },
+			"must be >= 0",
+		},
+		{
+			"a buffer longer than the session is rejected",
+			func(c *Config) { c.Timing.EntryCutoffBuffer = 7 * time.Hour },
+			"leaves no usable entry window",
 		},
 		{
 			"positive bearish threshold is rejected",

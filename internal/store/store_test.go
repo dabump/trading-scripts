@@ -396,3 +396,192 @@ func TestMigrationUpgradesAnExistingDatabase(t *testing.T) {
 		t.Errorf("duplicate insert error = %v, want ErrDuplicateOpenPosition — the partial index did not survive", err)
 	}
 }
+
+// Scaling out is a partial sale: shares leave, their profit is banked, and the
+// position stays open. The latch is what stops two ticks banking the same target.
+func TestScaleOutBanksPartOfAPosition(t *testing.T) {
+	s := newStore(t)
+	entry := time.Date(2026, 9, 28, 10, 35, 0, 0, time.UTC)
+
+	id, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-09-28", Symbol: "ABCD", Shares: 200,
+		EntryPrice: 4.00, EntryTime: entry, StopPrice: 3.90, InitialRisk: 0.10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	open, _ := s.OpenPositions()
+	if open[0].SharesOpen != 200 || open[0].StopPrice != 3.90 || open[0].InitialRisk != 0.10 {
+		t.Fatalf("insert did not seed the position for scaling: %+v", open[0])
+	}
+
+	// Sell half at 4.20 and lift the stop to breakeven.
+	if err := s.ScaleOut(id, 100, 4.20, 4.00); err != nil {
+		t.Fatal(err)
+	}
+	open, _ = s.OpenPositions()
+	got := open[0]
+	if got.SharesOpen != 100 {
+		t.Errorf("shares open = %d, want 100", got.SharesOpen)
+	}
+	if got.Shares != 200 {
+		t.Errorf("original size = %d, want it preserved at 200", got.Shares)
+	}
+	if want := 20.0; got.BankedDollars < want-0.01 || got.BankedDollars > want+0.01 {
+		t.Errorf("banked = %v, want %v (100 x $0.20)", got.BankedDollars, want)
+	}
+	if got.StopPrice != 4.00 {
+		t.Errorf("stop = %v, want it moved to 4.00", got.StopPrice)
+	}
+	if !got.TargetHit {
+		t.Error("the target must be latched")
+	}
+
+	// A second attempt must change nothing, which is what protects against two
+	// ticks racing on the same target.
+	err = s.ScaleOut(id, 50, 4.30, 4.00)
+	if !errors.Is(err, ErrScaleOutNotApplicable) {
+		t.Errorf("second scale-out error = %v, want ErrScaleOutNotApplicable", err)
+	}
+	open, _ = s.OpenPositions()
+	if open[0].SharesOpen != 100 || open[0].BankedDollars > 20.01 {
+		t.Errorf("a repeat scale-out changed the position: %+v", open[0])
+	}
+
+	// Closing folds the final leg into what was already banked.
+	exitAt := entry.Add(3 * time.Hour)
+	if err := s.ClosePosition(id, 5.00, exitAt, domain.ExitForcedEOD); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := s.SessionPositions("2026-09-28")
+	closed := all[0]
+	if closed.SharesOpen != 0 {
+		t.Errorf("shares open = %d after close, want 0", closed.SharesOpen)
+	}
+	// $20 banked at 4.20 plus 100 x $1.00 on the runner.
+	if want := 120.0; closed.RealizedDollars() < want-0.01 || closed.RealizedDollars() > want+0.01 {
+		t.Errorf("realized = %v, want %v", closed.RealizedDollars(), want)
+	}
+	// 15% on the $800 the position committed, not the 25% the final price move
+	// alone would suggest.
+	if got := closed.RealizedPct(); got < 14.99 || got > 15.01 {
+		t.Errorf("realized pct = %v, want 15 (on committed capital)", got)
+	}
+}
+
+// A stop may only ever move up. One that could move down would let a losing position
+// keep giving ground.
+func TestMoveStopNeverLowersIt(t *testing.T) {
+	s := newStore(t)
+	id, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-09-28", Symbol: "ABCD", Shares: 100,
+		EntryPrice: 4.00, EntryTime: time.Now(), StopPrice: 3.90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MoveStop(id, 4.10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MoveStop(id, 3.50); err != nil {
+		t.Fatal(err)
+	}
+	open, _ := s.OpenPositions()
+	if open[0].StopPrice != 4.10 {
+		t.Errorf("stop = %v, want 4.10 retained", open[0].StopPrice)
+	}
+}
+
+// Migration 004 has to backfill, not just add columns: a database written by the
+// previous version has positions whose shares_open would otherwise be zero, which
+// reads as "nothing held" and would silently stop managing a live position.
+func TestMigration004BackfillsExistingPositions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre004.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmts := []string{
+		`CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		`CREATE TABLE positions (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_date TEXT NOT NULL,
+			symbol       TEXT NOT NULL,
+			shares       INTEGER NOT NULL,
+			entry_price  REAL NOT NULL,
+			entry_time   TEXT NOT NULL,
+			peak_price   REAL NOT NULL,
+			is_open      INTEGER NOT NULL DEFAULT 1,
+			exit_price   REAL NOT NULL DEFAULT 0,
+			exit_time    TEXT NOT NULL DEFAULT '',
+			exit_reason  TEXT NOT NULL DEFAULT '',
+			last_price   REAL NOT NULL DEFAULT 0
+		)`,
+		`CREATE UNIQUE INDEX positions_one_open_per_symbol ON positions (symbol) WHERE is_open = 1`,
+		`INSERT INTO positions (session_date, symbol, shares, entry_price, entry_time,
+			peak_price, is_open, last_price)
+		 VALUES ('2026-09-28', 'HELD', 300, 4.00, '2026-09-28T10:35:00Z', 4.50, 1, 4.40)`,
+		`INSERT INTO positions (session_date, symbol, shares, entry_price, entry_time,
+			peak_price, is_open, last_price, exit_price, exit_reason)
+		 VALUES ('2026-09-28', 'DONE', 100, 2.00, '2026-09-28T10:35:00Z', 2.30, 0, 2.20, 2.20, 'STOP_LOSS')`,
+	}
+	for _, n := range []string{"001_init.sql", "002_last_price.sql", "003_drop_trail_armed.sql"} {
+		stmts = append(stmts,
+			`INSERT INTO schema_migrations (name, applied_at) VALUES ('`+n+`', '2026-01-01T00:00:00Z')`)
+	}
+	for _, q := range stmts {
+		if _, err := legacy.Exec(q); err != nil {
+			t.Fatalf("seed legacy schema: %v\n%s", err, q)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrating an existing database failed: %v", err)
+	}
+	defer st.Close()
+
+	open, err := st.OpenPositions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("got %d open positions, want the pre-existing one", len(open))
+	}
+	// The whole position is still held: anything less and the trading loop would sell
+	// the wrong number of shares.
+	if open[0].SharesOpen != 300 {
+		t.Errorf("shares open = %d, want the full 300 backfilled", open[0].SharesOpen)
+	}
+	if open[0].BankedDollars != 0 {
+		t.Errorf("banked = %v, want 0 on a position that never scaled", open[0].BankedDollars)
+	}
+	// No chart stop, which EvaluateExit reads as the percentage backstop being the
+	// only floor — the behaviour this row was opened under.
+	if open[0].StopPrice != 0 {
+		t.Errorf("stop = %v, want 0 so the backstop governs", open[0].StopPrice)
+	}
+
+	all, err := st.SessionPositions("2026-09-28")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range all {
+		if p.Symbol != "DONE" {
+			continue
+		}
+		// 100 shares from 2.00 to 2.20 is $20, which the backfill has to compute
+		// because banked_dollars is where realised P&L now lives.
+		if p.RealizedDollars() < 19.99 || p.RealizedDollars() > 20.01 {
+			t.Errorf("closed position realized = %v, want 20 backfilled",
+				p.RealizedDollars())
+		}
+		if p.SharesOpen != 0 {
+			t.Errorf("closed position shares open = %d, want 0", p.SharesOpen)
+		}
+	}
+}

@@ -398,7 +398,7 @@ func (e *Engine) Tick(ctx context.Context) {
 			return
 		}
 		e.setState(domain.StateScreening)
-		if err := e.maybeScreen(ctx, sess); err != nil {
+		if err := e.maybeScreen(ctx, sess, !e.now().Before(bounds.EntryWindowEnd)); err != nil {
 			e.fail("screen", err)
 		}
 
@@ -506,7 +506,11 @@ func (e *Engine) resolveGate(ctx context.Context, sess scheduler.Session) (bool,
 }
 
 // maybeScreen runs a screening pass if the scan interval has elapsed.
-func (e *Engine) maybeScreen(ctx context.Context, sess scheduler.Session) error {
+//
+// After the entry window closes it keeps screening but stops buying. The page is the
+// reason: an operator watching the afternoon should still see what is setting up and
+// why it was not taken, rather than an empty table that looks like a broken scanner.
+func (e *Engine) maybeScreen(ctx context.Context, sess scheduler.Session, entryWindowClosed bool) error {
 	now := e.now()
 	e.mu.RLock()
 	last := e.lastScan
@@ -525,7 +529,20 @@ func (e *Engine) maybeScreen(ctx context.Context, sess scheduler.Session) error 
 
 	// Entry runs before the snapshot is stored so the page can show what actually
 	// happened to each qualifying candidate, not just that it qualified.
-	outcomes, entryErr := e.enterPositions(ctx, sess, evals)
+	var outcomes map[string]string
+	var entryErr error
+	if entryWindowClosed {
+		outcomes = make(map[string]string, len(evals))
+		for _, ev := range evals {
+			if ev.Qualifies {
+				outcomes[ev.Symbol] = "entry window closed"
+			}
+		}
+		e.recordSkip("", "entry window closed",
+			map[string]any{"reason": "past the entry window; screening only"})
+	} else {
+		outcomes, entryErr = e.enterPositions(ctx, sess, evals)
+	}
 	for i := range evals {
 		if outcome, ok := outcomes[evals[i].Symbol]; ok {
 			evals[i].Outcome = outcome
@@ -754,15 +771,30 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			continue
 		}
 
-		snaps, err := e.data.Snapshots(ctx, []string{cand.Symbol})
+		// The setup gate. Screening said this name is interesting; the chart has to
+		// say that now is the moment and where the risk sits. This is the only place
+		// a per-symbol bar request is made, and it is made only for candidates that
+		// already passed all three criteria.
+		bars, err := e.data.IntradayBars(ctx, cand.Symbol, e.cfg.Entry.PatternInterval, sess.Open)
 		if err != nil {
-			e.log.Warn("skipping candidate: price unavailable", "symbol", cand.Symbol, "err", err)
-			outcomes[cand.Symbol] = "price unavailable"
-			e.recordSkip(cand.Symbol, "price unavailable",
-				map[string]any{"reason": "price unavailable", "error": err.Error()})
+			e.log.Warn("skipping candidate: bars unavailable", "symbol", cand.Symbol, "err", err)
+			outcomes[cand.Symbol] = "bars unavailable"
+			e.recordSkip(cand.Symbol, "bars unavailable",
+				map[string]any{"reason": "bars unavailable", "error": err.Error()})
 			continue
 		}
-		price := snaps[cand.Symbol].Price
+		setup := strategy.FindSetup(bars, e.cfg)
+		if !setup.Triggered {
+			// Not a failure: most of the time a screened candidate simply has not set
+			// up yet. It stays a candidate and is re-examined on the next scan, so
+			// this is logged at Debug and de-duplicated in the audit trail.
+			e.log.Debug("no setup", "symbol", cand.Symbol, "reason", setup.Reason)
+			outcomes[cand.Symbol] = "no setup: " + setup.Reason
+			e.recordSkip(cand.Symbol, "no setup",
+				map[string]any{"reason": setup.Reason})
+			continue
+		}
+		price := setup.Entry
 
 		// Re-read per candidate rather than once per pass: each fill consumes cash,
 		// so sizing the next position from a stale balance would over-commit.
@@ -775,7 +807,7 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			continue
 		}
 
-		sizing := risk.Size(acct, price, e.cfg)
+		sizing := risk.SizeForRisk(acct, price, setup.Stop, e.cfg)
 		if !sizing.OK {
 			e.log.Info("skipping candidate", "symbol", cand.Symbol, "reason", sizing.Reason)
 			outcomes[cand.Symbol] = sizing.Reason
@@ -795,6 +827,7 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 		if _, err := e.store.InsertPosition(domain.Position{
 			SessionDate: sess.Date, Symbol: cand.Symbol, Shares: sizing.Shares,
 			EntryPrice: price, EntryTime: e.now(), PeakPrice: price,
+			StopPrice: setup.Stop, InitialRisk: setup.RiskPerShare,
 		}); err != nil {
 			if errors.Is(err, store.ErrDuplicateOpenPosition) {
 				e.log.Warn("duplicate position rejected by store", "symbol", cand.Symbol)
@@ -805,8 +838,10 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 		}
 
 		e.log.Info("entered position", "symbol", cand.Symbol, "shares", sizing.Shares,
-			"price", price, "rel_volume", cand.VolumeMultiple)
-		outcomes[cand.Symbol] = fmt.Sprintf("bought %d @ $%.2f", sizing.Shares, price)
+			"price", price, "stop", setup.Stop, "risk", sizing.RiskDollar,
+			"rel_volume", cand.VolumeMultiple)
+		outcomes[cand.Symbol] = fmt.Sprintf("bought %d @ $%.2f, stop $%.2f",
+			sizing.Shares, price, setup.Stop)
 		// Everything needed to reconstruct the decision later: the criteria that were
 		// met, the size and why it was that size, and the account state behind it.
 		e.record(audit.PositionOpened, cand.Symbol,
@@ -819,7 +854,12 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 				"criteria":             criteriaDetail(cand),
 				"portfolio_value":      acct.PortfolioValue,
 				"cash_before":          acct.Cash,
-				"position_size_pct":    e.cfg.Risk.PositionSizePct,
+				"risk_per_trade_pct":   e.cfg.Risk.RiskPerTradePct,
+				"risk_dollars":         sizing.RiskDollar,
+				"stop_price":           setup.Stop,
+				"stop_distance_pct":    setup.StopDistancePct,
+				"setup_pole_high":      setup.PoleHigh,
+				"setup_flag_bars":      setup.FlagBars,
 				"open_positions_after": openCount + 1,
 			})
 		openSymbols[cand.Symbol] = true
@@ -868,6 +908,15 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 		decision := strategy.EvaluateExit(strategy.ExitInput{
 			Position: p, Price: price, EODReached: forceEOD,
 		}, e.cfg)
+
+		// A partial sale at the first target. The remainder stays open, which is the
+		// whole point: the runner is what pays for the losing trades.
+		if decision.Scale {
+			if err := e.scaleOut(ctx, sess, p, price, decision); err != nil {
+				return err
+			}
+			continue
+		}
 		if !decision.Exit {
 			continue
 		}
@@ -876,29 +925,81 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 		if exitPrice <= 0 {
 			exitPrice = p.EntryPrice
 		}
-		if err := e.submit(ctx, sess, p.Symbol, "sell", p.Shares, exitPrice); err != nil {
+		if err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, exitPrice); err != nil {
 			return err
 		}
 		if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), decision.Reason); err != nil {
 			return err
 		}
+		// Total P&L, which for a scaled position is the banked profit plus the final
+		// leg — not the price move from entry to this exit.
+		pnl := p.UnrealizedDollars(exitPrice)
 		e.log.Info("exited position", "symbol", p.Symbol, "reason", decision.Reason,
-			"entry", p.EntryPrice, "exit", exitPrice,
-			"pct", fmt.Sprintf("%+.2f", p.UnrealizedPct(exitPrice)))
+			"entry", p.EntryPrice, "exit", exitPrice, "shares", p.SharesOpen,
+			"banked", p.BankedDollars, "pnl", fmt.Sprintf("%+.2f", pnl))
 		e.record(audit.PositionClosed, p.Symbol,
-			fmt.Sprintf("sold %d shares at $%.2f (%s), %+.2f%%",
-				p.Shares, exitPrice, decision.Reason, p.UnrealizedPct(exitPrice)),
+			fmt.Sprintf("sold %d shares at $%.2f (%s), %+.2f%% on the trade",
+				p.SharesOpen, exitPrice, decision.Reason,
+				pnl/(p.EntryPrice*float64(p.Shares))*100),
 			map[string]any{
-				"reason":      string(decision.Reason),
-				"shares":      p.Shares,
-				"entry_price": p.EntryPrice,
-				"exit_price":  exitPrice,
-				"peak_price":  p.PeakPrice,
-				"pnl_dollars": p.UnrealizedDollars(exitPrice),
-				"pnl_pct":     p.UnrealizedPct(exitPrice),
-				"held_for":    e.now().Sub(p.EntryTime).String(),
+				"reason":         string(decision.Reason),
+				"shares_sold":    p.SharesOpen,
+				"shares_bought":  p.Shares,
+				"entry_price":    p.EntryPrice,
+				"exit_price":     exitPrice,
+				"stop_price":     p.StopPrice,
+				"peak_price":     p.PeakPrice,
+				"banked_earlier": p.BankedDollars,
+				"pnl_dollars":    pnl,
+				"r_multiple":     p.RMultiple(exitPrice),
+				"held_for":       e.now().Sub(p.EntryTime).String(),
 			})
 	}
+	return nil
+}
+
+// scaleOut banks part of a winning position and, when configured, lifts the stop on
+// what is left to the entry price.
+//
+// The sell is submitted before the store is updated, and a store refusal afterwards
+// is treated as benign rather than fatal: ErrScaleOutNotApplicable means another tick
+// already banked this target, which is exactly what the latch exists to prevent.
+func (e *Engine) scaleOut(ctx context.Context, sess scheduler.Session, p domain.Position,
+	price float64, decision strategy.ExitDecision) error {
+
+	if err := e.submit(ctx, sess, p.Symbol, "sell", decision.ScaleShares, price); err != nil {
+		// One symbol failing to scale must not abort the pass over the others; the
+		// position simply stays whole and the target is re-tested next tick.
+		e.log.Warn("scale-out order rejected", "symbol", p.Symbol, "err", err)
+		return nil
+	}
+	if err := e.store.ScaleOut(p.ID, decision.ScaleShares, price, decision.NewStop); err != nil {
+		if errors.Is(err, store.ErrScaleOutNotApplicable) {
+			e.log.Warn("scale-out already recorded", "symbol", p.Symbol)
+			return nil
+		}
+		return err
+	}
+
+	banked := (price - p.EntryPrice) * float64(decision.ScaleShares)
+	remaining := p.SharesOpen - decision.ScaleShares
+	e.log.Info("scaled out", "symbol", p.Symbol, "shares", decision.ScaleShares,
+		"price", price, "remaining", remaining, "banked", fmt.Sprintf("%+.2f", banked),
+		"r", fmt.Sprintf("%.2f", p.RMultiple(price)))
+	e.record(audit.PositionScaledOut, p.Symbol,
+		fmt.Sprintf("sold %d of %d shares at $%.2f (%.1fR), %d left running",
+			decision.ScaleShares, p.SharesOpen, price, p.RMultiple(price), remaining),
+		map[string]any{
+			"reason":          string(domain.ExitScaleOut),
+			"shares_sold":     decision.ScaleShares,
+			"shares_left":     remaining,
+			"price":           price,
+			"entry_price":     p.EntryPrice,
+			"banked_dollars":  banked,
+			"r_multiple":      p.RMultiple(price),
+			"stop_moved_to":   decision.NewStop,
+			"initial_risk_ps": p.InitialRisk,
+		})
 	return nil
 }
 

@@ -45,7 +45,7 @@ scheduler: market opens
   -> scheduler: force-exit any remaining open positions at T-30min-before-close
 ```
 
-`web` runs alongside this the whole time, independently reading `store` to render status — it never blocks or is blocked by the trading loop, and it makes no market-data calls of its own: the loop persists each position's last mark, so the ~12s page poll costs nothing upstream.
+`web` runs alongside this the whole time, independently reading `store` to render status — it never blocks or is blocked by the trading loop, and it makes no broker calls of its own: the loop persists each position's last mark, so the ~12s page poll costs nothing upstream. The account balance reaches the page the same way. Every tick reads `broker.Account` and publishes the result on the engine (`engine.Account`, alongside `Session` and `NextSession`), so the figure is refreshed once per tick — bounded by the loop — rather than once per page poll by every open browser.
 
 The page is not purely passive any more: `engine.CheckSentiment` and
 `engine.ScreenNow` back the two manual buttons. Both share code with the automated

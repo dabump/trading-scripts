@@ -328,6 +328,24 @@ setInterval(refresh, POLL_MS);
 </div>
 
 <section class="card" style="margin-bottom:16px">
+  <h2>Account
+    <span class="meta">
+      {{if .ShowAccount}}as of {{.AccountAsOf}} ET · sizing spends cash, not buying power{{end}}
+    </span>
+  </h2>
+  {{if .ShowAccount}}
+  <div class="totals" style="border-top:none">
+    <div><span class="label">Available cash</span><span class="value">{{.AccountCash}}</span></div>
+    <div><span class="label">Equity</span><span class="value">{{.AccountEquity}}</span></div>
+    <div><span class="label">Portfolio value</span><span class="value">{{.AccountPortfolio}}</span></div>
+  </div>
+  {{if .AccountNote}}<div class="body"><p class="note warn">▲ {{.AccountNote}}</p></div>{{end}}
+  {{else}}
+  <div class="body"><p class="note">{{.AccountNote}}</p></div>
+  {{end}}
+</section>
+
+<section class="card" style="margin-bottom:16px">
   <h2>Open positions <span class="meta">{{.ExposureText}}</span></h2>
   {{if .Positions}}
   <table>

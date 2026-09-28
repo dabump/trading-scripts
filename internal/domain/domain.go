@@ -71,6 +71,19 @@ type Account struct {
 	Equity         float64
 }
 
+// AccountSnapshot is an account reading with the moment it was taken.
+//
+// The status page shows the broker balance, but the web layer does not call the
+// broker: a page poll must not cost an API request. The trading loop therefore reads
+// the account on its own cadence and publishes the result here, and the page renders
+// it with its age. Known is false until the first successful read — the page then
+// shows nothing rather than a zero balance, which would read as a drained account.
+type AccountSnapshot struct {
+	Account Account
+	At      time.Time
+	Known   bool
+}
+
 // Snapshot is the per-symbol market data the screener needs.
 type Snapshot struct {
 	Symbol      string

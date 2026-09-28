@@ -25,11 +25,13 @@ type stubEngine struct {
 	tradingDay bool
 	next       scheduler.Session
 	nextKnown  bool
+	account    domain.AccountSnapshot
 }
 
 func (s *stubEngine) State() (domain.AgentState, string)     { return s.state, s.errMsg }
 func (s *stubEngine) Session() (scheduler.Session, bool)     { return s.session, s.tradingDay }
 func (s *stubEngine) NextSession() (scheduler.Session, bool) { return s.next, s.nextKnown }
+func (s *stubEngine) Account() domain.AccountSnapshot        { return s.account }
 
 // stubActions stands in for the engine's manual checks.
 type stubActions struct {
@@ -103,6 +105,11 @@ func newFixture(t *testing.T) *fixture {
 				Open:  time.Date(2026, 9, 29, 9, 30, 0, 0, scheduler.ET),
 				Close: time.Date(2026, 9, 29, 16, 0, 0, 0, scheduler.ET)},
 			nextKnown: true,
+			account: domain.AccountSnapshot{
+				Account: domain.Account{PortfolioValue: 25_143.71, Cash: 12_000, Equity: 25_143.71},
+				At:      time.Date(2026, 9, 28, 10, 59, 45, 0, scheduler.ET),
+				Known:   true,
+			},
 		},
 	}
 
@@ -260,6 +267,49 @@ func TestOpenPositionsShowLivePnL(t *testing.T) {
 	}
 	if !strings.Contains(body, "1 of 3 slots") {
 		t.Error("exposure summary missing")
+	}
+}
+
+// The balance comes from the engine's cached reading, never from a broker call in
+// the handler, so what the page shows is whatever the last tick published.
+func TestAccountBalanceRendersFromEngineSnapshot(t *testing.T) {
+	f := newFixture(t)
+
+	_, body := f.get(t, "/")
+	for _, want := range []string{
+		"Available cash", "$12,000.00",
+		"Equity", "$25,143.71",
+		"as of 10:59:45 ET",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("account panel missing %q", want)
+		}
+	}
+
+	// A reading the tick has stopped refreshing is labelled rather than presented as
+	// current: the scan interval is a minute here, so twenty minutes is a fault.
+	f.now = time.Date(2026, 9, 28, 11, 20, 0, 0, scheduler.ET)
+	_, body = f.get(t, "/")
+	if !strings.Contains(body, "not refreshed since 10:59:45 ET") {
+		t.Error("a stale balance must say so")
+	}
+	if !strings.Contains(body, "$12,000.00") {
+		t.Error("a stale balance is still the last known one and should stay visible")
+	}
+}
+
+// Before the first successful read there is no balance to show, and a zero would
+// read as a drained account.
+func TestAccountBalanceAbsentUntilRead(t *testing.T) {
+	f := newFixture(t)
+	f.eng.account = domain.AccountSnapshot{}
+
+	_, body := f.get(t, "/")
+	if strings.Contains(body, "Available cash") {
+		t.Error("no balance figures should be rendered before the first read")
+	}
+	if !strings.Contains(body, "has not read the account balance yet") {
+		t.Error("the absence should be explained")
 	}
 }
 

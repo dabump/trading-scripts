@@ -85,6 +85,36 @@ candidate — bought (with size and price), or why not: the position cap, alread
 holding it, already traded today, insufficient cash. Qualifying is not the same as
 being bought, and without this the reason lived only in the log.
 
+## Account section
+
+A strip above the open positions showing the broker account as the trading loop last
+read it: **available cash**, **equity** and **portfolio value**, with the time of the
+reading beside the heading. Cash is labelled "available" and called out as what
+sizing spends, because `risk.SizeForRisk` caps a position against `cash` — not
+against buying power, which on a margin account is the larger and more flattering
+number.
+
+Two properties of this panel are deliberate:
+
+- **The figure comes from the engine, not from the handler.** The web layer makes no
+  broker calls (see [`architecture.md`](./architecture.md)); the tick reads the
+  account and publishes a snapshot the page renders. So the refresh rate is one per
+  tick regardless of how many browsers are open, and a page poll still costs nothing
+  upstream. The entry path's per-candidate account read publishes too — it is taken
+  after any earlier fill in the same pass, so on a pass that buys more than once the
+  balance moves with the cash instead of only on the next tick.
+- **Missing and stale are distinguished from zero.** Before the first successful read
+  the panel says so instead of rendering `$0.00`, which would read as a drained
+  account. After three scan intervals without a new reading — the tick refreshes every
+  loop, so that is the account endpoint failing, not slow polling — the last known
+  balance stays visible with a warning that it is no longer being refreshed. A failed
+  read never faults the agent: the balance is display-only, and the trading path reads
+  the account for itself before it sizes anything.
+
+Balances are printed with thousands separators, unlike the per-share prices
+elsewhere on the page: these are the only figures large enough to be misread by a
+factor of ten at a glance.
+
 ## Open positions section
 
 | Ticker | Purchase price | Shares | Current price | Unrealized P&L ($ and %) |

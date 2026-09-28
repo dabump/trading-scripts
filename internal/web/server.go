@@ -29,6 +29,9 @@ type StateSource interface {
 	// NextSession is the first session after today, for the countdown to the next
 	// open. The web layer cannot ask the broker itself, so the engine caches it.
 	NextSession() (scheduler.Session, bool)
+	// Account is the last balance the trading loop read, for the same reason: the
+	// page shows the broker's cash without a page poll costing an API call.
+	Account() domain.AccountSnapshot
 }
 
 // Actions are the manually triggered checks behind the page's two buttons. Both
@@ -255,7 +258,7 @@ func (s *Server) view() (*View, error) {
 	sess, tradingDay := s.engine.Session()
 	next, nextKnown := s.engine.NextSession()
 	return BuildView(s.cfg, s.store, state, errMsg, sess, tradingDay, next, nextKnown,
-		s.now(), s.paper)
+		s.engine.Account(), s.now(), s.paper)
 }
 
 // render writes to a buffer first so a template error produces a clean 500

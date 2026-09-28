@@ -57,6 +57,9 @@ type Engine struct {
 	nextSession      scheduler.Session
 	nextSessionKnown bool
 	lastScan         time.Time
+	// account is the last balance read from the broker, for the status page. The web
+	// layer cannot ask the broker itself, so the tick publishes it here.
+	account domain.AccountSnapshot
 
 	// The tradable universe barely changes within a day, so it is fetched once per
 	// session rather than on every one-minute scan.
@@ -115,6 +118,43 @@ func (e *Engine) NextSession() (scheduler.Session, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.nextSession, e.nextSessionKnown
+}
+
+// Account returns the last balance read from the broker, for the status page.
+//
+// Not known is a normal outcome — before the first tick, or while the account
+// endpoint is failing — and callers render nothing rather than a zero balance.
+func (e *Engine) Account() domain.AccountSnapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.account
+}
+
+// publishAccount caches a balance the tick has just read.
+func (e *Engine) publishAccount(acct domain.Account) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.account = domain.AccountSnapshot{Account: acct, At: e.now(), Known: true}
+}
+
+// refreshAccount updates the balance the page shows.
+//
+// It runs on every tick, including outside market hours: one request per tick is
+// negligible beside the scan's ~130, and it is what keeps the figure current when
+// the market is closed and nothing else talks to the broker.
+//
+// A failure is display-only and never faults the agent — the trading path reads the
+// account for itself before it sizes anything, and faults there. The previous
+// snapshot is kept with its own timestamp, so the page reports an aging balance
+// rather than losing it. Logged at debug because it would otherwise repeat on every
+// tick for as long as the endpoint is unhappy.
+func (e *Engine) refreshAccount(ctx context.Context) {
+	acct, err := e.trading.Account(ctx)
+	if err != nil {
+		e.log.Debug("account balance unavailable", "err", err)
+		return
+	}
+	e.publishAccount(acct)
 }
 
 func (e *Engine) setState(s domain.AgentState) {
@@ -358,6 +398,10 @@ func (e *Engine) loadSession(ctx context.Context) (scheduler.Session, bool, erro
 
 // Tick performs one iteration: it works out the phase and does whatever is due.
 func (e *Engine) Tick(ctx context.Context) {
+	// Ahead of the session load, so a failing calendar lookup does not also take the
+	// balance off the page.
+	e.refreshAccount(ctx)
+
 	sess, tradingDay, err := e.loadSession(ctx)
 	if err != nil {
 		e.fail("load session", err)
@@ -806,6 +850,10 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 				map[string]any{"reason": "account unavailable", "error": err.Error()})
 			continue
 		}
+		// The page gets this read for free. It is taken after any earlier candidate in
+		// the same pass has been filled, so on a multi-buy pass the balance moves as
+		// the cash goes rather than only on the next tick.
+		e.publishAccount(acct)
 
 		sizing := risk.SizeForRisk(acct, price, setup.Stop, e.cfg)
 		if !sizing.OK {

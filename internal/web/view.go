@@ -130,6 +130,18 @@ type View struct {
 	ScreenTakenAt string
 	ScreenNote    string
 
+	// The account block is the broker's own balance, as the trading loop last read
+	// it. ShowAccount is false until the first successful read, where AccountNote
+	// explains the absence — a zero cash figure would read as a drained account
+	// rather than as missing data. AccountNote also carries the staleness warning
+	// when the reading has stopped being refreshed.
+	ShowAccount      bool
+	AccountCash      string
+	AccountEquity    string
+	AccountPortfolio string
+	AccountAsOf      string
+	AccountNote      string
+
 	Positions     []PositionRow
 	ExposureText  string
 	PositionsNote string
@@ -197,7 +209,26 @@ func countdown(now time.Time, sess scheduler.Session, tradingDay bool,
 	return "", ""
 }
 
+// staleAfter is how old the account balance may be before the page says so.
+//
+// The engine ticks at least once per scan interval (engine.Run takes the shorter of
+// the two poll intervals) and refreshes the balance on every tick, so three scan
+// intervals without a new reading is not slow polling — it is the account endpoint
+// failing. Zero when the interval is unset, which suppresses the warning rather than
+// declaring every reading stale.
+func staleAfter(cfg *config.Config) time.Duration {
+	if cfg.Timing.ScreenerScanInterval <= 0 {
+		return 0
+	}
+	return 3 * cfg.Timing.ScreenerScanInterval
+}
+
 func money(v float64) string { return fmt.Sprintf("$%.2f", v) }
+
+// accountMoney is money with thousands separators. Account balances are the page's
+// largest figures by a couple of orders of magnitude, and "$25143.71" is the one
+// number here that is easy to misread by a factor of ten at a glance.
+func accountMoney(v float64) string { return "$" + groupDigits(fmt.Sprintf("%.2f", v)) }
 
 func signedMoney(v float64) string { return fmt.Sprintf("%+.2f", v) }
 
@@ -216,7 +247,8 @@ func toneForPnL(v float64) string {
 
 // BuildView assembles the page from stored state. It deliberately takes no
 // market-data dependency: the trading loop persists each position's last mark, so
-// a 12-second poll cannot multiply API calls.
+// a 12-second poll cannot multiply API calls. The account balance arrives the same
+// way — as a snapshot the engine already read, not as a broker call from here.
 func BuildView(
 	cfg *config.Config,
 	st *store.Store,
@@ -226,6 +258,7 @@ func BuildView(
 	tradingDay bool,
 	next scheduler.Session,
 	nextKnown bool,
+	acct domain.AccountSnapshot,
 	now time.Time,
 	paperMode bool,
 ) (*View, error) {
@@ -343,6 +376,23 @@ func BuildView(
 	}
 	if len(v.ScreenRows) == 0 {
 		v.ScreenNote = "No screening pass has run yet for this session."
+	}
+
+	v.ShowAccount = acct.Known
+	if acct.Known {
+		v.AccountCash = accountMoney(acct.Account.Cash)
+		v.AccountEquity = accountMoney(acct.Account.Equity)
+		v.AccountPortfolio = accountMoney(acct.Account.PortfolioValue)
+		v.AccountAsOf = acct.At.In(scheduler.ET).Format("15:04:05")
+		// The tick refreshes this every loop, and the loop runs at most one scan
+		// interval apart, so several intervals of silence means the account endpoint
+		// is failing and the figure is only the last one that arrived.
+		if stale := staleAfter(cfg); stale > 0 && now.Sub(acct.At) > stale {
+			v.AccountNote = fmt.Sprintf("not refreshed since %s ET — the balance shown is the last one read",
+				v.AccountAsOf)
+		}
+	} else {
+		v.AccountNote = "The agent has not read the account balance yet."
 	}
 
 	open, err := st.OpenPositions()
@@ -628,7 +678,11 @@ func trimNumber(v float64) string {
 // only inserts separators — it never rounds, so the exactness trimNumber exists to
 // preserve still holds.
 func groupNumber(v float64) string {
-	s := trimNumber(v)
+	return groupDigits(trimNumber(v))
+}
+
+// groupDigits inserts thousands separators into an already-formatted number.
+func groupDigits(s string) string {
 	intPart, frac := s, ""
 	if i := strings.IndexByte(s, '.'); i >= 0 {
 		intPart, frac = s[:i], s[i:]

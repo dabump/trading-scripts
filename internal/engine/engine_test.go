@@ -231,6 +231,11 @@ func TestFullBullishDay(t *testing.T) {
 	if !pos[0].TargetHit {
 		t.Error("the target must latch so it cannot be banked twice")
 	}
+	// The balance the status page shows tracks the account: the buy consumed cash, and
+	// the next tick's refresh picked that up.
+	if snap := h.eng.Account(); !snap.Known || snap.Account.Cash >= 100_000 {
+		t.Errorf("published balance = %+v, want the cash the buy consumed", snap)
+	}
 	if pos[0].BankedDollars <= 0 {
 		t.Errorf("banked = %v, want the scale-out profit recorded", pos[0].BankedDollars)
 	}
@@ -505,6 +510,41 @@ func TestClosedDayDoesNothing(t *testing.T) {
 	}
 	if _, known := h.eng.Session(); known {
 		t.Error("a closed day must not report a tradable session")
+	}
+}
+
+// The status page cannot call the broker, so the balance it shows is whatever the
+// tick published — including on a day the exchange never opens, which is when
+// nothing else in the tick talks to the broker at all.
+func TestTickPublishesAccountBalance(t *testing.T) {
+	h := newHarness(t)
+
+	if snap := h.eng.Account(); snap.Known {
+		t.Error("no balance should be known before the first tick")
+	}
+
+	h.fake.SetCalendar(broker.CalendarDay{}) // no session today
+	h.at(11, 0)
+	h.tick()
+
+	snap := h.eng.Account()
+	if !snap.Known {
+		t.Fatal("the tick should publish a balance even with the exchange closed")
+	}
+	if snap.Account.Cash != 100_000 || snap.Account.Equity != 100_000 {
+		t.Errorf("published balance = %+v, want the broker's $100k", snap.Account)
+	}
+	if !snap.At.Equal(h.now) {
+		t.Errorf("reading timestamped %s, want %s", snap.At, h.now)
+	}
+
+	// A failing account endpoint keeps the last reading rather than blanking it, and
+	// does not fault the agent: the balance is display-only.
+	h.fake.SetError(errors.New("account 503"))
+	h.at(11, 1)
+	h.eng.Tick(context.Background())
+	if again := h.eng.Account(); !again.Known || !again.At.Equal(snap.At) {
+		t.Errorf("failed refresh should leave the previous reading untouched, got %+v", again)
 	}
 }
 

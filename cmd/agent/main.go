@@ -106,6 +106,19 @@ func run() error {
 			"sentiment_window", cfg.Timing.SentimentWindow,
 			"scan_interval", cfg.Timing.ScreenerScanInterval)
 
+		// Pre-market cannot be compressed the way the rest is: its start is a wall
+		// clock time in exchange hours, not an offset from the open. So it is moved to
+		// now instead, and seedFake pushes the simulated open a little into the future
+		// — which is what makes the demo start in PRE_MARKET and walk through the new
+		// state rather than skipping straight past it. Left alone when the config has
+		// pre-market off, so the switch still means something offline.
+		if cfg.PreMarket.Enabled {
+			cfg.PreMarket.Start = time.Now().In(scheduler.ET).Format("15:04")
+			cfg.PreMarket.ScanInterval = 5 * time.Second
+			logger.Warn("offline mode: pre-market opened at the current clock time",
+				"start", cfg.PreMarket.Start, "scan_interval", cfg.PreMarket.ScanInterval)
+		}
+
 		fake := seedFake(time.Now(), cfg)
 		data, trading = fake, fake
 	} else {
@@ -313,8 +326,15 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	// whatever the wall clock says. With the compressed timings set by the caller
 	// this yields a ~30s sentiment window, ~4.5 minutes of trading, then the EOD
 	// window.
+	//
+	// The open is pushed forward when pre-market is on, so the demo opens in
+	// PRE_MARKET and the new state is actually observable; the caller has already
+	// moved the pre-market start to now for the same reason.
 	open := now
-	close := now.Add(20 * time.Minute)
+	if cfg.PreMarket.Enabled {
+		open = now.Add(90 * time.Second)
+	}
+	close := open.Add(20 * time.Minute)
 
 	fake := broker.NewFake(domain.Account{
 		PortfolioValue: 100_000, Cash: 100_000, Equity: 100_000,
@@ -339,10 +359,15 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	// A handful of symbols standing in for the tradable universe: one qualifies, one
 	// fails on news only, and one never clears the move threshold — so the screening
 	// table shows each outcome.
+	// Pre-market volume is a separate reading from the snapshot's, because before the
+	// bell the snapshot has none — see broker.SessionVolumes. Seeding it is what makes
+	// the demo's pre-market phase show a candidate table rather than an empty one.
 	fake.SetSnapshot("FLAT", 10.00, 9.95, 800_000)
+	fake.SetSessionVolume("FLAT", 400_000)
 	fake.SetAverageVolume("FLAT", 750_000)
 
 	fake.SetSnapshot("DEMO", 4.56, 4.00, 6_100_000)
+	fake.SetSessionVolume("DEMO", 900_000)
 	fake.SetAverageVolume("DEMO", 1_000_000)
 	fake.SetNews("DEMO", 2)
 	// Clearing the screen is no longer enough to be bought: the chart has to print a
@@ -352,10 +377,12 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	// SETUPLESS clears every screening criterion but never sets up, which is the
 	// common real-world case and the one the page's Action column exists to explain.
 	fake.SetSnapshot("SETUPLESS", 3.40, 3.00, 7_000_000)
+	fake.SetSessionVolume("SETUPLESS", 1_000_000)
 	fake.SetAverageVolume("SETUPLESS", 1_100_000)
 	fake.SetNews("SETUPLESS", 1)
 
 	fake.SetSnapshot("NONEWS", 2.30, 2.06, 5_400_000)
+	fake.SetSessionVolume("NONEWS", 800_000)
 	fake.SetAverageVolume("NONEWS", 1_000_000)
 	fake.SetNews("NONEWS", 0)
 

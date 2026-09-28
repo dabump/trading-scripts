@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/martincoetzee/trading-agent/internal/domain"
+	"github.com/martincoetzee/trading-agent/internal/scheduler"
 	"github.com/martincoetzee/trading-agent/internal/screener"
 	"github.com/martincoetzee/trading-agent/internal/sentiment"
 )
@@ -34,6 +35,23 @@ func (e *Engine) CheckSentiment(ctx context.Context) (domain.SentimentCheck, err
 	}
 	defer e.manual.sentiment.Unlock()
 
+	check, err := e.readSentiment(ctx)
+	if err != nil {
+		return domain.SentimentCheck{}, err
+	}
+	e.log.Info("manual sentiment check", "classification", check.Classification,
+		"percentages", check.Percentages, "persisted", false)
+	return check, nil
+}
+
+// readSentiment classifies the basket as it stands right now, without storing
+// anything.
+//
+// Two callers share it and both depend on it not persisting: the page's button,
+// which must not be able to overturn the session's gate with a click, and the
+// pre-market pass, which stands this in for a gate that has not run yet. Storing
+// either would change what resolveGate judges the session on.
+func (e *Engine) readSentiment(ctx context.Context) (domain.SentimentCheck, error) {
 	snaps, err := e.data.Snapshots(ctx, e.cfg.Sentiment.Symbols)
 	if err != nil {
 		return domain.SentimentCheck{}, fmt.Errorf("snapshots: %w", err)
@@ -55,15 +73,12 @@ func (e *Engine) CheckSentiment(ctx context.Context) (domain.SentimentCheck, err
 		pcts[sym] = pct
 	}
 
-	check := domain.SentimentCheck{
+	return domain.SentimentCheck{
 		TakenAt:        e.now(),
 		Percentages:    pcts,
 		Classification: sentiment.Classify(pcts, e.cfg),
 		Missing:        missing,
-	}
-	e.log.Info("manual sentiment check", "classification", check.Classification,
-		"percentages", pcts, "persisted", false)
-	return check, nil
+	}, nil
 }
 
 // ScreenNow evaluates the candidate universe on demand and returns what it found.
@@ -85,16 +100,27 @@ func (e *Engine) ScreenNow(ctx context.Context) (domain.ScreenPreview, error) {
 	now := e.now()
 	sess, tradingDay := e.Session()
 
+	// The button reports what the agent would find at this moment, so it has to judge
+	// by the numbers that are in force at this moment: pre-market thresholds while
+	// pre-market, regular ones otherwise. Deriving it from the phase rather than a
+	// separate rule keeps the preview honest about which screen it just ran — the
+	// whole promise of this path is that a row it calls qualifying is one the
+	// automated scan would act on.
+	bounds := scheduler.Bounds(sess, e.cfg)
+	preMarket := tradingDay && scheduler.PhaseAt(now, bounds) == domain.PhasePreMarket
+	th := screener.ThresholdsFor(e.cfg, preMarket)
+
 	// The same catalyst window as the automated scan, which is relative to now and
-	// therefore works just as well with the exchange closed.
-	inputs, universe, err := e.gatherCandidates(ctx, e.newsSince())
+	// therefore works just as well with the exchange closed. The session start is
+	// where a pre-market pass sums its volume from, and is unused otherwise.
+	inputs, universe, err := e.gatherCandidates(ctx, e.newsSince(), th, bounds.PreMarketOpen)
 	if err != nil {
 		return domain.ScreenPreview{}, err
 	}
 
 	evals := make([]domain.Evaluation, 0, len(inputs))
 	for _, in := range inputs {
-		evals = append(evals, screener.Evaluate(in, e.cfg))
+		evals = append(evals, screener.Evaluate(in, th))
 	}
 
 	marketOpen := tradingDay && !now.Before(sess.Open) && now.Before(sess.Close)
@@ -105,6 +131,7 @@ func (e *Engine) ScreenNow(ctx context.Context) (domain.ScreenPreview, error) {
 		MarketOpen:   marketOpen,
 	}
 	e.log.Info("manual screening pass", "universe_scanned", universe,
-		"evaluated", len(evals), "market_open", marketOpen, "orders_placed", 0)
+		"evaluated", len(evals), "market_open", marketOpen, "pre_market", preMarket,
+		"orders_placed", 0)
 	return preview, nil
 }

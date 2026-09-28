@@ -93,6 +93,13 @@ type funnel struct {
 // prepare applies the sentiment gate and the three screening criteria to every
 // session, leaving the exit rules to simulate.
 func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[string]float64) []*preparedDay {
+	// Regular-session thresholds, because that is the only session this measures. The
+	// bars fetched here are 09:30-16:00; pre-market screening (config premarket.*)
+	// runs on a tape this backtest has no data for, so its own thresholds are
+	// deliberately not exercised rather than being measured against the wrong bars.
+	// See the open item in docs/decisions.md.
+	th := screener.ThresholdsFor(cfg, false)
+
 	out := make([]*preparedDay, 0, len(days))
 	for _, day := range days {
 		sess, ok := sessionFor(day.Date)
@@ -185,7 +192,7 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 				}
 				price := bar.O
 				vol := cumVol[sym]
-				if ok, _ := screener.Tradable(price, price*vol, cfg); !ok {
+				if ok, _ := screener.Tradable(price, price*vol, th); !ok {
 					continue
 				}
 				seen[sym].tradable = true
@@ -197,7 +204,7 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 					AvgVolume:   cd.AvgVolume,
 					NewsCount:   newsCount(day.News[sym], t, cfg.Screening.NewsLookback),
 				}
-				e := screener.Evaluate(in, cfg)
+				e := screener.Evaluate(in, th)
 				for _, c := range e.Criteria {
 					if !c.Pass {
 						continue

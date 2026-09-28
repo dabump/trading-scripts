@@ -52,6 +52,36 @@ func TestLoadShippedConfig(t *testing.T) {
 		t.Errorf("tradability floors = $%v / $%v, both must be set",
 			c.Screening.MinPrice, c.Screening.MinDollarVolume)
 	}
+	// The state is a claim about what the exchange is doing, so coverage has to start
+	// when the exchange's pre-market does. Shipped at 07:00 once, which meant an agent
+	// started at 06:15 ET sat in MARKET_CLOSED while the tape was trading — it looked
+	// like the feature was broken, and from the operator's side it was.
+	if c.PreMarket.Enabled {
+		hour, minute, err := c.PreMarket.StartClock()
+		if err != nil {
+			t.Fatalf("premarket.start: %v", err)
+		}
+		if hour*60+minute > 4*60 {
+			t.Errorf("premarket.start = %s, want 04:00 or earlier — the US pre-market session opens at 04:00 ET, and a later start reports MARKET_CLOSED while the market is in pre-market",
+				c.PreMarket.Start)
+		}
+	}
+	// Pre-market thresholds have to be looser than the regular-session ones, or the
+	// pre-market screen never returns anything and the feature only looks enabled.
+	if c.PreMarket.Enabled {
+		if c.PreMarket.MinDollarVolume >= c.Screening.MinDollarVolume {
+			t.Errorf("premarket.min_dollar_volume $%v is not below the regular $%v floor, so the pre-market screen cannot fill",
+				c.PreMarket.MinDollarVolume, c.Screening.MinDollarVolume)
+		}
+		if c.PreMarket.MinVolumeMultiple >= c.Screening.MinVolumeMultiple {
+			t.Errorf("premarket.min_volume_multiple %vx is not below the regular %vx, which no pre-market session reaches",
+				c.PreMarket.MinVolumeMultiple, c.Screening.MinVolumeMultiple)
+		}
+		if c.PreMarket.ScanInterval < c.Timing.ScreenerScanInterval {
+			t.Errorf("premarket.scan_interval %s is faster than the regular %s; one pass is ~130 requests",
+				c.PreMarket.ScanInterval, c.Timing.ScreenerScanInterval)
+		}
+	}
 	// The full consolidated tape, without which the volume criterion is meaningless.
 	if c.MarketData.Feed != "sip" {
 		t.Errorf("feed = %q, want sip", c.MarketData.Feed)
@@ -98,6 +128,15 @@ func valid() *Config {
 	c.Storage = Storage{DatabasePath: "data/agent.db"}
 	c.Audit = Audit{Directory: "logs"}
 	return c
+}
+
+// enabledPreMarket is a pre-market section that passes validation, so a test case
+// can mutate the one field it is about.
+func enabledPreMarket() PreMarket {
+	return PreMarket{
+		Enabled: true, Start: "07:00", ScanInterval: 5 * time.Minute,
+		MinDollarVolume: 100_000, MinVolumeMultiple: 0.5,
+	}
 }
 
 func TestValidate(t *testing.T) {
@@ -198,6 +237,107 @@ func TestValidate(t *testing.T) {
 			"the free IEX feed is accepted, with its caveats left to the operator",
 			func(c *Config) { c.MarketData.Feed = "iex" },
 			"",
+		},
+		{
+			// Nothing in the section is read while it is off, so a disabled pre-market
+			// must not be able to fail start-up over numbers nobody will use.
+			"a disabled pre-market is not validated",
+			func(c *Config) {
+				c.PreMarket = PreMarket{Start: "nonsense", ScanInterval: -1}
+			},
+			"",
+		},
+		{
+			"an enabled pre-market is valid",
+			func(c *Config) { c.PreMarket = enabledPreMarket() },
+			"",
+		},
+		{
+			"a pre-market start that is not a clock time is rejected",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.Start = "7am"
+			},
+			"premarket.start",
+		},
+		{
+			// A start at or after the bell leaves no pre-market at all, which would
+			// read as the feature being broken rather than misconfigured.
+			"a pre-market start at the regular open is rejected",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.Start = "09:30"
+			},
+			"must be before the 09:30 regular open",
+		},
+		{
+			"a pre-market with no scan cadence is rejected",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.ScanInterval = 0
+			},
+			"premarket.scan_interval",
+		},
+		{
+			// Left at zero the thresholds would admit everything, which on the
+			// pre-market tape means every illiquid name in the market.
+			"pre-market thresholds must be set",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.MinDollarVolume = 0
+				c.PreMarket.MinVolumeMultiple = 0
+			},
+			"premarket.min_dollar_volume",
+		},
+		{
+			// Pre-market orders are always limit orders, so enabling pre-market entry
+			// must not drag the regular session off market orders with it — that would
+			// be an unrelated change to how the rest of the day trades.
+			"pre-market entry does not require limit orders in the regular session",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.AllowEntry = true
+				c.PreMarket.LimitSlipPct = 1
+				c.Execution = Execution{OrderType: "market"}
+			},
+			"",
+		},
+		{
+			// A limit order with no allowance has no price to be limited to.
+			"pre-market entry with no limit allowance anywhere is rejected",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.AllowEntry = true
+				c.Execution = Execution{OrderType: "market"}
+			},
+			"needs a limit price allowance",
+		},
+		{
+			// Falling back to the regular allowance is what keeps the pre-market one
+			// optional rather than another thing to remember.
+			"pre-market entry falls back to the regular limit allowance",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.AllowEntry = true
+				c.Execution = Execution{OrderType: "limit", LimitSlipPct: 0.5}
+			},
+			"",
+		},
+		{
+			"a negative pre-market limit allowance is rejected",
+			func(c *Config) {
+				c.PreMarket = enabledPreMarket()
+				c.PreMarket.LimitSlipPct = -1
+			},
+			"premarket.limit_slip_pct",
+		},
+		{
+			"pre-market entry without pre-market screening is rejected",
+			func(c *Config) {
+				c.PreMarket = PreMarket{AllowEntry: true}
+				c.Execution = Execution{OrderType: "limit", LimitSlipPct: 0.5}
+			},
+			"requires premarket.enabled",
 		},
 	}
 

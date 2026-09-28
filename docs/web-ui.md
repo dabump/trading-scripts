@@ -39,7 +39,7 @@ clicks get told it is already running rather than multiplying API calls.
 
 These are distinct and shouldn't be visually merged, since the agent's status doesn't always match raw market-open/closed (e.g. market is open but the agent is in its no-trade first hour, or halted for the day on bearish sentiment):
 
-1. **Market hours badge** — simple green/red: green while the US exchange is open, red while closed. Driven directly by `scheduler`'s market-hours knowledge, not by anything the agent itself decided. It also carries a **countdown**: `closes in 4h 12m` while open, `opens in 15h 42m` while closed, with the exact target moment in the badge's tooltip.
+1. **Market hours badge** — green while the US exchange is open, **orange** while the pre-market session is running (`PRE-MARKET`), red while closed. Driven directly by `scheduler`'s market-hours knowledge, not by anything the agent itself decided. It also carries a **countdown**: `closes in 4h 12m` while open, `opens in 15h 42m` while closed, with the exact target moment in the badge's tooltip.
 
    Two things about the countdown are worth knowing. First, the "next open" is often *not* today's session — after the close, or on a weekend or holiday, it is the following session, which the engine looks up from the exchange calendar once per day and caches (`NextSession`). If that lookup fails the countdown is simply absent, because a blank is better than a wrong number. Second, the resolution stops at **minutes**: the page refreshes on a ~12s poll, so a seconds figure would advance in 12-second jumps and read as broken, and none of these boundaries is actionable to the second since the agent handles them itself.
 2. **Agent status badge** — one of the states below (the "legend"), reflecting what the agent is actually doing right now.
@@ -49,11 +49,16 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 | State | Color | Meaning |
 |---|---|---|
 | `MARKET_CLOSED` | Gray | Outside exchange hours. Daemon idle, waiting for next open. |
+| `PRE_MARKET` | Orange | The pre-market session (`premarket.start` → 09:30). Screening the early tape; the sentiment gate has not run yet, and nothing is bought unless `premarket.allow_entry` is set. |
 | `SENTIMENT_CHECK` | Amber | Market open, within the first hour. Polling every 10 minutes. No trades placed. |
 | `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates and may hold open positions. |
 | `EOD_WINDOW` | Amber | Final 30 minutes before the close. Flattening open positions; no new entries. |
 | `HALTED_BEARISH` | Red | First-hour sentiment came back overwhelmingly bearish. No trades for the rest of the session; waiting for next trading day. |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
+
+`PRE_MARKET` was added when pre-market coverage was, for the same reason `EOD_WINDOW` exists: neither of the neighbouring states is true. `MARKET_CLOSED` would report a scanning agent as idle, and `SCREENING` would imply entries are being taken when by default they are not. It gets its own orange, sitting between the grey of a closed market and the green of a trading one — and a warmer orange than the amber `SENTIMENT_CHECK`/`EOD_WINDOW` use, so the two are not read as variations of each other. With `premarket.enabled: false` the state never appears and the morning is `MARKET_CLOSED` exactly as before.
+
+The market-hours badge stays on the *regular* session throughout: during pre-market it reads `PRE-MARKET` and still counts down to 09:30, because that bell is when the sentiment gate and ordinary entries begin.
 
 `EOD_WINDOW` was added during implementation. The original five states had no way to describe the window between the forced-exit mark and the close: the market is still open, so `MARKET_CLOSED` would be untrue, and `SCREENING` would imply entries were still possible. Rather than misreport either, the window got its own state.
 

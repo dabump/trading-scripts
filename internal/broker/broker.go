@@ -27,6 +27,11 @@ type OrderRequest struct {
 	Type          string // "market" or "limit"
 	LimitPrice    float64
 	ClientOrderID string
+	// ExtendedHours routes the order to the pre- or post-market session. Alpaca
+	// only accepts it on a day limit order — a market order outside 09:30-16:00 is
+	// rejected outright — which is why config validation refuses
+	// premarket.allow_entry unless execution.order_type is limit.
+	ExtendedHours bool
 }
 
 // OrderResult is the broker's acknowledgement.
@@ -61,6 +66,19 @@ type MarketData interface {
 	AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error)
 	// NewsCounts reports how many stories each symbol has since the given time.
 	NewsCounts(ctx context.Context, symbols []string, since time.Time) (map[string]int, error)
+	// SessionVolumes reports how many shares each symbol has traded since `since`.
+	//
+	// It exists because the snapshot endpoint cannot answer this before the opening
+	// bell: verified against a live account, `dailyBar` during pre-market is still the
+	// *previous* session's bar and no daily bar for today exists yet, so a pre-market
+	// symbol's volume-so-far reads as zero. That zero fails both the dollar-volume
+	// floor and the relative-volume criterion, which is what made the pre-market
+	// screen return nothing at all.
+	//
+	// Implementations must batch: this runs on every symbol that cleared the price
+	// move, and a per-symbol call there would cost more than the rest of the scan
+	// combined.
+	SessionVolumes(ctx context.Context, symbols []string, since time.Time) (map[string]float64, error)
 	// IntradayBars returns this session's candles for one symbol, oldest first, at
 	// the given interval and starting no earlier than `since`.
 	//

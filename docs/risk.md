@@ -27,7 +27,8 @@
 ## Daily kill switch
 
 - If the first-hour sentiment read comes back overwhelmingly bearish, no trades are placed for the rest of that session. The agent waits for the next trading day. The verdict is persisted, so a restart does not re-open a halted day.
-- Open positions are still monitored while halted: the kill switch stops new entries, it does not abandon anything already held. (In practice nothing can be open when the gate halts, since no entries happen during the first hour — but a restart that adopted a broker position is the case where this matters.)
+- Open positions are still monitored while halted: the kill switch stops new entries, it does not abandon anything already held. (In practice nothing can be open when the gate halts, since no entries happen during the first hour — but a restart that adopted a broker position, or a pre-market entry, are the cases where this matters.)
+- **The kill switch does not cover pre-market, because it cannot.** Its readings are taken after the open, so anything before the bell necessarily predates the verdict. Pre-market screening is unaffected — it buys nothing by itself — but `premarket.allow_entry` trades with the switch nonexistent rather than merely off. A live sentiment read through the same classifier stands in for it (`docs/strategy.md` §1 and §2b); one sample is a weaker guarantee than a window of them, which is why `allow_entry` defaults to false. A position opened pre-market is then covered by everything else in this document from the moment it exists: the same stop, the same sizing, the same forced end-of-day exit.
 - This is a pre-emptive halt (based on sentiment, before any position is opened) — distinct from the per-trade stop-loss, which protects an already-open position.
 
 ## End-of-day exit

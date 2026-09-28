@@ -37,13 +37,21 @@ func stubAlpaca(t *testing.T, routes map[string]string) *Alpaca {
 	}, "sip")
 }
 
+// sessionStamp is an RFC3339 timestamp for a bar `daysAgo` exchange days back,
+// stamped at 20:00 UTC the way Alpaca stamps a daily bar. The dates have to be
+// relative to the clock, because which bar counts as "today" is exactly what the
+// decoder reads them for.
+func sessionStamp(daysAgo int) string {
+	return time.Now().In(ET()).AddDate(0, 0, -daysAgo).Format("2006-01-02") + "T20:00:00Z"
+}
+
 func TestSnapshotsDecoding(t *testing.T) {
 	a := stubAlpaca(t, map[string]string{
 		"/v2/stocks/snapshots": `{
 			"ABCD": {
 				"latestTrade": {"p": 4.56},
-				"dailyBar": {"c": 4.50, "v": 6100000, "t": "2026-09-28T20:00:00Z"},
-				"prevDailyBar": {"c": 4.00, "v": 900000, "t": "2026-09-25T20:00:00Z"}
+				"dailyBar": {"c": 4.50, "v": 6100000, "t": "` + sessionStamp(0) + `"},
+				"prevDailyBar": {"c": 4.00, "v": 900000, "t": "` + sessionStamp(3) + `"}
 			}
 		}`,
 	})
@@ -345,5 +353,75 @@ func TestAverageVolumeExcludingToday(t *testing.T) {
 	}
 	if got := AverageVolumeExcludingToday(nil, 20, now); got != 0 {
 		t.Errorf("average = %v, want 0 for no data", got)
+	}
+}
+
+// Before the opening bell the daily bar may still be the previous session's, and
+// which one is "yesterday" has to be read from the bar's own date rather than from
+// its field name. Taking prevDailyBar as the reference close in that state would
+// measure every pre-market move against the close from two sessions ago — and that
+// percentage is the whole basis of the screen.
+func TestSnapshotsPreMarketReferenceClose(t *testing.T) {
+	a := stubAlpaca(t, map[string]string{
+		"/v2/stocks/snapshots": `{
+			"ABCD": {
+				"latestTrade": {"p": 5.50},
+				"dailyBar": {"c": 5.00, "v": 900000, "t": "` + sessionStamp(1) + `"},
+				"prevDailyBar": {"c": 2.00, "v": 800000, "t": "` + sessionStamp(2) + `"}
+			}
+		}`,
+	})
+	got, err := a.Snapshots(context.Background(), []string{"ABCD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := got["ABCD"]
+	if snap.PrevClose != 5.00 {
+		t.Errorf("PrevClose = %v, want 5.00 — the last completed session, not the one before it",
+			snap.PrevClose)
+	}
+	if want := 10.0; snap.IntradayPct < want-0.01 || snap.IntradayPct > want+0.01 {
+		t.Errorf("IntradayPct = %v, want ~%v (+10%% pre-market, not +175%%)", snap.IntradayPct, want)
+	}
+	// Today has printed no daily bar, so there is no volume to report for it. A
+	// stale figure would be worse: it is the numerator of the relative-volume test.
+	if snap.TodayVolume != 0 {
+		t.Errorf("TodayVolume = %v, want 0 before today's daily bar exists", snap.TodayVolume)
+	}
+}
+
+// Extended-hours routing is opt-in. Alpaca accepts the flag only on a day limit
+// order, so sending it unconditionally would break every regular-session order.
+func TestPlaceOrderExtendedHours(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		io.WriteString(w, `{"id":"o-3","status":"accepted","filled_qty":"0","filled_avg_price":""}`)
+	}))
+	defer srv.Close()
+
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
+	if _, err := a.PlaceOrder(context.Background(), OrderRequest{
+		Symbol: "ABCD", Shares: 10, Side: "buy", Type: "limit", LimitPrice: 4.5,
+		ExtendedHours: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if body["extended_hours"] != true {
+		t.Errorf("extended_hours = %v, want true", body["extended_hours"])
+	}
+	if body["time_in_force"] != "day" {
+		t.Errorf("time_in_force = %v, want day — Alpaca rejects extended hours on anything else",
+			body["time_in_force"])
+	}
+
+	body = nil
+	if _, err := a.PlaceOrder(context.Background(), OrderRequest{
+		Symbol: "ABCD", Shares: 10, Side: "buy", Type: "market",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["extended_hours"]; present {
+		t.Error("a regular-session order must not carry extended_hours at all")
 	}
 }

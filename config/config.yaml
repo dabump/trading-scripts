@@ -38,6 +38,57 @@ screening:
   # the prior evening through this morning's pre-market. PROPOSED.
   news_lookback: 18h
 
+# Pre-market: the 04:00-09:30 ET session. The same three screening criteria, run
+# against a tape carrying a few percent of regular-session volume — which is why two
+# of the numbers they are compared against have pre-market counterparts here.
+#
+# Every value below is PROPOSED. Unlike the regular-session thresholds, none of these
+# has been measured: cmd/backtest fetches 09:30-16:00 bars, so it has no pre-market
+# data to sweep. Treat a pre-market run as an observation exercise before turning
+# allow_entry on. See docs/decisions.md.
+premarket:
+  # Screening and scanning before the bell. Off means the agent behaves exactly as it
+  # did before this section existed: MARKET_CLOSED until 09:30, no requests made.
+  enabled: true
+  # The whole pre-market session. US pre-market trading opens at 04:00 ET, and this
+  # matches it so the agent's state never disagrees with what the exchange is doing —
+  # a PRE-MARKET badge that only appears for part of the pre-market period is worse
+  # than none. A later start is a supported way to trim API calls, at the cost of
+  # being blind to anything that has already moved by then.
+  start: "04:00"
+  # Deliberately slower than timing.screener_scan_interval. One pass is ~130 mostly
+  # serial requests, so 04:00-09:30 at this cadence is ~66 passes, averaging ~26
+  # requests a minute against Alpaca's 200/min — affordable, where the regular
+  # one-minute cadence would not be.
+  scan_interval: 1m
+  # Replaces screening.min_dollar_volume while pre-market. The regular $1,000,000
+  # floor is a regular-session number and rejects essentially every pre-market name,
+  # including the ones genuinely trading.
+  min_dollar_volume: 100000
+  # Replaces screening.min_volume_multiple while pre-market. The comparison is
+  # unchanged — volume so far against the 20-session daily average — but a pre-market
+  # session is a fraction of a day, so 0.5x here is a far more extreme reading than
+  # 5.0x is at 15:00.
+  min_volume_multiple: 0.5
+  # Buying before the bell. Off by default, and deliberately a separate switch from
+  # `enabled`: pre-market entry fills from a thin book and runs before the first-hour
+  # sentiment gate exists. The engine substitutes a live sentiment read for the gate,
+  # which is a weaker guarantee than the gate itself.
+  allow_entry: true
+  # Limit-price allowance on pre-market orders, in percent. Extended-hours orders are
+  # always limit orders — Alpaca accepts nothing else for that session — so
+  # execution.order_type below governs the regular session only, and this governs
+  # before the bell.
+  #
+  # Wider than the regular 0.5% because pre-market spreads on these names are several
+  # times wider, and an order that never fills is the failure mode where the feature
+  # looks enabled and silently does nothing. It applies to exits too, where not
+  # filling is the worse direction: an unfilled pre-market stop leaves the position
+  # open until the bell. PROPOSED, and the first thing to watch if orders sit
+  # unfilled or fills come in worse than expected. 0 falls back to
+  # execution.limit_slip_pct.
+  limit_slip_pct: 1.0
+
 # The setup gate: what a screened candidate has to print before it is bought. All
 # PROPOSED — these are the mechanical reading of a discretionary pattern, and the
 # numbers are the ones the strategy is usually described with, not measured optima.

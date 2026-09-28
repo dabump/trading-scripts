@@ -49,8 +49,12 @@ func (s Session) IsEarlyClose() bool {
 
 // Boundaries are the decision points within a session.
 type Boundaries struct {
-	Open         time.Time
-	FirstHourEnd time.Time
+	// PreMarketOpen is when pre-market coverage begins. It is zero when pre-market
+	// is disabled, and zero is the only signal PhaseAt needs: a session with no
+	// pre-market mark is simply closed until its open, exactly as before.
+	PreMarketOpen time.Time
+	Open          time.Time
+	FirstHourEnd  time.Time
 	// EntryWindowEnd is the last moment a new position may be opened. Screening
 	// continues after it — the page still shows what is setting up — but nothing is
 	// bought. It is the earlier of `open + entry_window` and
@@ -59,6 +63,30 @@ type Boundaries struct {
 	EntryWindowEnd time.Time
 	EODExit        time.Time
 	Close          time.Time
+}
+
+// preMarketOpen resolves the configured pre-market start against a session's own
+// date, or reports false when there is no pre-market to enter.
+//
+// The start is clamped against the session's real open rather than the usual 09:30,
+// so a day the exchange opens late cannot end up with a "pre-market" that overlaps
+// the regular session. A start that does not parse is treated as no pre-market:
+// config validation rejects it at start-up, and a running daemon reaching here with
+// a bad value should scan less, never scan at the wrong time.
+func preMarketOpen(s Session, cfg *config.Config) (time.Time, bool) {
+	if !cfg.PreMarket.Enabled || s.Open.IsZero() {
+		return time.Time{}, false
+	}
+	hour, minute, err := cfg.PreMarket.StartClock()
+	if err != nil {
+		return time.Time{}, false
+	}
+	open := s.Open.In(ET)
+	start := time.Date(open.Year(), open.Month(), open.Day(), hour, minute, 0, 0, ET)
+	if !start.Before(s.Open) {
+		return time.Time{}, false
+	}
+	return start, true
 }
 
 // Bounds derives the session's decision points from config.
@@ -82,6 +110,9 @@ func Bounds(s Session, cfg *config.Config) Boundaries {
 	if b.EntryWindowEnd.Before(b.Open) {
 		b.EntryWindowEnd = b.Open
 	}
+	if start, ok := preMarketOpen(s, cfg); ok {
+		b.PreMarketOpen = start
+	}
 	return b
 }
 
@@ -92,10 +123,20 @@ func Bounds(s Session, cfg *config.Config) Boundaries {
 // the EOD window wins: flattening positions before the close matters more than
 // completing the sentiment poll, and entering trades with less than the normal
 // runway was never the intent.
+//
+// Pre-market only ever occupies time that used to be PhaseClosed, and only when
+// PreMarketOpen is set. Everything from the opening bell onwards is untouched, and
+// after the close the day is closed again — the post-market session is deliberately
+// not covered, because the forced end-of-day exit has already flattened the book.
 func PhaseAt(now time.Time, b Boundaries) domain.Phase {
 	switch {
-	case now.Before(b.Open), !now.Before(b.Close):
+	case !now.Before(b.Close):
 		return domain.PhaseClosed
+	case now.Before(b.Open):
+		if b.PreMarketOpen.IsZero() || now.Before(b.PreMarketOpen) {
+			return domain.PhaseClosed
+		}
+		return domain.PhasePreMarket
 	case !now.Before(b.EODExit):
 		return domain.PhaseEODWindow
 	case now.Before(b.FirstHourEnd):

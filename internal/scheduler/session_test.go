@@ -35,7 +35,7 @@ func TestPhaseAt(t *testing.T) {
 		now  time.Time
 		want domain.Phase
 	}{
-		{"pre-market", at(9, 0), domain.PhaseClosed},
+		{"before the open with pre-market off", at(9, 0), domain.PhaseClosed},
 		{"at the open", at(9, 30), domain.PhaseFirstHour},
 		{"mid first hour", at(10, 0), domain.PhaseFirstHour},
 		{"one minute before gate", at(10, 29), domain.PhaseFirstHour},
@@ -72,6 +72,102 @@ func TestPhaseAtEarlyCloseOverlapsFirstHour(t *testing.T) {
 	}
 	if got := PhaseAt(time.Date(2026, 11, 27, 9, 35, 0, 0, ET), b); got != domain.PhaseFirstHour {
 		t.Errorf("got %v, want PhaseFirstHour before the EOD mark", got)
+	}
+}
+
+// With pre-market enabled the time before the open splits in two: closed until the
+// configured start, then PhasePreMarket. Everything from the bell onwards must be
+// exactly what it was.
+func TestPhaseAtWithPreMarket(t *testing.T) {
+	cfg := testCfg()
+	cfg.PreMarket.Enabled = true
+	cfg.PreMarket.Start = "07:00"
+
+	b := Bounds(normalSession(t), cfg)
+	at := func(h, m int) time.Time { return time.Date(2026, 9, 28, h, m, 0, 0, ET) }
+
+	tests := []struct {
+		name string
+		now  time.Time
+		want domain.Phase
+	}{
+		{"overnight, before pre-market opens", at(3, 0), domain.PhaseClosed},
+		{"a minute before the pre-market start", at(6, 59), domain.PhaseClosed},
+		{"exactly at the pre-market start", at(7, 0), domain.PhasePreMarket},
+		{"mid pre-market", at(8, 15), domain.PhasePreMarket},
+		{"a minute before the bell", at(9, 29), domain.PhasePreMarket},
+		{"at the bell, the regular day resumes", at(9, 30), domain.PhaseFirstHour},
+		{"midday is unaffected", at(13, 0), domain.PhaseTrading},
+		{"at the EOD mark", at(15, 30), domain.PhaseEODWindow},
+		// Post-market is deliberately not covered: the forced exit has already
+		// flattened the book, so there is nothing for the agent to do after the close.
+		{"after the close is closed, not post-market", at(18, 0), domain.PhaseClosed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PhaseAt(tt.now, b); got != tt.want {
+				t.Errorf("PhaseAt(%s) = %v, want %v", tt.now.Format("15:04"), got, tt.want)
+			}
+		})
+	}
+}
+
+// A pre-market start that does not sit before the session's own open leaves no
+// pre-market rather than one overlapping the regular session. The clamp is against
+// the calendar's open, not a hardcoded 09:30, so a late-opening day is handled too.
+func TestPreMarketStartMustPrecedeTheOpen(t *testing.T) {
+	cfg := testCfg()
+	cfg.PreMarket.Enabled = true
+	cfg.PreMarket.Start = "11:00"
+
+	late := Session{
+		Date:  "2026-09-28",
+		Open:  time.Date(2026, 9, 28, 11, 0, 0, 0, ET),
+		Close: time.Date(2026, 9, 28, 16, 0, 0, 0, ET),
+	}
+	if b := Bounds(late, cfg); !b.PreMarketOpen.IsZero() {
+		t.Errorf("PreMarketOpen = %v, want zero when the start is not before the open", b.PreMarketOpen)
+	}
+
+	// An unparseable start is treated the same way. Validation rejects it at
+	// start-up, so a daemon reaching here should scan less, never at the wrong time.
+	cfg.PreMarket.Start = "half past six"
+	if b := Bounds(normalSession(t), cfg); !b.PreMarketOpen.IsZero() {
+		t.Errorf("PreMarketOpen = %v, want zero for an unparseable start", b.PreMarketOpen)
+	}
+}
+
+// Pre-market boundaries are exchange-local, so the DST offset has to come from the
+// timezone database rather than a fixed hour — the same reason the package embeds
+// tzdata at all.
+func TestPreMarketStartTracksDST(t *testing.T) {
+	cfg := testCfg()
+	cfg.PreMarket.Enabled = true
+	cfg.PreMarket.Start = "07:00"
+
+	for _, date := range []struct {
+		day       time.Time
+		wantZone  string
+		wantHours int
+	}{
+		{time.Date(2026, 1, 15, 9, 30, 0, 0, ET), "EST", -5},
+		{time.Date(2026, 7, 15, 9, 30, 0, 0, ET), "EDT", -4},
+	} {
+		sess := Session{
+			Date:  date.day.Format("2006-01-02"),
+			Open:  date.day,
+			Close: date.day.Add(6*time.Hour + 30*time.Minute),
+		}
+		start := Bounds(sess, cfg).PreMarketOpen
+		zone, offset := start.Zone()
+		if zone != date.wantZone || offset != date.wantHours*3600 {
+			t.Errorf("%s pre-market start is %s (%s, %ds), want %s at %d hours",
+				sess.Date, start.Format("15:04"), zone, offset, date.wantZone, date.wantHours)
+		}
+		if start.Format("15:04") != "07:00" {
+			t.Errorf("%s pre-market start = %s, want 07:00 exchange time",
+				sess.Date, start.Format("15:04"))
+		}
 	}
 }
 

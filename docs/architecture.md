@@ -32,6 +32,13 @@ There is one Alpaca account/API key set used for both market data and order exec
 ## Data flow (one trading day)
 
 ```
+scheduler: pre-market opens (premarket.start, only when premarket.enabled)
+  -> screener: find candidates, on pre-market thresholds and cadence
+       -> store: record the pass; the page shows it with "why not bought" per row
+       (premarket.allow_entry only) live sentiment read -> not bearish
+         -> strategy: setup on pre-market candles -> risk: size
+              -> broker: extended-hours limit order -> store: record open position
+  -> strategy: evaluate any pre-market position against the exit rules
 scheduler: market opens
   -> sentiment: poll every 10min for 1 hour, write readings to store
   -> scheduler: read sentiment history from store, decide bullish/bearish
@@ -52,6 +59,8 @@ The page is not purely passive any more: `engine.CheckSentiment` and
 path but deliberately stop short of it — neither persists anything and neither can
 place an order, which is what makes them safe to run with the market closed. See
 [`web-ui.md`](./web-ui.md) for the reasoning.
+
+Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the book, and this strategy holds nothing overnight.
 
 On startup, before the loop begins, `engine.Reconcile` compares the broker's positions against the store: anything the broker holds that the store does not know about is adopted, anything the store thinks is open that the broker does not hold is closed as `RECONCILED`, and orders recorded as submitted but never confirmed are resolved. This is what closes the crash-between-submit-and-confirm hole.
 

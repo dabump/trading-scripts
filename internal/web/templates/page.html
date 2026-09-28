@@ -15,6 +15,10 @@
   --good: #3fd08a;
   --bad: #ff6b6b;
   --warn: #f5b942;
+  /* Pre-market. A distinctly warmer orange than --warn's amber, so the exchange
+     badge and the PRE_MARKET state read as their own thing rather than as a
+     variation on the end-of-day warning sitting beside them. */
+  --pre: #ff8c32;
   --idle: #7d8fa1;
   --accent: #5ab0ff;
   --radius: 12px;
@@ -51,6 +55,8 @@ header.top {
 .badge.bad .dot { background: var(--bad); }
 .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
 .badge.warn .dot { background: var(--warn); }
+.badge.pre { color: var(--pre); border-color: color-mix(in srgb, var(--pre) 40%, var(--line)); }
+.badge.pre .dot { background: var(--pre); }
 .badge.idle { color: var(--idle); }
 .badge.idle .dot { background: var(--idle); }
 .badge .icon { font-size: 12px; }
@@ -108,6 +114,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
 .good { color: var(--good); }
 .bad { color: var(--bad); }
 .warn { color: var(--warn); }
+.pre { color: var(--pre); }
 .idle { color: var(--idle); }
 .muted { color: var(--muted); }
 
@@ -268,7 +275,7 @@ setInterval(refresh, POLL_MS);
   </div>
   <div class="badges">
     {{if .PaperMode}}<span class="paper-tag">paper</span>{{else}}<span class="paper-tag" style="color:var(--bad);border-color:var(--bad)">live</span>{{end}}
-    <span class="badge {{if .MarketOpen}}good{{else}}bad{{end}}"
+    <span class="badge {{.ExchangeTone}}"
           {{if .CountdownAt}}title="{{.CountdownAt}}"{{end}}>
       <span class="dot"></span>Exchange {{.MarketLabel}}{{if .Countdown}}<span class="countdown">· {{.Countdown}}</span>{{end}}
     </span>

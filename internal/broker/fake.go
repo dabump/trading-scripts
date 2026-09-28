@@ -25,13 +25,17 @@ type Fake struct {
 	positions map[string]BrokerPosition
 	placed    []OrderRequest
 	bars      map[string][]domain.Bar
-	err       error
+	// sessionVolume is what SessionVolumes reports, standing in for the pre-market
+	// volume a snapshot cannot carry. Unset means the symbol has not printed.
+	sessionVolume map[string]float64
+	err           error
 
 	// Call counters, so tests can assert the scan's cost profile: a full-market
 	// scan is only affordable if the expensive per-symbol calls stay rare.
-	assetCalls     int
-	avgVolumeCalls map[string]int
-	newsSince      time.Time
+	assetCalls         int
+	sessionVolumeCalls int
+	avgVolumeCalls     map[string]int
+	newsSince          time.Time
 }
 
 func NewFake(acct domain.Account) *Fake {
@@ -43,6 +47,7 @@ func NewFake(acct domain.Account) *Fake {
 		positions: map[string]BrokerPosition{},
 		bars:      map[string][]domain.Bar{},
 
+		sessionVolume:  map[string]float64{},
 		avgVolumeCalls: map[string]int{},
 	}
 }
@@ -191,6 +196,43 @@ func (f *Fake) AverageDailyVolume(_ context.Context, symbol string, _ int) (floa
 	// Stored directly so a test can set a relative-volume multiple without
 	// simulating 20 days of daily bars.
 	return f.avgVolume[symbol], nil
+}
+
+// SessionVolumes reports the volume traded since `since`.
+//
+// The fake ignores `since` and returns what SetSessionVolume installed: a test is
+// asserting on the screening arithmetic, not on bar aggregation. A symbol with
+// nothing set is absent from the result, which is how the real implementation reports
+// a symbol that has not printed.
+func (f *Fake) SessionVolumes(_ context.Context, symbols []string, _ time.Time) (map[string]float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.sessionVolumeCalls++
+	out := make(map[string]float64, len(symbols))
+	for _, sym := range symbols {
+		if v, ok := f.sessionVolume[sym]; ok {
+			out[sym] = v
+		}
+	}
+	return out, nil
+}
+
+// SetSessionVolume sets what SessionVolumes will report for a symbol.
+func (f *Fake) SetSessionVolume(symbol string, v float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessionVolume[symbol] = v
+}
+
+// SessionVolumeCalls is how many batched requests SessionVolumes made, so a test can
+// assert it is batched rather than per-symbol.
+func (f *Fake) SessionVolumeCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionVolumeCalls
 }
 
 // SetAverageVolume sets the value AverageDailyVolume will report.

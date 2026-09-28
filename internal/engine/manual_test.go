@@ -9,6 +9,7 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/broker"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
+	"github.com/martincoetzee/trading-agent/internal/screener"
 )
 
 // The manual sentiment check must not write a reading: the gate verdict is decided
@@ -158,7 +159,7 @@ func TestScreenNowUsesTheSameCriteriaAsTheAutomatedScan(t *testing.T) {
 	}
 
 	// The automated path must reach the same verdict on the same data.
-	auto, err := h.eng.screen(context.Background(), mustSession(t, h))
+	auto, err := h.eng.screen(context.Background(), screener.ThresholdsFor(h.cfg, false), h.open)
 	if err != nil {
 		t.Fatal(err)
 	}

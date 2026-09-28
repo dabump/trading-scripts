@@ -27,9 +27,17 @@ type LegendEntry struct {
 // legend is the documented set of states. ERROR and HALTED_BEARISH share a tone
 // but carry different icons and labels, because docs/web-ui.md requires them to
 // be distinguishable without relying on colour alone.
+//
+// PRE_MARKET has a tone of its own — orange, between the grey of a closed market and
+// the green of a trading one — because it is neither: the agent is working, but on a
+// session where the sentiment gate has not run and, by default, nothing is bought.
+// Showing it as MARKET_CLOSED would misreport a scanning agent as idle, and as
+// SCREENING would imply entries that are not happening.
 var legend = []LegendEntry{
 	{State: domain.StateMarketClosed, Tone: "idle", Icon: "○",
 		Meaning: "Outside exchange hours. Waiting for the next open."},
+	{State: domain.StatePreMarket, Tone: "pre", Icon: "◔",
+		Meaning: "Pre-market session. Screening the early tape; the sentiment gate has not run yet."},
 	{State: domain.StateSentimentCheck, Tone: "warn", Icon: "◐",
 		Meaning: "First hour. Polling market sentiment every 10 minutes. No trades placed."},
 	{State: domain.StateScreening, Tone: "good", Icon: "●",
@@ -99,10 +107,18 @@ type View struct {
 	GeneratedAt string
 	SessionDate string
 
-	MarketOpen  bool
+	MarketOpen bool
+	// PreMarket is true during the pre-market session. MarketOpen stays false then —
+	// the regular market genuinely is not open — so anything keyed on "is the agent
+	// live" has to read both.
+	PreMarket   bool
 	MarketLabel string
-	SessionText string
-	EarlyClose  bool
+	// ExchangeTone drives the exchange badge's colour: green open, orange pre-market,
+	// red closed. Computed here rather than in the template so the three-way choice
+	// is not an if/else chain inside markup.
+	ExchangeTone string
+	SessionText  string
+	EarlyClose   bool
 	// Countdown is "closes in 4h 12m" while open, or "opens in 15h 42m" while closed.
 	// Empty when the next boundary is not known — after the close with a failed
 	// calendar lookup, say — because a blank is better than a wrong number.
@@ -297,10 +313,14 @@ func BuildView(
 	} else {
 		v.SessionText = "no session today"
 	}
-	if v.MarketOpen {
-		v.MarketLabel = "OPEN"
-	} else {
-		v.MarketLabel = "CLOSED"
+	v.PreMarket = tradingDay && scheduler.PhaseAt(now, bounds) == domain.PhasePreMarket
+	switch {
+	case v.MarketOpen:
+		v.MarketLabel, v.ExchangeTone = "OPEN", "good"
+	case v.PreMarket:
+		v.MarketLabel, v.ExchangeTone = "PRE-MARKET", "pre"
+	default:
+		v.MarketLabel, v.ExchangeTone = "CLOSED", "bad"
 	}
 	v.Countdown, v.CountdownAt = countdown(now, sess, tradingDay, next, nextKnown)
 
@@ -545,6 +565,67 @@ func strategySections(cfg *config.Config) []StrategySection {
 		},
 	}
 
+	// Pre-market appears whether or not it is on, because "off" is the fact an
+	// operator most needs from this panel: it explains an empty 06:00 page without
+	// requiring them to go and read the config file.
+	preMarket := StrategySection{
+		Title: "2b · Pre-market",
+		Note: "The same three criteria, run before the opening bell against a much " +
+			"thinner tape — so two of the numbers they are measured against differ.",
+		Rows: []StrategyRow{{
+			Label: "Screening",
+			Value: map[bool]string{true: "enabled", false: "disabled"}[cfg.PreMarket.Enabled],
+			Note: map[bool]string{
+				true:  "the agent scans before the open and the page fills",
+				false: "the agent is idle until the opening bell",
+			}[cfg.PreMarket.Enabled],
+		}},
+	}
+	if cfg.PreMarket.Enabled {
+		preMarket.Rows = append(preMarket.Rows,
+			StrategyRow{Label: "Session start", Value: cfg.PreMarket.Start + " ET"},
+			StrategyRow{
+				Label: "Scan interval",
+				Value: durationText(cfg.PreMarket.ScanInterval),
+				Note:  "slower than the regular cadence: one pass is ~130 requests",
+			},
+			StrategyRow{
+				Label: "Minimum traded",
+				Value: "$" + groupNumber(cfg.PreMarket.MinDollarVolume),
+				Note: "replaces the regular $" + groupNumber(cfg.Screening.MinDollarVolume) +
+					" floor, which no pre-market tape clears",
+			},
+			StrategyRow{
+				Label: "Relative volume",
+				Value: "≥ " + trimNumber(cfg.PreMarket.MinVolumeMultiple) + "x",
+				Note: "against the same " + fmt.Sprintf("%d", cfg.Screening.AvgVolumeLookbackDays) +
+					"-session daily average, so a fraction of a day is a far higher bar than it looks",
+			},
+			StrategyRow{
+				Label: "Entries",
+				Value: map[bool]string{true: "allowed", false: "blocked"}[cfg.PreMarket.AllowEntry],
+				Note: map[bool]string{
+					true: "extended-hours limit orders, gated on a live sentiment read " +
+						"standing in for the first-hour gate",
+					false: "candidates are shown but nothing is bought before the bell",
+				}[cfg.PreMarket.AllowEntry],
+			},
+		)
+		if cfg.PreMarket.AllowEntry {
+			// Derived the way engine.submit derives it, including the fallback, so the
+			// panel cannot claim an allowance the orders are not actually priced off.
+			slip := cfg.PreMarket.LimitSlipPct
+			note := "pre-market spreads are wider; too tight and orders never fill"
+			if slip <= 0 {
+				slip = cfg.Execution.LimitSlipPct
+				note = "inherited from the regular session — " + note
+			}
+			preMarket.Rows = append(preMarket.Rows, StrategyRow{
+				Label: "Limit allowance", Value: pctOf(slip), Note: note,
+			})
+		}
+	}
+
 	// Derived the same way risk.SizeForRisk and config validation do, so the figures
 	// shown are the figures enforced.
 	maxExposure := cfg.Risk.MaxPositionPct * float64(cfg.Risk.MaxConcurrentPositions)
@@ -660,7 +741,7 @@ func strategySections(cfg *config.Config) []StrategySection {
 		},
 	}
 
-	return []StrategySection{gate, screening, entry, exits}
+	return []StrategySection{gate, screening, preMarket, entry, exits}
 }
 
 // trimNumber renders a configured number exactly, dropping only trailing zeros.

@@ -39,6 +39,13 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `screening.avg_volume_lookback_days` | 20 | **PROPOSED** — excludes today |
 | `screening.max_enriched` | 100 | **PROPOSED** — caps the per-symbol lookups after the move filter, not the scan itself |
 | `screening.news_lookback` | 18h | **PROPOSED** — must reach back past the open so pre-market catalysts are visible; validated to be ≥7h |
+| `premarket.enabled` | `true` | `strategy.md` §2b — screening and scanning before the bell. Off means the morning is `MARKET_CLOSED` and no requests are made |
+| `premarket.start` | `04:00` | HH:MM exchange time, matching the exchange's own pre-market open; validated to parse and to fall before the 09:30 open. A later value is supported to trim API calls, but reports `MARKET_CLOSED` while the market is in pre-market |
+| `premarket.scan_interval` | 5m | **PROPOSED** — deliberately slower than `timing.screener_scan_interval`. 04:00–09:30 at 5m is ~66 passes of ~130 requests, averaging ~26 req/min against Alpaca's 200/min |
+| `premarket.min_dollar_volume` | 100000 | **PROPOSED** — replaces `screening.min_dollar_volume` while pre-market; the regular floor rejects the whole early tape |
+| `premarket.min_volume_multiple` | 0.5 | **PROPOSED** — replaces `screening.min_volume_multiple` while pre-market; still measured against the 20-session **daily** average, so half a day's volume before the bell is an extreme reading |
+| `premarket.allow_entry` | `false` | `strategy.md` §2b — buying before the bell. Validated to require `premarket.enabled`, and a non-zero limit allowance from either `premarket.limit_slip_pct` or `execution.limit_slip_pct` |
+| `premarket.limit_slip_pct` | 1.0 | **PROPOSED** — limit allowance on pre-market orders. Extended-hours orders are always limit orders, so `execution.order_type` does not apply before the bell. Wider than the regular 0.5% because pre-market spreads are wider; 0 falls back to `execution.limit_slip_pct` |
 | `entry.pattern_interval` | 1m | `strategy.md` §3 — the candle the setup is read on |
 | `entry.ema_period` | 9 | `strategy.md` §3 — trend filter |
 | `entry.require_above_vwap` | `true` | `strategy.md` §3 |
@@ -65,7 +72,7 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `sentiment.bearish_avg_pct` | −0.8 | **PROPOSED** — must be negative |
 | `sentiment.require_all_negative` | `true` | **PROPOSED** |
 | `execution.order_type` | `market` | **PROPOSED** — guarantees fills but can slip on thinly traded names |
-| `execution.limit_slip_pct` | 0.5 | Only used when `order_type: limit` |
+| `execution.limit_slip_pct` | 0.5 | Used when `order_type: limit`, and as the pre-market fallback when `premarket.limit_slip_pct` is 0 |
 | `web.listen_addr` | `:8080` | |
 | `web.poll_interval` | 12s | `web-ui.md` (~10–15s) |
 | `storage.database_path` | `data/agent.db` | Created on start; gitignored |

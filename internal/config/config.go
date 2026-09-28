@@ -16,6 +16,7 @@ import (
 type Config struct {
 	MarketData MarketData `yaml:"market_data"`
 	Screening  Screening  `yaml:"screening"`
+	PreMarket  PreMarket  `yaml:"premarket"`
 	Entry      Entry      `yaml:"entry"`
 	Risk       Risk       `yaml:"risk"`
 	Exit       Exit       `yaml:"exit"`
@@ -81,6 +82,95 @@ type Screening struct {
 	// 09:30 would miss the very story that caused the move and report "no news" for
 	// exactly the candidates the strategy wants.
 	NewsLookback time.Duration `yaml:"news_lookback"`
+}
+
+// PreMarket extends the agent's coverage backwards into the 04:00-09:30 ET session.
+//
+// It is its own section rather than more fields on Screening because pre-market is a
+// different market wearing the same symbols. It carries a few percent of regular
+// session volume, its spreads are wide, and there is no consolidated auction behind
+// the print. The three screening criteria still apply unchanged — a catalyst, a move,
+// unusual volume — but two of the numbers they are compared against cannot: a 5x test
+// against a 20-session *daily* average is unreachable at 06:00, and a $1,000,000
+// dollar-volume floor rejects essentially the whole tape. Both therefore have
+// pre-market counterparts here, and screening reads whichever set is in force.
+//
+// Everything in this section is off or conservative by default. Turning Enabled on
+// costs API calls and shows candidates; turning AllowEntry on trades them.
+type PreMarket struct {
+	// Enabled turns pre-market screening and scanning on. With it off the agent
+	// behaves exactly as it did before this section existed: MARKET_CLOSED until the
+	// opening bell, and not a single request made.
+	Enabled bool `yaml:"enabled"`
+	// Start is when coverage begins, as "HH:MM" in exchange time.
+	//
+	// It should match the exchange's own pre-market open — 04:00 ET — because the
+	// PRE_MARKET state is a claim about what the market is doing, and a start later
+	// than the real one makes the agent report MARKET_CLOSED while the tape is
+	// trading. A later start is still supported as a way to trim API calls; it just
+	// trades away coverage of anything that moved before it.
+	Start string `yaml:"start"`
+	// ScanInterval is the pre-market scan cadence, deliberately separate from
+	// timing.screener_scan_interval.
+	//
+	// One pass is ~130 mostly-serial requests (see the note in CLAUDE.md), and a
+	// 04:00 start at the regular one-minute cadence would add roughly 330 of them
+	// before the bell — for a tape that barely moves between prints. A slower
+	// pre-market cadence is the difference between this feature being affordable and
+	// not.
+	ScanInterval time.Duration `yaml:"scan_interval"`
+	// MinDollarVolume replaces screening.min_dollar_volume while pre-market. It is
+	// the same liquidity idea measured against a session that is orders of magnitude
+	// thinner, so the regular floor would reject every name including the ones
+	// genuinely trading.
+	MinDollarVolume float64 `yaml:"min_dollar_volume"`
+	// MinVolumeMultiple replaces screening.min_volume_multiple while pre-market. The
+	// comparison is unchanged — volume so far against the daily average — but a
+	// pre-market session is a fraction of a day, so the same multiple means something
+	// far more extreme. A name printing half a normal *day's* volume before the bell
+	// is the pre-market equivalent of the 5x the regular session looks for.
+	MinVolumeMultiple float64 `yaml:"min_volume_multiple"`
+	// AllowEntry permits actual buying before the opening bell. Screening and the
+	// page work with this off; only orders are withheld.
+	//
+	// It is a second switch rather than part of Enabled because the two carry
+	// completely different consequences: the fill comes from a thin book, and the
+	// first-hour sentiment gate has not run yet. The engine substitutes a live
+	// sentiment read for that last one — see docs/strategy.md §1 — but it is a weaker
+	// guarantee than the gate it stands in for, which is why this defaults to false.
+	AllowEntry bool `yaml:"allow_entry"`
+	// LimitSlipPct is the limit-price allowance on pre-market orders, in percent away
+	// from the reference price. Zero falls back to execution.limit_slip_pct.
+	//
+	// It is separate because extended-hours orders have no choice about being limit
+	// orders — Alpaca only accepts a day limit order for the extended session — so
+	// execution.order_type does not apply before the bell and cannot carry this
+	// number. Coupling the two would mean switching the *regular* session to limit
+	// orders as the price of enabling pre-market entry, which is an unrelated change
+	// to how the rest of the day trades.
+	//
+	// It is worth its own value rather than reusing the regular one because
+	// pre-market spreads on these names are several times wider. An allowance that is
+	// generous at 14:00 may simply never fill at 06:00 — and an order that never fills
+	// is the failure mode where the feature looks enabled and quietly does nothing.
+	// The same number applies to exits, where not filling is the more serious
+	// direction: a pre-market stop that goes unfilled leaves the position open until
+	// the bell.
+	LimitSlipPct float64 `yaml:"limit_slip_pct"`
+}
+
+// StartClock parses Start into an hour and minute in exchange time.
+//
+// It returns the clock rather than an instant because config knows nothing about
+// which day is being scheduled — internal/scheduler combines this with the session
+// date the calendar reported. Validation calls it too, so a typo is a start-up
+// failure rather than a pre-market that silently never opens.
+func (p PreMarket) StartClock() (hour, minute int, err error) {
+	t, err := time.Parse("15:04", p.Start)
+	if err != nil {
+		return 0, 0, fmt.Errorf("premarket.start %q is not an HH:MM exchange time: %w", p.Start, err)
+	}
+	return t.Hour(), t.Minute(), nil
 }
 
 // Entry is the setup gate: the pattern a screened candidate has to print before it
@@ -309,6 +399,42 @@ func (c *Config) Validate() error {
 	case "sip", "iex":
 	default:
 		add("market_data.feed must be one of: sip, iex")
+	}
+
+	// Pre-market. Nothing below is checked when the section is off, so a disabled
+	// pre-market cannot fail start-up over numbers nothing will read.
+	if c.PreMarket.Enabled {
+		if _, _, err := c.PreMarket.StartClock(); err != nil {
+			add("%v", err)
+		} else if hour, minute, _ := c.PreMarket.StartClock(); hour*60+minute >= 9*60+30 {
+			// A start at or after the regular open leaves no pre-market at all, which
+			// would look like the feature being broken rather than misconfigured. The
+			// bound is the standard 09:30; scheduler.Bounds additionally clamps against
+			// the session's real open, which an early-open day could move.
+			add("premarket.start (%s) must be before the 09:30 regular open", c.PreMarket.Start)
+		}
+		if c.PreMarket.ScanInterval <= 0 {
+			add("premarket.scan_interval must be > 0")
+		}
+		if c.PreMarket.MinDollarVolume <= 0 {
+			add("premarket.min_dollar_volume must be > 0")
+		}
+		if c.PreMarket.MinVolumeMultiple <= 0 {
+			add("premarket.min_volume_multiple must be > 0")
+		}
+		if c.PreMarket.LimitSlipPct < 0 || c.PreMarket.LimitSlipPct >= 100 {
+			add("premarket.limit_slip_pct must be in [0, 100) — 0 falls back to execution.limit_slip_pct")
+		}
+	} else if c.PreMarket.AllowEntry {
+		add("premarket.allow_entry requires premarket.enabled; entries cannot be placed from a session the agent never scans")
+	}
+	// An extended-hours order has to be a day limit order — Alpaca accepts nothing
+	// else for the pre- and post-market sessions — so the engine sends one before the
+	// bell whatever execution.order_type says, and execution.order_type keeps
+	// governing the regular session alone. What a limit order cannot do without is a
+	// price allowance, so that is what is required here.
+	if c.PreMarket.AllowEntry && c.PreMarket.LimitSlipPct <= 0 && c.Execution.LimitSlipPct <= 0 {
+		add("premarket.allow_entry needs a limit price allowance: set premarket.limit_slip_pct (or execution.limit_slip_pct) above 0, because a pre-market order is always a limit order")
 	}
 	if c.Risk.RiskPerTradePct <= 0 || c.Risk.RiskPerTradePct > 100 {
 		add("risk.risk_per_trade_pct must be in (0, 100]")

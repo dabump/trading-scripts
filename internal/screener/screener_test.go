@@ -75,7 +75,7 @@ func TestEvaluateAllCriteriaMustPass(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			in := passing()
 			tt.mutate(&in)
-			got := Evaluate(in, cfg())
+			got := Evaluate(in, ThresholdsFor(cfg(), false))
 
 			if got.Qualifies != tt.wantPass {
 				t.Fatalf("Qualifies = %v, want %v (%s)", got.Qualifies, tt.wantPass, got.FailReason)
@@ -93,7 +93,7 @@ func TestEvaluateAllCriteriaMustPass(t *testing.T) {
 
 // Criteria carry their underlying value, not just a boolean, per docs/web-ui.md.
 func TestEvaluateReportsValues(t *testing.T) {
-	got := Evaluate(passing(), cfg())
+	got := Evaluate(passing(), ThresholdsFor(cfg(), false))
 	want := map[string]string{
 		CriterionNews:   "2 today",
 		CriterionMove:   "+14.0%",
@@ -173,7 +173,7 @@ func TestTradableFloors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ok, reason := Tradable(tt.price, tt.dollarVolume, c)
+			ok, reason := Tradable(tt.price, tt.dollarVolume, ThresholdsFor(c, false))
 			if ok != tt.wantOK {
 				t.Fatalf("Tradable(%v, %v) = %v (%q), want %v",
 					tt.price, tt.dollarVolume, ok, reason, tt.wantOK)
@@ -189,5 +189,67 @@ func TestTradableFloors(t *testing.T) {
 				t.Errorf("reason = %q, want it to mention %q", reason, tt.wantReason)
 			}
 		})
+	}
+}
+
+// Pre-market runs the same three criteria against a tape a fraction of the size, so
+// two of the numbers have to change and the rest must not. Swapping the price band
+// or the move threshold too would make it a different screen, not the same one on a
+// different session.
+func TestThresholdsForPreMarket(t *testing.T) {
+	c := cfg()
+	c.Screening.MinDollarVolume = 1_000_000
+	c.Screening.MinVolumeMultiple = 5
+	c.PreMarket.MinDollarVolume = 100_000
+	c.PreMarket.MinVolumeMultiple = 0.5
+
+	regular := ThresholdsFor(c, false)
+	pre := ThresholdsFor(c, true)
+
+	if regular.PreMarket || !pre.PreMarket {
+		t.Errorf("PreMarket flags = %v / %v, want false / true", regular.PreMarket, pre.PreMarket)
+	}
+	if regular.MinDollarVolume != 1_000_000 || regular.MinVolumeMultiple != 5 {
+		t.Errorf("regular thresholds = $%v / %vx, want the screening.* values",
+			regular.MinDollarVolume, regular.MinVolumeMultiple)
+	}
+	if pre.MinDollarVolume != 100_000 || pre.MinVolumeMultiple != 0.5 {
+		t.Errorf("pre-market thresholds = $%v / %vx, want the premarket.* values",
+			pre.MinDollarVolume, pre.MinVolumeMultiple)
+	}
+	// The price band and the move threshold are the same question in either session.
+	if pre.MinPrice != regular.MinPrice || pre.MaxPrice != regular.MaxPrice ||
+		pre.MinIntradayPct != regular.MinIntradayPct {
+		t.Errorf("pre-market changed the price band or the move threshold: %+v vs %+v", pre, regular)
+	}
+}
+
+// The same candidate is judged differently by the two sessions: a name trading
+// $250,000 at 0.8x its daily average is a live pre-market mover and a dead one at
+// 15:00. If it were not, the pre-market screen would return nothing at all.
+func TestPreMarketThresholdsAdmitTheEarlyTape(t *testing.T) {
+	c := cfg()
+	c.Screening.MinPrice = 1
+	c.Screening.MaxPrice = 20
+	c.Screening.MinDollarVolume = 1_000_000
+	c.Screening.MinVolumeMultiple = 5
+	c.PreMarket.MinDollarVolume = 100_000
+	c.PreMarket.MinVolumeMultiple = 0.5
+
+	in := Input{Symbol: "EARLY", Price: 5, IntradayPct: 22,
+		TodayVolume: 800_000, AvgVolume: 1_000_000, NewsCount: 1}
+	const dollarVolume = 250_000
+
+	if ok, _ := Tradable(in.Price, dollarVolume, ThresholdsFor(c, true)); !ok {
+		t.Error("pre-market must admit a $250,000 tape; the regular floor is a regular-session number")
+	}
+	if ok, _ := Tradable(in.Price, dollarVolume, ThresholdsFor(c, false)); ok {
+		t.Error("the regular session must still reject a $250,000 tape")
+	}
+	if got := Evaluate(in, ThresholdsFor(c, true)); !got.Qualifies {
+		t.Errorf("pre-market evaluation should qualify at 0.8x: %s", got.FailReason)
+	}
+	if got := Evaluate(in, ThresholdsFor(c, false)); got.Qualifies {
+		t.Error("0.8x must not qualify against the regular 5x threshold")
 	}
 }

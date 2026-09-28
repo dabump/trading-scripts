@@ -16,6 +16,45 @@ const (
 	CriterionVolume = "Rel. volume"
 )
 
+// Thresholds are the screening numbers in force for one pass.
+//
+// They exist because the same three criteria are applied to two different markets.
+// A pre-market pass compares against a tape carrying a few percent of regular
+// session volume, so its liquidity floor and its relative-volume multiple have to be
+// different numbers or the screen returns nothing at all. Resolving them once, into
+// a value the pass carries, means there is a single answer to "which numbers were
+// these candidates judged against" — including in the audit trail.
+//
+// The price band and the move threshold are deliberately not split: a name is in the
+// strategy's band, or moving enough, regardless of which session is printing it.
+type Thresholds struct {
+	// PreMarket says which session these came from. Nothing in screening branches on
+	// it; it is carried so callers can label a pass without re-deriving it.
+	PreMarket         bool
+	MinPrice          float64
+	MaxPrice          float64
+	MinIntradayPct    float64
+	MinDollarVolume   float64
+	MinVolumeMultiple float64
+}
+
+// ThresholdsFor resolves the numbers a pass runs with.
+func ThresholdsFor(cfg *config.Config, preMarket bool) Thresholds {
+	th := Thresholds{
+		PreMarket:         preMarket,
+		MinPrice:          cfg.Screening.MinPrice,
+		MaxPrice:          cfg.Screening.MaxPrice,
+		MinIntradayPct:    cfg.Screening.MinIntradayPct,
+		MinDollarVolume:   cfg.Screening.MinDollarVolume,
+		MinVolumeMultiple: cfg.Screening.MinVolumeMultiple,
+	}
+	if preMarket {
+		th.MinDollarVolume = cfg.PreMarket.MinDollarVolume
+		th.MinVolumeMultiple = cfg.PreMarket.MinVolumeMultiple
+	}
+	return th
+}
+
 // Tradable reports whether a symbol is worth evaluating at all, given its price and
 // the dollar volume it has traded so far today.
 //
@@ -32,18 +71,37 @@ const (
 //
 // Both inputs come from the snapshot already fetched for the move filter, so rejecting
 // here costs nothing and saves the per-symbol news and average-volume lookups.
-func Tradable(price, dollarVolume float64, cfg *config.Config) (bool, string) {
-	if price < cfg.Screening.MinPrice {
-		return false, fmt.Sprintf("price $%.2f is below the $%.2f floor",
-			price, cfg.Screening.MinPrice)
+func Tradable(price, dollarVolume float64, th Thresholds) (bool, string) {
+	if ok, reason := TradablePrice(price, th); !ok {
+		return false, reason
 	}
-	if price > cfg.Screening.MaxPrice {
-		return false, fmt.Sprintf("price $%.2f is above the $%.2f ceiling",
-			price, cfg.Screening.MaxPrice)
+	return TradableLiquidity(dollarVolume, th)
+}
+
+// TradablePrice is the price-band half of Tradable, and TradableLiquidity the
+// turnover half.
+//
+// They are separable because the two halves stop being answerable at the same moment.
+// In the regular session one snapshot carries both, so Tradable applies them together
+// and rejects before any per-symbol call. Pre-market there is no volume in the
+// snapshot at all — no daily bar for today exists yet — so the price band is applied
+// first to narrow the list, the session's volume is fetched for what survives, and
+// only then can turnover be judged. Splitting the check is what keeps that ordering
+// honest instead of comparing against a zero that means "unknown".
+func TradablePrice(price float64, th Thresholds) (bool, string) {
+	if price < th.MinPrice {
+		return false, fmt.Sprintf("price $%.2f is below the $%.2f floor", price, th.MinPrice)
 	}
-	if dollarVolume < cfg.Screening.MinDollarVolume {
+	if price > th.MaxPrice {
+		return false, fmt.Sprintf("price $%.2f is above the $%.2f ceiling", price, th.MaxPrice)
+	}
+	return true, ""
+}
+
+func TradableLiquidity(dollarVolume float64, th Thresholds) (bool, string) {
+	if dollarVolume < th.MinDollarVolume {
 		return false, fmt.Sprintf("only $%.0f traded so far, below the $%.0f floor",
-			dollarVolume, cfg.Screening.MinDollarVolume)
+			dollarVolume, th.MinDollarVolume)
 	}
 	return true, ""
 }
@@ -77,7 +135,11 @@ func (in Input) VolumeMultiple() float64 {
 //
 // The criteria are news, price move and relative volume only. Nothing here filters
 // on company size, so the screen admits large caps as readily as small ones.
-func Evaluate(in Input, cfg *config.Config) domain.Evaluation {
+//
+// The thresholds arrive as a value rather than being read from config, because a
+// pre-market pass judges the same criteria against different numbers — see
+// ThresholdsFor.
+func Evaluate(in Input, th Thresholds) domain.Evaluation {
 	mult := in.VolumeMultiple()
 
 	volDisplay := "unknown"
@@ -88,9 +150,9 @@ func Evaluate(in Input, cfg *config.Config) domain.Evaluation {
 	criteria := []domain.Criterion{
 		{Name: CriterionNews, Pass: in.NewsCount > 0,
 			Display: fmt.Sprintf("%d today", in.NewsCount)},
-		{Name: CriterionMove, Pass: in.IntradayPct >= cfg.Screening.MinIntradayPct,
+		{Name: CriterionMove, Pass: in.IntradayPct >= th.MinIntradayPct,
 			Display: fmt.Sprintf("%+.1f%%", in.IntradayPct)},
-		{Name: CriterionVolume, Pass: mult >= cfg.Screening.MinVolumeMultiple,
+		{Name: CriterionVolume, Pass: mult >= th.MinVolumeMultiple,
 			Display: volDisplay},
 	}
 

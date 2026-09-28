@@ -182,21 +182,51 @@ func (a *Alpaca) snapshotBatch(ctx context.Context, symbols []string) (map[strin
 		return nil, err
 	}
 
+	today := time.Now().In(ET()).Format("2006-01-02")
 	out := make(map[string]domain.Snapshot, len(raw))
 	for sym, v := range raw {
 		snap := domain.Snapshot{Symbol: sym}
 		if v.LatestTrade != nil {
 			snap.Price = v.LatestTrade.P
 		}
-		if v.DailyBar != nil {
+
+		// Which bar is "today" has to be read from the bar's own date rather than
+		// assumed from its field name, because the answer changes before the opening
+		// bell. Verified against a live account at 06:16 ET: dailyBar was still the
+		// previous *Friday's* bar and no daily bar for the current date existed at all
+		// (see docs/decisions.md for the payload). Taking prevDailyBar as yesterday in
+		// that state computes every pre-market move against the close from *two*
+		// sessions ago, and the screen's whole premise is that percentage.
+		//
+		// Reading the date is correct in both sessions. If dailyBar is today's, the
+		// reference close is prevDailyBar; if it is not, dailyBar itself is the last
+		// completed session and today has printed no daily bar yet — which is also why
+		// TodayVolume is zero pre-market and SessionVolumes exists.
+		// A bar with no timestamp keeps the original reading — the field is always
+		// present in practice, and inferring "not today" from its absence would turn a
+		// decoding quirk into a silently wrong percentage.
+		dailyIsToday := v.DailyBar != nil &&
+			(v.DailyBar.T.IsZero() || v.DailyBar.T.In(ET()).Format("2006-01-02") == today)
+		switch {
+		case dailyIsToday:
 			snap.TodayVolume = v.DailyBar.V
 			if snap.Price == 0 {
 				snap.Price = v.DailyBar.C
 			}
-		}
-		if v.PrevDailyBar != nil {
+			if v.PrevDailyBar != nil {
+				snap.PrevClose = v.PrevDailyBar.C
+			}
+		case v.DailyBar != nil:
+			// Pre-market before the daily bar rolls: today has no volume of its own on
+			// this endpoint, and the reference close is the bar itself.
+			snap.PrevClose = v.DailyBar.C
+			if snap.Price == 0 {
+				snap.Price = v.DailyBar.C
+			}
+		case v.PrevDailyBar != nil:
 			snap.PrevClose = v.PrevDailyBar.C
 		}
+
 		if snap.PrevClose > 0 && snap.Price > 0 {
 			snap.IntradayPct = (snap.Price - snap.PrevClose) / snap.PrevClose * 100
 		}
@@ -250,6 +280,76 @@ func (a *Alpaca) IntradayBars(ctx context.Context, symbol string, interval time.
 		}
 		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
 			return out, nil
+		}
+		token = *resp.NextPageToken
+	}
+}
+
+// sessionVolumeBatchSize bounds how many symbols go into one multi-symbol bars
+// request. The symbols travel in the query string, so this is the same URL-length
+// concern that bounds snapshotBatchSize, at a size that keeps a batch's bars well
+// inside one page.
+const sessionVolumeBatchSize = 200
+
+// sessionVolumeTimeframe is the candle size the volume is summed from.
+//
+// Hourly rather than minute: the answer wanted is one number per symbol, and a
+// pre-market session is at most six hourly candles against roughly 330 minute ones.
+// At a couple of hundred symbols a batch that is the difference between one page and
+// forty.
+const sessionVolumeTimeframe = "1Hour"
+
+// SessionVolumes sums each symbol's traded volume since `since` from batched bars.
+//
+// This is the pre-market stand-in for the snapshot's daily-bar volume, which does not
+// exist before the opening bell. It is batched across symbols precisely because it
+// runs on every name that cleared the price move — the one place the scan cannot
+// afford a per-symbol call.
+//
+// Alpaca's bars include extended-hours trades, which is what makes this work at all;
+// a symbol that has not printed since `since` is simply absent from the response and
+// is reported as zero rather than as an error.
+func (a *Alpaca) SessionVolumes(ctx context.Context, symbols []string, since time.Time) (map[string]float64, error) {
+	out := make(map[string]float64, len(symbols))
+	for start := 0; start < len(symbols); start += sessionVolumeBatchSize {
+		end := start + sessionVolumeBatchSize
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+		if err := a.sessionVolumeBatch(ctx, symbols[start:end], since, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (a *Alpaca) sessionVolumeBatch(ctx context.Context, symbols []string, since time.Time, out map[string]float64) error {
+	if len(symbols) == 0 {
+		return nil
+	}
+	token := ""
+	for {
+		u := fmt.Sprintf("%s/v2/stocks/bars?symbols=%s&timeframe=%s&start=%s&limit=10000&adjustment=raw&feed=%s&sort=asc",
+			a.dataURL, url.QueryEscape(strings.Join(symbols, ",")),
+			url.QueryEscape(sessionVolumeTimeframe),
+			url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(a.feed))
+		if token != "" {
+			u += "&page_token=" + url.QueryEscape(token)
+		}
+		var resp struct {
+			Bars          map[string][]alpacaBar `json:"bars"`
+			NextPageToken *string                `json:"next_page_token"`
+		}
+		if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+			return err
+		}
+		for sym, bars := range resp.Bars {
+			for _, b := range bars {
+				out[sym] += b.V
+			}
+		}
+		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
+			return nil
 		}
 		token = *resp.NextPageToken
 	}
@@ -499,6 +599,12 @@ func (a *Alpaca) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult,
 	}
 	if req.Type == "limit" {
 		payload["limit_price"] = strconv.FormatFloat(req.LimitPrice, 'f', 2, 64)
+	}
+	// Sent only when asked for. Alpaca accepts extended_hours on a day limit order
+	// and rejects it on anything else, so setting it unconditionally would break
+	// every regular-session market order.
+	if req.ExtendedHours {
+		payload["extended_hours"] = true
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

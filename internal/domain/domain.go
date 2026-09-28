@@ -7,7 +7,12 @@ import "time"
 type AgentState string
 
 const (
-	StateMarketClosed   AgentState = "MARKET_CLOSED"
+	StateMarketClosed AgentState = "MARKET_CLOSED"
+	// StatePreMarket is the 04:00-09:30 ET session, when the agent is scanning but
+	// the regular market has not opened. It is distinct from MARKET_CLOSED because
+	// the agent is doing work — and distinct from SCREENING because the sentiment
+	// gate has not run and, unless premarket.allow_entry is set, nothing is bought.
+	StatePreMarket      AgentState = "PRE_MARKET"
 	StateSentimentCheck AgentState = "SENTIMENT_CHECK"
 	StateScreening      AgentState = "SCREENING"
 	StateHaltedBearish  AgentState = "HALTED_BEARISH"
@@ -19,8 +24,12 @@ const (
 // agent decided to do about it.
 type Phase int
 
+// The values are in chronological order through the day, which is the order
+// scheduler.PhaseAt tests them in. Nothing compares them ordinally, so inserting
+// PhasePreMarket in its rightful place is safe.
 const (
 	PhaseClosed Phase = iota
+	PhasePreMarket
 	PhaseFirstHour
 	PhaseTrading
 	PhaseEODWindow

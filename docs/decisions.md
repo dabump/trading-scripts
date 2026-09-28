@@ -553,6 +553,156 @@ ceilings — the best cell ends at $9,741. Nothing was tuned toward those number
 | Settings left at their stated values despite better-looking cells | A 3% stop ($9,631) and a +35% move ceiling ($9,741) both beat the current configuration, and both are inside noise at n = 55. Tuning to them would repeat exactly the mistake recorded above, where a well-powered finding derived under one rule set reversed when the rules changed. |
 | The scale-out fraction stays at 50% even though selling more measured better | Selling 90% at the target ends at $9,217 against 50% at $8,871 — the *opposite* of the earlier finding that truncating gains is fatal, and for a coherent reason: with a 3–4% chart stop and a breakeven stop behind it, the runner is usually stopped before a tail develops, so there is less tail to protect. Interesting, not significant, and recorded rather than acted on. |
 
+## 2026-09-28 — Pre-market session added
+
+The US market trades from 04:00 ET and the agent ignored it entirely, which is
+awkward for a strategy built on gap-and-go setups: the catalyst breaks overnight,
+the name is already up 40% by 08:00, and 09:30 is where the move is *revealed*
+rather than where it starts. `news_lookback` already reached back past the open for
+exactly that reason — the agent was reading pre-market news while refusing to look
+at the pre-market tape.
+
+**Scope.** Pre-market only. Post-market was considered and deliberately left out:
+the forced end-of-day exit flattens the book before the close, so after 16:00 there
+is nothing to manage, and opening a position into the 16:00-20:00 session would mean
+holding overnight, which this strategy never does. Adding an `AFTER_HOURS` state
+would have been UI for a phase with no behaviour behind it.
+
+**What was decided, and why.**
+
+- **A `premarket` config section, not more fields on `screening`.** Two of the
+  screening numbers have to differ before the bell, and the reason is structural
+  rather than a matter of taste: a 5x test against a 20-session *daily* average is
+  unreachable at 06:00, and the $1,000,000 dollar-volume floor rejects essentially
+  the whole early tape. `screener.Thresholds`, resolved once per pass by
+  `ThresholdsFor`, is what makes "which numbers were these candidates judged
+  against" a question with one answer. The price band and the move threshold are
+  deliberately *not* split — a name is in the strategy's band, or moving enough,
+  regardless of which session prints it.
+- **Its own cadence.** One scan is ~130 mostly-serial requests. A 04:00 start at the
+  regular one-minute cadence adds ~330 passes before the bell for a tape that barely
+  moves between prints, so `premarket.scan_interval` defaults to 5m and
+  `premarket.start` to 07:00 rather than 04:00.
+- **Screening and entry are separate switches, and entry defaults off.** With
+  `allow_entry: false` the agent scans, the page fills, and every qualifying row
+  carries `pre-market entry is disabled` in the Action column — the same reasoning as
+  the closed entry window, where an empty table reads as a broken scanner rather than
+  a deliberate stand-down.
+- **Pre-market entry needs extended-hours limit orders.** Alpaca rejects a market
+  order outside 09:30-16:00 outright, so `allow_entry` with
+  `execution.order_type: market` would fail on every attempt and show up only as a
+  rejected order in the trail. Config validation refuses the combination at start-up
+  instead. Exits carry the same flag while the phase is pre-market, so a position
+  opened at 07:00 can stop out at 08:00 rather than waiting three hours for the bell.
+- **A live sentiment read stands in for the gate.** The first-hour gate's readings
+  are taken after the open, so pre-market entry cannot inherit the kill switch.
+  Rather than trade without one, a pass that may buy reads the same basket through
+  the same classifier and withholds entry on an overwhelmingly bearish tape — and
+  equally when the read fails, because no answer is not a passing answer. It is *not*
+  persisted: `resolveGate` judges the session on the stored readings, and a 07:30
+  sample must not settle the day. This is a weaker guarantee than the gate, and one
+  of the reasons `allow_entry` defaults to false.
+- **The snapshot decoder now reads the daily bar's date instead of trusting its
+  name.** Which bar is "today" changes before the bell, and the old code took
+  `prevDailyBar` as yesterday unconditionally. If Alpaca's `dailyBar` has not rolled
+  over by 07:00, that computes every pre-market move against the close from *two*
+  sessions ago — and that percentage is the entire basis of the screen. Reading the
+  bar's own date is correct under either rollover behaviour, which is the point,
+  because the behaviour could not be verified against a live account.
+
+**Not measured.** `cmd/backtest` fetches 09:30-16:00 bars, so it has no pre-market
+data to sweep and every `premarket.*` value is a reasoned default rather than a
+measured one. This is the opposite of how the regular-session thresholds were
+arrived at, and it is why the recommendation is to run with `allow_entry: false` and
+read the candidate table for a while first.
+
+### Three things the first real pre-market run corrected
+
+Run against a live account at 06:15 ET, the feature did not work, in two separate
+ways. Both are worth recording because both were listed above as unknowns and both
+turned out to matter.
+
+**1. `premarket.start` shipped at 07:00, so the agent sat in `MARKET_CLOSED` while
+the market was in pre-market.** The reasoning for 07:00 was API cost, and it was the
+wrong thing to spend. `PRE_MARKET` is a claim about what the exchange is doing, so a
+start later than the exchange's own (04:00 ET) makes the agent report something
+false — and from the outside it is indistinguishable from the feature being broken.
+The default is now 04:00, the cost is absorbed by the 5m cadence instead (~66 passes
+across the session, ~26 requests a minute against Alpaca's 200/min), and a test on
+the shipped config fails if the start drifts past 04:00 again.
+
+**2. The snapshot endpoint carries no pre-market volume at all**, which was the open
+question flagged above, now answered from live data:
+
+```
+TSLA at 06:16 ET on Mon 2026-09-28
+  latestTrade   p=369.36  t=2026-09-28T10:16Z
+  dailyBar      c=372.11  v=46230933  t=2026-09-25   <- Friday, not today
+  prevDailyBar  c=377.94  v=26410149  t=2026-09-24   <- Thursday
+GET /v2/stocks/bars?timeframe=1Day&start=2026-09-28  -> {"bars":{}}
+```
+
+So `dailyBar` does **not** roll over before the bell, and no daily bar for today
+exists to roll into. Two consequences:
+
+- The date-aware decoder was the right call and is doing real work: `PrevClose` comes
+  from `dailyBar` (Friday's 372.11), not `prevDailyBar` (Thursday's 377.94). The
+  original code would have measured every pre-market move against a close one session
+  too old.
+- `TodayVolume` is **0** for every symbol before the bell. That zero failed the
+  dollar-volume floor and the relative-volume criterion, so the first live scan found
+  66 movers and rejected all 66 — an empty screen regardless of how the thresholds
+  were set. The thresholds were never the problem.
+
+The fix is `broker.SessionVolumes`, which sums each symbol's volume from **batched
+hourly bars** since the pre-market open. Hourly rather than minute because the answer
+wanted is one number per symbol and a pre-market session is at most six hourly candles
+against ~330 minute ones. It runs on the names that cleared the move and the price
+band — which is why `screener.Tradable` split into `TradablePrice` and
+`TradableLiquidity`: the price band is answerable from the snapshot in either session,
+turnover is not, so pre-market applies the band first, fetches volume for the
+survivors, and only then judges turnover. Fetching before the ranking is deliberate:
+the enrichment budget is handed out by dollar volume, and ranking on zeros would have
+handed it to whichever symbols happened to sort first.
+
+**3. `allow_entry` required `execution.order_type: limit`, which was the wrong
+coupling.** Turning pre-market entry on failed start-up with a validation error
+demanding the *regular* session switch to limit orders — an unrelated change to how
+the rest of the day trades, and one the open items still list as undecided.
+
+The constraint is narrower than the rule expressed. Alpaca accepts only a **day limit
+order** for the extended session, so before the bell there is no choice to configure:
+`engine.submit` now sends a limit order whenever the extended-hours flag is set,
+whatever `execution.order_type` says, and `execution.order_type` governs the regular
+session alone. Validation asks for the one thing a limit order genuinely cannot do
+without — a price allowance — via `premarket.limit_slip_pct`, falling back to
+`execution.limit_slip_pct`.
+
+That allowance is now the setting most likely to make the feature look broken while
+working: pre-market spreads on these names are several times wider than
+regular-session ones, so 0.5% may never fill at 06:00. It defaults to 1.0% and is
+PROPOSED like the rest of §2b. The **exit** side is the one that matters — an
+unfilled pre-market stop leaves the position open until the bell, which is a real
+consequence of `allow_entry` and part of why it defaults off.
+
+**First observed pre-market screen** (06:21 ET, 13,191 symbols scanned, 66 cleared
++10%, 11 survived the floors):
+
+| Symbol | Move | Rel. volume | Verdict |
+|---|---|---|---|
+| CLRO | +79.1% | 123.9x | qualifies |
+| GYGY | +94.8% | 3.3x | qualifies |
+| WBUY | +27.4% | 9.4x | qualifies |
+| MIMI | +29.7% | 0.9x | qualifies |
+| SDEV | +10.7% | 3.2x | qualifies |
+| ACET | +10.8% | 0.2x | fails relative volume |
+| MEDS | +18.2% | 0.1x | fails news, relative volume |
+
+That spread is the first evidence that `min_volume_multiple: 0.5` discriminates
+rather than admitting everything: genuine runners land between 3x and 124x, noise
+between 0.1x and 0.3x. It is one morning's observation, not a measurement, and it
+says nothing about whether any of these would have been profitable.
+
 ## Open items (not yet decided)
 
 - **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
@@ -570,6 +720,8 @@ ceilings — the best cell ends at $9,741. Nothing was tuned toward those number
 
 - **The strategy has no demonstrated edge, and this is the load-bearing open item.** Screening floors and the MACD removal address composition and dead weight; neither creates an edge. Before any real money: measure realised slippage in paper trading, since that single number decides the outcome, and decide whether entries must be limit orders.
 
+- **Every `premarket.*` threshold is unmeasured.** `cmd/backtest` has no pre-market bars, so the start time, scan interval, dollar-volume floor and volume multiple are reasoned rather than measured. Extending the backtest to fetch extended-hours bars is what would close this; until then the pre-market screen should be read, not traded.
+- **Pre-market entries make the PDT problem worse, not better.** A pre-market entry that exits the same session is still a day trade, and the rolling five-session count is already **64** against a limit of 3. `premarket.allow_entry` must stay off until the PDT constraint is resolved, and the live-trading guard does not cover it — that guard is about real money, and this is about trade count on paper too.
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.
 - **PDT rule resolution before going live** — fund above $25k, reduce trade frequency, or switch to a cash account; none chosen yet (`docs/operations.md`).
 - Review the claude-proposed values above — especially the profit target, trailing stop and sentiment thresholds, none of which rest on evidence.

@@ -39,7 +39,9 @@ clicks get told it is already running rather than multiplying API calls.
 
 These are distinct and shouldn't be visually merged, since the agent's status doesn't always match raw market-open/closed (e.g. market is open but the agent is in its no-trade first hour, or halted for the day on bearish sentiment):
 
-1. **Market hours badge** — simple green/red: green while the US exchange is open, red while closed. Driven directly by `scheduler`'s market-hours knowledge, not by anything the agent itself decided.
+1. **Market hours badge** — simple green/red: green while the US exchange is open, red while closed. Driven directly by `scheduler`'s market-hours knowledge, not by anything the agent itself decided. It also carries a **countdown**: `closes in 4h 12m` while open, `opens in 15h 42m` while closed, with the exact target moment in the badge's tooltip.
+
+   Two things about the countdown are worth knowing. First, the "next open" is often *not* today's session — after the close, or on a weekend or holiday, it is the following session, which the engine looks up from the exchange calendar once per day and caches (`NextSession`). If that lookup fails the countdown is simply absent, because a blank is better than a wrong number. Second, the resolution stops at **minutes**: the page refreshes on a ~12s poll, so a seconds figure would advance in 12-second jumps and read as broken, and none of these boundaries is actionable to the second since the agent handles them itself.
 2. **Agent status badge** — one of the states below (the "legend"), reflecting what the agent is actually doing right now.
 
 ### Agent status legend
@@ -90,6 +92,36 @@ Scope for v1: **today's session only** — not a browsable multi-day history. Th
 Plus a totals row: net P&L for the day (aggregate $ and %) and a win/loss count, so the day's outcome is visible without adding up the rows by hand.
 
 **Not yet decided:** whether a later version should support browsing prior days' sessions (would need `store` queries across days and a day-picker UI). Flagged as a possible v2 item in [`decisions.md`](./decisions.md), not to be built now.
+
+## Active strategy section (bottom of the page)
+
+A four-part panel at the foot of the page describing the running strategy: the
+sentiment gate, the screening criteria, entry and sizing, and the exits.
+
+**Every value is read from the loaded configuration**, never written into the
+template. That is the whole point of the section: a hardcoded panel would pass a
+"does it render" test and start lying the first time a threshold was tuned — the same
+drift this project has repeatedly had to correct in its own docs. Tuning
+`config/config.yaml` and restarting changes what the page says.
+
+Details that follow from that goal:
+
+- **Derived figures are computed the way the engine computes them.** Maximum exposure
+  is size × concurrency (the product config validation caps at 100%), and the MACD
+  warm-up is `slow + signal` candles × the interval — so the panel cannot disagree
+  with behaviour.
+- **Numbers are printed exactly, with only trailing zeros trimmed.** Fixed precision
+  would round a tuned `3.25` to `3.2` (Go rounds half to even), and someone who had
+  just set 3.25 would reasonably conclude their change had not applied.
+- **Exits are listed in the order `strategy.EvaluateExit` checks them**, because the
+  first match wins; any other order would misrepresent which rule takes effect. The
+  heading says so rather than leaving the order to be inferred.
+- **Conditional settings appear only when they apply.** A limit order's slippage
+  allowance is shown for `order_type: limit` and hidden for `market`, where the value
+  is set but inert. The all-negative sentiment requirement changes how the halt
+  threshold is described.
+- It lives **inside the polled fragment**, so it is never stale relative to the rest
+  of the page.
 
 ## Refresh behavior
 

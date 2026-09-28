@@ -15,7 +15,7 @@ There is one Alpaca account/API key set used for both market data and order exec
 
 | Package | Responsibility |
 |---|---|
-| `scheduler` | Pure session arithmetic: given the exchange's calendar day and config, reports which phase the clock is in (closed / first hour / trading / EOD window) and where the boundaries fall. Holds no state and does no I/O. |
+| `scheduler` | Pure session arithmetic, including the countdowns the status page shows (`UntilOpen`, `UntilClose`, `FormatCountdown`): given the exchange's calendar day and config, reports which phase the clock is in (closed / first hour / trading / EOD window) and where the boundaries fall. Holds no state and does no I/O. |
 | `engine` | Drives the daily loop that `scheduler` describes, plus restart reconciliation. One `Tick` decides what is due; there are no per-phase goroutines and no direct `time.Now()` calls (the clock is injected, which is what makes a whole day testable). |
 | `config` | Loads and validates `config/config.yaml`, rejecting configurations that would only fail mid-session — for example sizing × concurrency exceeding 100% of the portfolio. Credentials are read from the environment here, never from YAML. |
 | `domain` | Shared types (positions, snapshots, evaluations, agent states). Exists to keep `store`, `broker`, `strategy`, `risk` and `web` from importing each other. |

@@ -380,6 +380,16 @@ func (a *Alpaca) Calendar(ctx context.Context, date string) (CalendarDay, error)
 	return ParseCalendarDay(resp[0].Date, resp[0].Open, resp[0].Close)
 }
 
+// ET returns the exchange timezone, matching internal/scheduler. Kept local so the
+// broker package does not depend on scheduler.
+func ET() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.FixedZone("EST", -5*60*60)
+	}
+	return loc
+}
+
 // ParseCalendarDay converts the calendar's date plus "HH:MM" local exchange times
 // into absolute instants.
 func ParseCalendarDay(date, open, close string) (CalendarDay, error) {
@@ -407,6 +417,43 @@ func ParseCalendarDay(date, open, close string) (CalendarDay, error) {
 		return CalendarDay{}, err
 	}
 	return CalendarDay{Date: date, Open: o, Close: c}, nil
+}
+
+// nextSessionWindow is how far ahead to look for the next trading day. It has to
+// clear the longest closure: a holiday landing beside a weekend (Thanksgiving,
+// Christmas/New Year) can leave four consecutive non-trading days, so ten gives
+// comfortable margin without fetching a pointless amount of calendar.
+const nextSessionWindow = 10 * 24 * time.Hour
+
+func (a *Alpaca) NextSession(ctx context.Context, afterDate string) (CalendarDay, error) {
+	start, err := time.ParseInLocation("2006-01-02", afterDate, ET())
+	if err != nil {
+		return CalendarDay{}, fmt.Errorf("parse date %q: %w", afterDate, err)
+	}
+	end := start.Add(nextSessionWindow)
+
+	u := fmt.Sprintf("%s/v2/calendar?start=%s&end=%s", a.baseURL,
+		url.QueryEscape(start.AddDate(0, 0, 1).Format("2006-01-02")),
+		url.QueryEscape(end.Format("2006-01-02")))
+
+	var resp []struct {
+		Date  string `json:"date"`
+		Open  string `json:"open"`
+		Close string `json:"close"`
+	}
+	if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+		return CalendarDay{}, err
+	}
+	for _, day := range resp {
+		// The range excludes afterDate itself, but guard anyway rather than trust it.
+		if day.Date <= afterDate {
+			continue
+		}
+		return ParseCalendarDay(day.Date, day.Open, day.Close)
+	}
+	// No session in the window is not an error — the caller renders "unknown"
+	// rather than a wrong countdown.
+	return CalendarDay{}, nil
 }
 
 func (a *Alpaca) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error) {

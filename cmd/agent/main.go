@@ -312,6 +312,14 @@ func seedFake(now time.Time) *broker.Fake {
 	fake.SetCalendar(broker.CalendarDay{
 		Date: scheduler.SessionDate(now), Open: open, Close: close,
 	})
+	// So the demo exercises the "opens in" countdown too, once its compressed session
+	// has finished, rather than showing nothing.
+	tomorrow := now.AddDate(0, 0, 1)
+	fake.SetNextSession(broker.CalendarDay{
+		Date:  scheduler.SessionDate(tomorrow),
+		Open:  time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 9, 30, 0, 0, scheduler.ET),
+		Close: time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 16, 0, 0, 0, scheduler.ET),
+	})
 
 	// A bullish tape so the sentiment gate opens.
 	for _, sym := range []string{"SPY", "QQQ", "IWM"} {

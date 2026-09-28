@@ -4,6 +4,7 @@ package web
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,6 +97,13 @@ type View struct {
 	MarketLabel string
 	SessionText string
 	EarlyClose  bool
+	// Countdown is "closes in 4h 12m" while open, or "opens in 15h 42m" while closed.
+	// Empty when the next boundary is not known — after the close with a failed
+	// calendar lookup, say — because a blank is better than a wrong number.
+	Countdown string
+	// CountdownAt names the moment being counted towards, so the figure can be
+	// sanity-checked at a glance.
+	CountdownAt string
 
 	State        domain.AgentState
 	StateTone    string
@@ -126,8 +134,61 @@ type View struct {
 	EODNetTone string
 	EODWinLoss string
 
+	// Strategy is the active configuration, rendered for display. Every value is read
+	// from config rather than written into the template, so tuning a threshold and
+	// restarting is reflected here — a hardcoded panel would quietly start lying the
+	// first time a number changed.
+	Strategy []StrategySection
+
 	PollSeconds int
 	PaperMode   bool
+}
+
+// StrategySection groups related settings under a heading.
+type StrategySection struct {
+	Title string
+	Note  string
+	Rows  []StrategyRow
+}
+
+// StrategyRow is one setting: what it is, its current value, and why it matters where
+// that is not obvious from the number alone.
+type StrategyRow struct {
+	Label string
+	Value string
+	Note  string
+}
+
+// countdown renders the time to the next market boundary: the close while open, the
+// next open while closed.
+//
+// The "next open" is not always today's. Before the open on a trading day it is, but
+// after the close — or on a weekend or holiday — it is the following session, which
+// only the engine's cached calendar lookup knows. When that is unavailable both
+// strings are empty and the page simply shows no countdown, rather than inventing one.
+func countdown(now time.Time, sess scheduler.Session, tradingDay bool,
+	next scheduler.Session, nextKnown bool) (text, at string) {
+
+	if tradingDay {
+		if d, ok := scheduler.UntilClose(now, sess); ok {
+			return "closes in " + scheduler.FormatCountdown(d),
+				sess.Close.In(scheduler.ET).Format("15:04 MST")
+		}
+		// Before today's open, today's own session is the one to count towards.
+		if d, ok := scheduler.UntilOpen(now, sess); ok {
+			return "opens in " + scheduler.FormatCountdown(d),
+				sess.Open.In(scheduler.ET).Format("15:04 MST")
+		}
+	}
+
+	// Either a non-trading day, or today's session has finished.
+	if nextKnown {
+		if d, ok := scheduler.UntilOpen(now, next); ok {
+			return "opens in " + scheduler.FormatCountdown(d),
+				next.Open.In(scheduler.ET).Format("Mon 2 Jan, 15:04 MST")
+		}
+	}
+	return "", ""
 }
 
 func money(v float64) string { return fmt.Sprintf("$%.2f", v) }
@@ -157,6 +218,8 @@ func BuildView(
 	errMessage string,
 	sess scheduler.Session,
 	tradingDay bool,
+	next scheduler.Session,
+	nextKnown bool,
 	now time.Time,
 	paperMode bool,
 ) (*View, error) {
@@ -200,6 +263,7 @@ func BuildView(
 	} else {
 		v.MarketLabel = "CLOSED"
 	}
+	v.Countdown, v.CountdownAt = countdown(now, sess, tradingDay, next, nextKnown)
 
 	rec, err := st.Session(date)
 	if err != nil {
@@ -333,5 +397,179 @@ func BuildView(
 		v.EODWinLoss = fmt.Sprintf("%d up · %d down", wins, losses)
 	}
 
+	v.Strategy = strategySections(cfg)
+
 	return v, nil
+}
+
+// strategySections describes the running strategy from the loaded configuration.
+//
+// Everything here is derived from cfg. Values that the code computes rather than
+// reads — maximum exposure, the MACD warm-up — are computed the same way the engine
+// computes them, so the panel cannot disagree with behaviour. Settings that only
+// apply conditionally (a limit order's slippage allowance) appear only when they do.
+func strategySections(cfg *config.Config) []StrategySection {
+	pctOf := func(v float64) string { return trimNumber(v) + "%" }
+
+	gate := StrategySection{
+		Title: "1 · Sentiment gate",
+		Note: fmt.Sprintf("No trades are placed during the first %s after the open.",
+			durationText(cfg.Timing.SentimentWindow)),
+		Rows: []StrategyRow{
+			{Label: "Window after open", Value: durationText(cfg.Timing.SentimentWindow)},
+			{Label: "Poll interval", Value: durationText(cfg.Timing.SentimentPollInterval)},
+			{Label: "Basket", Value: strings.Join(cfg.Sentiment.Symbols, ", ")},
+			{
+				Label: "Halts the day when",
+				Value: fmt.Sprintf("average ≤ %s", pctOf(cfg.Sentiment.BearishAvgPct)),
+				Note: map[bool]string{
+					true:  "and no symbol in the basket is positive",
+					false: "regardless of individual symbols",
+				}[cfg.Sentiment.RequireAllNegative],
+			},
+		},
+	}
+
+	screening := StrategySection{
+		Title: "2 · Screening",
+		Note: "Every tradable US equity is scanned each pass; the price move is checked " +
+			"first, and only symbols clearing it incur the per-symbol lookups. Nothing here " +
+			"filters on company size.",
+		Rows: []StrategyRow{
+			{Label: "Intraday move", Value: "≥ " + pctOf(cfg.Screening.MinIntradayPct)},
+			{
+				Label: "Relative volume",
+				Value: "≥ " + trimNumber(cfg.Screening.MinVolumeMultiple) + "x",
+				Note: fmt.Sprintf("versus the %d-session average, excluding today",
+					cfg.Screening.AvgVolumeLookbackDays),
+			},
+			{
+				Label: "News catalyst",
+				Value: "at least one story",
+				Note:  "within " + durationText(cfg.Screening.NewsLookback) + ", so pre-market catalysts count",
+			},
+			{Label: "Scan interval", Value: durationText(cfg.Timing.ScreenerScanInterval)},
+			{
+				Label: "Enrichment cap",
+				Value: fmt.Sprintf("%d symbols", cfg.Screening.MaxEnriched),
+				Note:  "the busiest by dollar volume, when more clear the move threshold",
+			},
+			{
+				Label: "Data feed",
+				Value: cfg.MarketData.Feed,
+				Note: map[bool]string{
+					true:  "full consolidated tape",
+					false: "single exchange — relative volume is not market-wide on this feed",
+				}[cfg.MarketData.Feed == "sip"],
+			},
+		},
+	}
+
+	// Derived the same way risk.Size and config validation do, so the figure shown is
+	// the figure enforced.
+	maxExposure := cfg.Risk.PositionSizePct * float64(cfg.Risk.MaxConcurrentPositions)
+	entry := StrategySection{
+		Title: "3 · Entry",
+		Note:  "Day-trade only; nothing is held overnight.",
+		Rows: []StrategyRow{
+			{
+				Label: "Position size",
+				Value: pctOf(cfg.Risk.PositionSizePct) + " of portfolio",
+				Note:  "clamped to available cash, rounded down to whole shares",
+			},
+			{Label: "Concurrent positions", Value: fmt.Sprintf("up to %d", cfg.Risk.MaxConcurrentPositions)},
+			{
+				Label: "Maximum exposure",
+				Value: pctOf(maxExposure),
+				Note:  "size × concurrency",
+			},
+			{Label: "Ranking", Value: "highest relative volume first"},
+			{
+				Label: "Same-day re-entry",
+				Value: map[bool]string{true: "allowed", false: "blocked"}[cfg.Risk.AllowSameDayReentry],
+			},
+		},
+	}
+	if cfg.Execution.OrderType == "limit" {
+		entry.Rows = append(entry.Rows, StrategyRow{
+			Label: "Order type", Value: "limit",
+			Note: fmt.Sprintf("priced %s away from the quote", pctOf(cfg.Execution.LimitSlipPct)),
+		})
+	} else {
+		entry.Rows = append(entry.Rows, StrategyRow{
+			Label: "Order type", Value: cfg.Execution.OrderType,
+			Note: "fills are guaranteed but can slip on thinly traded names",
+		})
+	}
+
+	// Listed in the order strategy.EvaluateExit checks them, because that order is
+	// the priority: the first match wins, and showing them in any other order would
+	// misrepresent which rule takes effect.
+	warmup := time.Duration(cfg.MACDWarmupBars()*cfg.Exit.MACDIntervalMins) * time.Minute
+	exits := StrategySection{
+		Title: "4 · Exits, in priority order",
+		Note:  "Whichever triggers first closes the position.",
+		Rows: []StrategyRow{
+			{
+				Label: "Forced end-of-day",
+				Value: fmt.Sprintf("%d min before close", cfg.Exit.EODExitOffsetMins),
+				Note:  "unconditional, regardless of P&L",
+			},
+			{
+				Label: "Stop-loss",
+				Value: "−" + pctOf(cfg.Risk.StopLossPct) + " from entry",
+				Note:  "a hard floor, checked ahead of the momentum signals",
+			},
+			{
+				Label: "Profit target",
+				Value: "+" + pctOf(cfg.Exit.ProfitTargetPct),
+				Note:  "arms the trailing stop; it does not sell on its own",
+			},
+			{
+				Label: "Trailing stop",
+				Value: pctOf(cfg.Exit.TrailingStopPct) + " below the peak",
+				Note:  "active only once the profit target has been reached",
+			},
+			{
+				Label: "MACD bearish cross",
+				Value: fmt.Sprintf("%d/%d/%d on %d-minute candles",
+					cfg.Exit.MACDFast, cfg.Exit.MACDSlow, cfg.Exit.MACDSignal,
+					cfg.Exit.MACDIntervalMins),
+				Note: fmt.Sprintf("needs %d candles (%s) of session data, so it cannot fire before then",
+					cfg.MACDWarmupBars(), durationText(warmup)),
+			},
+		},
+	}
+
+	return []StrategySection{gate, screening, entry, exits}
+}
+
+// trimNumber renders a configured number exactly, dropping only trailing zeros.
+//
+// Fixed precision would misreport a tuned value: %.1f turns 3.25 into "3.2" (Go rounds
+// half to even), so someone who set 3.25 would see 3.2 and reasonably conclude their
+// change had not taken effect. The shortest round-tripping form avoids that while still
+// printing 10 rather than 10.0.
+func trimNumber(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// durationText renders a config duration the way someone reading the page would say
+// it, rather than Go's "1h0m0s".
+func durationText(d time.Duration) string {
+	switch {
+	case d == 0:
+		return "0"
+	case d%time.Hour == 0 && d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	case d%time.Minute == 0 && d >= time.Minute:
+		if d >= time.Hour {
+			return fmt.Sprintf("%dh %dm", int(d/time.Hour), int(d/time.Minute)%60)
+		}
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	default:
+		return d.String()
+	}
 }

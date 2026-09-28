@@ -70,6 +70,11 @@ type MarketData interface {
 type Trading interface {
 	Account(ctx context.Context) (domain.Account, error)
 	Calendar(ctx context.Context, date string) (CalendarDay, error)
+	// NextSession returns the first trading session on a date strictly after the
+	// given one. The status page needs it to count down to the next open: after the
+	// close, or on a weekend or holiday, today's calendar entry says nothing about
+	// when trading resumes.
+	NextSession(ctx context.Context, afterDate string) (CalendarDay, error)
 	PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error)
 	Positions(ctx context.Context) ([]BrokerPosition, error)
 }

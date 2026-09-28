@@ -51,7 +51,12 @@ type Engine struct {
 	lastError    string
 	session      scheduler.Session
 	sessionKnown bool
-	lastScan     time.Time
+	// nextSession is the first session after today, for the status page's countdown
+	// to the next open. After the close — or on a weekend or holiday — today's
+	// calendar entry says nothing about when trading resumes.
+	nextSession      scheduler.Session
+	nextSessionKnown bool
+	lastScan         time.Time
 
 	// The tradable universe barely changes within a day, so it is fetched once per
 	// session rather than on every one-minute scan.
@@ -101,6 +106,15 @@ func (e *Engine) Session() (scheduler.Session, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.session, e.sessionKnown
+}
+
+// NextSession returns the first session after today, and whether it is known.
+// Unknown is a normal outcome — the calendar lookup may have failed — and callers
+// render nothing rather than guessing.
+func (e *Engine) NextSession() (scheduler.Session, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.nextSession, e.nextSessionKnown
 }
 
 func (e *Engine) setState(s domain.AgentState) {
@@ -323,8 +337,21 @@ func (e *Engine) loadSession(ctx context.Context) (scheduler.Session, bool, erro
 		sess = scheduler.Session{Date: date}
 	}
 
+	// Fetched in the same pass, so it costs one extra call per day rather than one
+	// per tick. A failure here is not fatal: the countdown simply reads "unknown"
+	// while trading continues.
+	next, nextKnown := scheduler.Session{}, false
+	if day, err := e.trading.NextSession(ctx, date); err != nil {
+		e.log.Warn("next session unavailable; the page cannot count down to the next open",
+			"err", err)
+	} else if !day.Open.IsZero() && !day.Close.IsZero() {
+		next = scheduler.Session{Date: day.Date, Open: day.Open, Close: day.Close}
+		nextKnown = true
+	}
+
 	e.mu.Lock()
 	e.session, e.sessionKnown = sess, tradingDay
+	e.nextSession, e.nextSessionKnown = next, nextKnown
 	e.mu.Unlock()
 	return sess, tradingDay, nil
 }

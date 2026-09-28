@@ -22,6 +22,7 @@ type Fake struct {
 	news      map[string]int
 	avgVolume map[string]float64
 	day       CalendarDay
+	nextDay   CalendarDay
 	positions map[string]BrokerPosition
 	placed    []OrderRequest
 	err       error
@@ -57,6 +58,22 @@ func (f *Fake) SetCalendar(day CalendarDay) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.day = day
+}
+
+// SetNextSession defines what NextSession reports, for the status page's countdown.
+func (f *Fake) SetNextSession(day CalendarDay) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextDay = day
+}
+
+func (f *Fake) NextSession(_ context.Context, _ string) (CalendarDay, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return CalendarDay{}, f.err
+	}
+	return f.nextDay, nil
 }
 
 // SetAssets defines the tradable universe the screener will scan.

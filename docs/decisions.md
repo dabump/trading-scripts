@@ -278,6 +278,37 @@ written in the same session where the standard "a test that cannot fail proves n
 was applied repeatedly to the implementation. Every fix in this pass was verified by
 reverting the fix and watching the new test fail.
 
+## 2026-09-28 — Market-hours countdown on the status page
+
+| Decision | Rationale |
+|---|---|
+| The market-hours badge carries a countdown: time to the close while open, time to the next open while closed | User request. |
+| The engine looks up and caches the *next* session once per day (`broker.NextSession`) | Today's calendar entry says nothing about when trading resumes, so after the close — or on a weekend or holiday, which is most of the time anyone would want this — the countdown had no target. The web layer cannot call the broker itself, so the engine caches it alongside today's session: one extra call per day, not per tick. |
+| A failed next-session lookup renders no countdown rather than a guess | A blank is honest; a wrong "opens in" is worse than nothing. The lookup failing also must not fault the agent — trading is unaffected. |
+| Minute resolution, not seconds | The page polls every ~12s, so a seconds figure would advance in 12-second jumps and read as broken. None of these boundaries is actionable to the second, since the agent handles them itself. |
+| The countdown lives in the polled fragment | Otherwise it would freeze between manual reloads. A test asserts it is present in `/fragment`, not just `/`. |
+| A 10-day calendar window for the next session | Has to clear the longest closure: a holiday beside a weekend (Thanksgiving, Christmas/New Year) can leave four consecutive non-trading days. |
+
+Not added: countdowns to the *first-hour gate* or the *forced EOD exit*, which are
+arguably the more operationally meaningful deadlines for this system. Both were left out
+as scope the user did not ask for; easy to add if wanted.
+
+## 2026-09-28 — Active strategy panel on the status page
+
+| Decision | Rationale |
+|---|---|
+| A four-section panel at the foot of the page, built entirely from the loaded config | User request, with the explicit requirement that tuning the config be reflected. A hardcoded panel would pass a render test and start lying the first time a number changed — the exact drift this project has had to correct in its own docs more than once. |
+| Derived values recomputed the way the engine computes them | Maximum exposure (size × concurrency) and the MACD warm-up (`slow + signal` candles × interval) are shown as derived, so the panel cannot disagree with behaviour. |
+| Numbers printed exactly, trailing zeros trimmed, rather than fixed precision | Found while testing: `%.1f` renders a tuned `3.25` as `3.2`, because Go rounds half to even. Someone who had just set 3.25 would see 3.2 and reasonably conclude the change had not applied — which defeats the purpose of the panel. |
+| Exits listed in `EvaluateExit`'s check order, labelled as priority | The first match wins, so any other order misrepresents which rule takes effect. |
+| Conditional settings shown only when they apply | `limit_slip_pct` is inert under `order_type: market`, and `require_all_negative` changes what the bearish threshold means. |
+| Rendered inside the polled fragment | Otherwise it could sit stale beside live state that had refreshed. |
+
+Verified by mutating config and observing the page follow: move 10→12.75%, size
+10→6.5%, concurrency 5→8 (exposure recomputing to 52%), stop 10→4%, market→limit (the
+slippage note appearing). A test table asserts each field independently against the
+JSON view, so a label/value pair cannot pass by coincidental substring match.
+
 ## Open items (not yet decided)
 
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.

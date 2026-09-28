@@ -65,8 +65,11 @@ services:
     image: trading-agent:latest
     container_name: trading-agent-offline
     command: ["-config", "/app/config/config.yaml", "-offline"]
+    # 8082, not 8081: the main agent runs detached with restart: unless-stopped, so
+    # sharing a host port meant the documented demo command always failed with "port is
+    # already allocated".
     ports:
-      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:8082:8080"
     volumes:
       # Deliberately separate from the live volumes: demo runs must never write into
       # the real database or the real audit trail.

@@ -6,10 +6,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,7 +42,9 @@ func run() error {
 			"run against an in-memory fake broker with seeded data; no credentials, no network, no real orders")
 		allowLive = flag.Bool("allow-live-trading", false,
 			"required to start when ALPACA_BASE_URL points at the live endpoint")
-		verbose = flag.Bool("verbose", false, "enable debug logging")
+		verbose     = flag.Bool("verbose", false, "enable debug logging")
+		healthcheck = flag.Bool("healthcheck", false,
+			"probe a running agent's /healthz and exit 0 if healthy; used by the container healthcheck")
 	)
 	flag.Parse()
 
@@ -50,6 +57,12 @@ func run() error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+
+	// Before any store, audit or broker setup: the probe must be cheap and must not
+	// touch the running agent's state.
+	if *healthcheck {
+		return probeHealth(cfg.Web.ListenAddr)
 	}
 
 	if dir := filepath.Dir(cfg.Storage.DatabasePath); dir != "" && dir != "." {
@@ -162,7 +175,8 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errs := make(chan error, 2)
+	const components = 2
+	errs := make(chan error, components)
 	go func() { errs <- srv.Serve(ctx) }()
 	go func() { errs <- eng.Run(ctx) }()
 
@@ -170,12 +184,115 @@ func run() error {
 		"listen", cfg.Web.ListenAddr, "db", cfg.Storage.DatabasePath,
 		"audit", auditLog.Path(scheduler.SessionDate(now)))
 
-	err = <-errs
-	if errors.Is(err, context.Canceled) {
-		logger.Info("shutting down")
-		return nil
+	if err := waitForShutdown(errs, components, &stopOnce{stop: stop}, shutdownGrace, logger); err != nil {
+		return err
 	}
-	return err
+	logger.Info("shutting down")
+	return nil
+}
+
+// probeHealth asks a running agent whether it is healthy.
+//
+// It reads the port from the same config the server binds, which is the point: the
+// container config is bind-mounted, so a hardcoded port in the healthcheck would leave
+// the container permanently unhealthy after a listen_addr change while the daemon was
+// perfectly fine.
+func probeHealth(listenAddr string) error {
+	addr, err := dialableAddr(listenAddr)
+	if err != nil {
+		return err
+	}
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return fmt.Errorf("healthcheck: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("healthcheck: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// dialableAddr turns a listen address into one that can be connected to. A server
+// listening on ":8080" binds every interface, but ":8080" is not a valid dial target,
+// so an empty host becomes loopback.
+func dialableAddr(listenAddr string) (string, error) {
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return "", fmt.Errorf("parse web.listen_addr %q: %w", listenAddr, err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// shutdownGrace bounds how long a component gets to stop after the others have. It sits
+// below the compose stop_grace_period so Docker's SIGKILL is the backstop, not the
+// normal path.
+const shutdownGrace = 15 * time.Second
+
+// stopOnce wraps the context cancel so waitForShutdown can trigger shutdown itself
+// without caring whether a signal already did.
+type stopOnce struct {
+	once sync.Once
+	stop func()
+}
+
+func (s *stopOnce) Stop() {
+	s.once.Do(s.stop)
+}
+
+// waitForShutdown blocks until every component has reported, and returns the first real
+// error among them.
+//
+// Waiting for all of them is the point. Both components exit on context cancellation,
+// but the web server returns almost instantly while the engine may be mid-tick
+// submitting an order or appending an audit event. Returning after the first would run
+// the caller's deferred store and audit Close while the engine is still writing — losing
+// an audit record, or writing against a closed database.
+//
+// The first component to finish also triggers cancellation, so one of them failing on its
+// own brings the other down instead of leaving it orphaned.
+func waitForShutdown(errs <-chan error, components int, stop interface{ Stop() }, grace time.Duration, log *slog.Logger) error {
+	var firstErr error
+
+	for i := 0; i < components; i++ {
+		if i == 0 {
+			err := <-errs
+			stop.Stop()
+			if isCleanShutdown(err) {
+				err = nil
+			}
+			firstErr = err
+			continue
+		}
+
+		select {
+		case err := <-errs:
+			if !isCleanShutdown(err) && firstErr == nil {
+				firstErr = err
+			}
+		case <-time.After(grace):
+			// Give up waiting rather than hang forever, but say so: anything the
+			// straggler was midway through is now unaccounted for.
+			log.Error("component did not stop within the grace period; "+
+				"state may be incomplete", "grace", grace, "still_running", components-i)
+			return firstErr
+		}
+	}
+	return firstErr
+}
+
+// isCleanShutdown reports whether an error simply means "asked to stop".
+func isCleanShutdown(err error) bool {
+	return err == nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, http.ErrServerClosed)
 }
 
 // seedFake builds an offline broker with a plausible session and one candidate

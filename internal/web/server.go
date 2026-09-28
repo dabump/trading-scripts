@@ -69,6 +69,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handlePage)
 	mux.HandleFunc("/fragment", s.handleFragment)
 	mux.HandleFunc("/api/status", s.handleJSON)
+	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/actions/sentiment", s.handleCheckSentiment)
 	mux.HandleFunc("/actions/screen", s.handleScreenNow)
 	return mux
@@ -288,6 +289,33 @@ func (s *Server) handleFragment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "content", v)
+}
+
+// handleHealth reports whether the agent is faulted, for the container healthcheck.
+//
+// It is deliberately separate from /api/status, which answers 200 in every state
+// because it is an information endpoint. Pointing a healthcheck at that would report
+// healthy while the agent sat in ERROR unable to trade.
+//
+// A bearish halt is healthy: it is the kill switch working as designed, not a fault.
+// Only StateError is unhealthy.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	state, errMsg := s.engine.State()
+
+	status := http.StatusOK
+	if state == domain.StateError {
+		status = http.StatusServiceUnavailable
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	// The message goes in the body so `docker inspect` output explains itself.
+	if errMsg != "" {
+		fmt.Fprintf(w, "%s: %s\n", state, errMsg)
+		return
+	}
+	fmt.Fprintf(w, "%s\n", state)
 }
 
 // handleJSON exposes the same state as machine-readable output, which is what

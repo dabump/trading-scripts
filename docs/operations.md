@@ -125,20 +125,31 @@ jq 'select(.kind == "POSITION_OPENED")' logs/audit-2026-09-28.jsonl
 cp .env.example .env            # then fill in the Alpaca paper keys
 docker compose up -d --build    # paper trading
 docker compose logs -f agent
-docker compose --profile demo up agent-offline   # fake broker, no credentials, port 8081
+docker compose --profile demo up agent-offline   # fake broker, no credentials, port 8082
 ```
 
-The status page is published on `127.0.0.1:8080` only — bound to loopback rather
-than every interface, because the page exposes positions and the two manual buttons
-and has no authentication.
+The status page is published on `127.0.0.1:8081` only (the demo profile uses 8082) —
+bound to loopback rather than every interface, because the page exposes positions and
+the two manual buttons and has no authentication. The two services deliberately use
+different host ports: the main agent runs detached under `restart: unless-stopped`, so
+sharing one meant the demo command always failed with "port is already allocated".
 
 Notes on the image, since several of these are the difference between working and
 subtly wrong:
 
-- **The binary embeds its own timezone database** (`internal/scheduler`). Every
-  session boundary is defined in exchange time, and a minimal image carries no
-  tzdata — without the embed the fallback engages and puts every boundary an hour out
-  from March to November. `TestExchangeTimezoneHandlesDST` fails if that regresses.
+- **The binary embeds its own timezone database** (`internal/scheduler`), and the image
+  deliberately does **not** install `tzdata`. Every session boundary is defined in
+  exchange time, and without a timezone database the fallback engages and puts every
+  boundary an hour out from March to November.
+
+  What guards this is worth being precise about, because an earlier version of these
+  docs got it wrong. Go's `LoadLocation` consults `$ZONEINFO`, the system zoneinfo
+  directory, and `$GOROOT/lib/time/zoneinfo.zip` *before* the `time/tzdata` embed, and
+  that GOROOT zip ships with every toolchain. So no unit test can prove the embed is
+  present — `TestExchangeTimezoneHandlesDST` only proves `ET` is a real DST-aware zone,
+  which catches the fallback engaging but not the import being removed. The real guard is
+  that the runtime image has no system database, making the embed the only source, plus
+  the container check below.
 - **`CGO_ENABLED=0` is load-bearing, not tuning.** The SQLite driver is pure Go, so
   the binary is fully static; verified with `file` reporting "statically linked".
 - **`data/` and `logs/` are named volumes.** The database is what makes a restart
@@ -153,10 +164,29 @@ subtly wrong:
 - **`ENTRYPOINT` uses exec form** so SIGTERM reaches the process and triggers the
   graceful shutdown the daemon implements, with a 30s grace period — being killed
   mid-order-submission is the one moment worth being patient about.
-- **The healthcheck hits `/api/status`**, which reports the agent's own view of
-  itself, so a wedged daemon is caught rather than just a dead process.
+- **The healthcheck probes `/healthz`**, which returns 503 when the agent state is
+  `ERROR`. `/api/status` answers 200 in every state — it is an information endpoint — so
+  pointing a healthcheck at it would have reported a wedged agent as healthy. A bearish
+  halt stays *healthy*: that is the kill switch working, not a fault.
+
+  The probe runs the binary with `-healthcheck` rather than `wget`, so it reads the port
+  from the same config the server binds; a hardcoded port would leave the container
+  permanently unhealthy after a `listen_addr` change while the daemon was fine.
+
+  Note this *reports* health, it does not act on it: compose's `restart: unless-stopped`
+  ignores health status, so an unhealthy container is surfaced and left running.
 - Container logs are capped (10MB × 5); the durable record is the audit trail on the
   volume, not Docker's log driver.
+
+Verifying the timezone guarantee against a running container — the only place it can be
+checked, since no unit test can:
+
+```bash
+docker compose exec agent sh -c 'ls /usr/share/zoneinfo 2>&1 | head -1'   # expect "No such file"
+curl -s http://127.0.0.1:8081/api/status | grep -o '"GeneratedAt":"[^"]*"'
+#   must read EDT between March and November; EST there means the embed is gone and
+#   every session boundary is an hour out
+```
 
 Going live inside a container still takes both deliberate steps — `ALPACA_BASE_URL`
 pointing at the live endpoint *and* `-allow-live-trading` added to the command — and

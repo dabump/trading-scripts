@@ -25,10 +25,15 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ---------- runtime ----------
 FROM alpine:3.21
 
-# ca-certificates: required for TLS to Alpaca; without it every API call fails.
-# tzdata: the binary embeds its own copy (see internal/scheduler), so this is only
-# for anything that shells in and wants a sane local time.
-RUN apk add --no-cache ca-certificates tzdata wget \
+# ca-certificates only: required for TLS to Alpaca; without it every API call fails.
+#
+# tzdata is deliberately NOT installed. Go consults the system zoneinfo database before
+# the time/tzdata embed, so installing it here would mask the embed and leave the
+# guarantee untested — exactly the situation a review caught. With no system database,
+# the embed is the only source, so if someone drops the import the container is
+# immediately and visibly wrong rather than silently correct until it is deployed
+# somewhere leaner. wget is likewise unnecessary: the healthcheck uses the binary.
+RUN apk add --no-cache ca-certificates \
     && addgroup -g 10001 agent \
     && adduser -D -u 10001 -G agent agent
 
@@ -50,10 +55,17 @@ USER agent
 
 EXPOSE 8080
 
-# Hits the status endpoint the page already serves. It reports the agent's own view
-# of itself, so this catches a wedged daemon, not just a dead process.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -q -O- http://127.0.0.1:8080/api/status >/dev/null || exit 1
+# Probes /healthz, which returns 503 when the agent has faulted — unlike /api/status,
+# which answers 200 in every state and so would report a wedged agent as healthy.
+#
+# The binary does the probing rather than wget: it reads the port from the same config the
+# server binds, so a listen_addr change in the bind-mounted config cannot leave the
+# container permanently unhealthy while the daemon is fine.
+#
+# Note this reports health; it does not act on it. compose's restart: unless-stopped
+# ignores health status, so an unhealthy container is surfaced, not restarted.
+HEALTHCHECK --interval=30s --timeout=8s --start-period=15s --retries=3 \
+  CMD ["/app/agent", "-config", "/app/config/config.yaml", "-healthcheck"]
 
 # No shell form: signals reach the process directly, so SIGTERM triggers the
 # graceful shutdown the daemon already implements rather than being swallowed.

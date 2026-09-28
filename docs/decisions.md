@@ -256,6 +256,28 @@ points (including SQLite's WAL sidecars); `/` and `/api/status` both answer 200;
 SIGTERM produces a clean shutdown. The first `docker compose up --build` is still the
 real test.
 
+## 2026-09-27 — Code review of the containerisation change
+
+`/code-review` on commit `0656217` returned seven findings. All seven were independently
+verified and all stood. The three that mattered:
+
+| Finding | Reality | Fix |
+|---|---|---|
+| Both compose services published host port 8081 | The documented demo command could never run: the main agent is detached under `restart: unless-stopped`, so `docker compose --profile demo up agent-offline` always failed with "port is already allocated". | `agent-offline` moved to 8082. The main agent stays on 8081 (a deliberate local change); the docs were wrong, not the compose file. |
+| SIGTERM did not shut down gracefully, despite three places claiming it did | `main` did `err = <-errs` across two goroutines and returned on whichever finished first. `Serve` swallows `http.ErrServerClosed` and returns almost instantly, so `run()` returned — firing the deferred store and audit `Close` — while the engine could still be mid-tick submitting an order. The `stop_grace_period: 30s` was never used. It also explains why "shutting down" appeared in one manual test but was never guaranteed: it only logged when the engine won the race. | New `waitForShutdown`, extracted so it could be unit-tested. Waits for every component, triggers cancellation after the first finishes so a lone failure does not orphan the other, and bounds the wait at 15s. |
+| Two tests could not fail, and one was cited in two docs as a guarantee | Verified against Go's source: `LoadLocation` consults `$ZONEINFO`, the system zoneinfo directory and `$GOROOT/lib/time/zoneinfo.zip` *before* the `time/tzdata` embed, and that zip ships with every toolchain — so removing the import broke nothing. Separately, `TestSessionBoundariesAreHostTimezoneIndependent` asserted `open.In(loc).In(ET)`, an identity operation, so it passed for every input including the degraded fixed-zone fallback it existed to detect. | `tzdata` dropped from the runtime image so the embed is genuinely the only source; the DST test's comment corrected to say what it actually guards; the tautology replaced with a test that overrides `time.Local` and asserts the real property. The container check is now documented as the only real guard on the embed. |
+
+The remaining four (healthcheck reporting healthy while faulted, healthcheck port
+hardcoded against a bind-mounted config, `.dockerignore` matching only `.env`, and the
+false claims in `CLAUDE.md`/`docs/operations.md`) were fixed in the same pass: `/healthz`
+added returning 503 only on `StateError`, a `-healthcheck` flag that reads the port from
+config, `.env*` with `!.env.example`, and the docs corrected.
+
+**Worth recording plainly:** two of the seven were tests of mine that could not fail,
+written in the same session where the standard "a test that cannot fail proves nothing"
+was applied repeatedly to the implementation. Every fix in this pass was verified by
+reverting the fix and watching the new test fail.
+
 ## Open items (not yet decided)
 
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.

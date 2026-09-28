@@ -1,6 +1,10 @@
 # Keep credentials and runtime state out of the build context entirely — anything
 # copied in is recoverable from the image, so secrets must never enter it.
-.env
+# .env* rather than .env: dockerignore patterns are literal and * does not cross a
+# slash, so plain ".env" would let .env.local / .env.paper / .env.live into the build
+# context and the build-stage layer.
+.env*
+!.env.example
 data/
 logs/
 

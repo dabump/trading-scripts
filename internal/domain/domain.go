@@ -42,6 +42,13 @@ const (
 	VerdictPending Verdict = "PENDING"
 	VerdictProceed Verdict = "PROCEED"
 	VerdictBearish Verdict = "OVERWHELMINGLY_BEARISH"
+	// VerdictOverridden is an operator dismissing a halt the gate could not actually
+	// judge — the daemon started after the first hour, so no readings exist and
+	// resolveGate halts rather than trading without the safety check. Distinct from
+	// PROCEED for the same reason ExitManual is distinct from a strategy exit: the
+	// gate did not pass, it was stood down, and the page and the trail should not
+	// later claim otherwise.
+	VerdictOverridden Verdict = "GATE_OVERRIDDEN"
 )
 
 // ExitReason records why a position was closed. Mirrors the exit triggers in
@@ -57,6 +64,11 @@ const (
 	// sale at the first profit target, which banks part of the trade and leaves a
 	// runner open.
 	ExitScaleOut ExitReason = "SCALE_OUT"
+	// ExitManual is an operator closing a position from the status page. Kept
+	// distinct for the same reason ExitReconciled is: it is not a strategy rule
+	// firing, and any later reading of the trail — or of the end-of-day summary —
+	// must not attribute it to one.
+	ExitManual ExitReason = "MANUAL"
 	// ExitReconciled is not a strategy exit: it records a position the broker no
 	// longer holds, found during restart reconciliation. Kept distinct so the
 	// end-of-day summary never attributes a disappearance to a strategy rule.
@@ -231,6 +243,25 @@ type ScreenPreview struct {
 	// MarketOpen is false when this ran outside exchange hours, in which case the
 	// prices and percentages describe the last session, not a live move.
 	MarketOpen bool
+}
+
+// ManualOpen is what a manual open did, including the parts the operator most needs
+// to see before it is too late to object: how big, and where the stop is.
+type ManualOpen struct {
+	Position Position
+	Shares   int
+	Entry    float64
+	Stop     float64
+	// RiskDollar is what the position loses if the stop fills at its price.
+	RiskDollar float64
+	// FromSetup says the stop came from a real pullback on the chart rather than
+	// from the configured maximum. It is the difference between a stop the market
+	// drew and one the config did, and the operator should know which they got.
+	FromSetup bool
+	// SetupReason is why there was no setup, when there was not.
+	SetupReason string
+	// Halted records that the session's kill switch was on and this overrode it.
+	Halted bool
 }
 
 // SentimentReading is one 10-minute poll during the first hour.

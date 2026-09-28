@@ -130,6 +130,25 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
 }
 .pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); }
 
+.tabs { display: inline-flex; gap: 4px; margin-left: 12px; vertical-align: middle; }
+.tab {
+  font: inherit; font-size: 12px; cursor: pointer; padding: 4px 10px; border-radius: 6px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.tab .k { opacity: .6; margin-left: 4px; font-variant-numeric: tabular-nums; }
+
+button.mini {
+  font: inherit; font-size: 11px; cursor: pointer; padding: 3px 9px; border-radius: 5px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
+button.mini:hover:not(:disabled) { color: var(--text); }
+button.mini:disabled { opacity: .45; cursor: default; }
+button.mini.danger:hover:not(:disabled) {
+  color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+}
+
 .legend { display: grid; gap: 8px; }
 .legend .row { display: flex; gap: 12px; align-items: baseline; font-size: 13px; }
 .legend .row.active { color: var(--text); }
@@ -252,6 +271,115 @@ document.addEventListener('click', async (e) => {
   }
 });
 
+// Dismissing a halt the gate could not judge. It places no order — it only lets the
+// automated path resume — but it does mean the session runs without a kill switch, so
+// it says so rather than asking a bland "are you sure".
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-ignore-halt]');
+  if (!btn) return;
+  if (!confirm('Resume screening for this session?\n\nNo first-hour sentiment readings exist, ' +
+               'so the gate never ran and cannot run. The rest of the day will trade without a ' +
+               'sentiment kill switch behind it.')) return;
+
+  btn.disabled = true;
+  try {
+    const res = await fetch('actions/ignore-halt', {
+      method: 'POST', headers: { 'Accept': 'text/html' },
+    });
+    modalContent.innerHTML = await res.text();
+    if (!modal.open) modal.showModal();
+  } catch (err) {
+    modalContent.innerHTML = '<div class="mhead"><h3>Failed</h3></div>' +
+      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
+    if (!modal.open) modal.showModal();
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+});
+
+// Opening a position by hand. This overrides the setup gate — the rule the whole
+// strategy turns on — so the confirmation says so rather than asking a bland
+// "are you sure".
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-open]');
+  if (!btn) return;
+  const symbol = btn.dataset.open;
+  if (!confirm('Buy ' + symbol + ' now?\n\nThis overrides the setup gate. Size comes from the ' +
+               'risk budget and the stop, which may be the configured maximum rather than one ' +
+               'read off the chart.')) return;
+
+  btn.disabled = true;
+  modalContent.innerHTML = '<div class="mhead"><h3>Opening…</h3></div>' +
+    '<div class="mbody"><p class="note">Sizing and submitting the buy order.</p></div>';
+  if (!modal.open) modal.showModal();
+
+  try {
+    const res = await fetch('actions/open', {
+      method: 'POST',
+      headers: { 'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'symbol=' + encodeURIComponent(symbol),
+    });
+    modalContent.innerHTML = await res.text();
+  } catch (err) {
+    modalContent.innerHTML = '<div class="mhead"><h3>Open failed</h3></div>' +
+      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+});
+
+// Closing a position. It asks first, and the server asks again in its own way,
+// refusing when the exchange is shut or the position has already gone.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-close]');
+  if (!btn) return;
+  const symbol = btn.dataset.symbol || 'this position';
+  if (!confirm('Sell the remaining shares of ' + symbol + ' now?')) return;
+
+  btn.disabled = true;
+  modalContent.innerHTML = '<div class="mhead"><h3>Closing…</h3></div>' +
+    '<div class="mbody"><p class="note">Submitting the sell order.</p></div>';
+  if (!modal.open) modal.showModal();
+
+  try {
+    const res = await fetch('actions/close', {
+      method: 'POST',
+      headers: { 'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'id=' + encodeURIComponent(btn.dataset.close),
+    });
+    modalContent.innerHTML = await res.text();
+  } catch (err) {
+    modalContent.innerHTML = '<div class="mhead"><h3>Close failed</h3></div>' +
+      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+});
+
+// Which positions tab is showing. The fragment poll replaces the whole content
+// block, so the choice lives out here and is re-applied after every swap —
+// otherwise the page would snap back to Open every twelve seconds.
+let activeTab = 'open';
+try { activeTab = localStorage.getItem('positionsTab') || 'open'; } catch (e) { /* private window */ }
+
+function applyTab() {
+  document.querySelectorAll('[data-pane]').forEach(
+    p => p.hidden = p.dataset.pane !== activeTab);
+  document.querySelectorAll('.tab').forEach(
+    t => t.classList.toggle('active', t.dataset.tab === activeTab));
+}
+document.addEventListener('click', (e) => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  activeTab = tab.dataset.tab;
+  try { localStorage.setItem('positionsTab', activeTab); } catch (e) { /* ignored */ }
+  applyTab();
+});
+applyTab();
+
 // Re-fetches the rendered fragment and swaps it in, so the markup is produced in
 // exactly one place (the Go template) rather than duplicated in JS.
 const POLL_MS = {{.PollSeconds}} * 1000;
@@ -260,6 +388,7 @@ async function refresh() {
     const res = await fetch('fragment', { headers: { 'Accept': 'text/html' } });
     if (!res.ok) return;
     document.getElementById('content').innerHTML = await res.text();
+    applyTab();
   } catch (e) { /* a transient failure just leaves the last good render up */ }
 }
 setInterval(refresh, POLL_MS);
@@ -297,7 +426,13 @@ setInterval(refresh, POLL_MS);
 <div class="alert"><strong>▲ Fault:</strong> {{.ErrorMessage}}</div>
 {{end}}
 {{if .HaltReason}}
-<div class="alert soft"><strong>■ Halted for the session:</strong> {{.HaltReason}}</div>
+<div class="alert soft">
+  <strong>■ Halted for the session:</strong> {{.HaltReason}}
+  {{if .CanIgnoreHalt}}
+  <button type="button" class="mini" data-ignore-halt style="margin-left:10px"
+          title="Resume screening without a sentiment gate for this session">Ignore</button>
+  {{end}}
+</div>
 {{end}}
 
 <div class="grid two" style="margin-bottom:16px">
@@ -353,14 +488,22 @@ setInterval(refresh, POLL_MS);
 </section>
 
 <section class="card" style="margin-bottom:16px">
-  <h2>Open positions <span class="meta">{{.ExposureText}}</span></h2>
+  <h2>Positions
+    <span class="tabs">
+      <button type="button" class="tab" data-tab="open">Open <span class="k">{{len .Positions}}</span></button>
+      <button type="button" class="tab" data-tab="closed">Closed <span class="k">{{len .ClosedRows}}</span></button>
+    </span>
+    <span class="meta">{{.ExposureText}}</span>
+  </h2>
+
+  <div data-pane="open">
   {{if .Positions}}
   <table>
     <thead>
       <tr>
         <th>Symbol</th><th class="num">Shares</th><th class="num">Entry</th>
         <th class="num">Stop</th><th class="num">Current</th><th class="num">Peak</th>
-        <th class="num">R</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th>
+        <th class="num">R</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th></th>
       </tr>
     </thead>
     <tbody>
@@ -375,6 +518,10 @@ setInterval(refresh, POLL_MS);
         <td class="num muted">{{.RMultiple}}</td>
         <td class="num {{.Tone}}">{{.PnLDollars}}</td>
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
+        <td class="num">
+          <button type="button" class="mini danger" data-close="{{.ID}}" data-symbol="{{.Symbol}}"
+                  title="Sell the {{.Shares}} shares still held, now">Close</button>
+        </td>
       </tr>
       {{end}}
     </tbody>
@@ -382,16 +529,51 @@ setInterval(refresh, POLL_MS);
   {{else}}
   <div class="body"><p class="note">{{.PositionsNote}}</p></div>
   {{end}}
+  </div>
+
+  <div data-pane="closed" hidden>
+  {{if .ClosedRows}}
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th class="num">Shares</th><th class="num">Opened</th>
+        <th class="num">Closed</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th>Exit</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .ClosedRows}}
+      <tr>
+        <td class="sym">{{.Symbol}}</td>
+        <td class="num">{{.Shares}}</td>
+        <td class="num muted">{{.Open}}</td>
+        <td class="num">{{.Close}}</td>
+        <td class="num {{.Tone}}">{{.PnLDollars}}</td>
+        <td class="num {{.Tone}}">{{.PnLPct}}</td>
+        <td class="muted">{{.Reason}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{end}}
+  {{if .ShowTotals}}
+  <div class="totals">
+    <div><span class="label">Net P&amp;L</span><span class="value {{.EODNetTone}}">{{.EODNetPnL}}</span></div>
+    <div><span class="label">Result</span><span class="value">{{.EODWinLoss}}</span></div>
+  </div>
+  {{else}}
+  <div class="body"><p class="note">{{.ClosedNote}}</p></div>
+  {{end}}
+  </div>
 </section>
 
-<section class="card" {{if .ShowEOD}}style="margin-bottom:16px"{{end}}>
+<section class="card" style="margin-bottom:16px">
   <h2>Screening
     <span class="meta">{{if .ScreenTakenAt}}last pass {{.ScreenTakenAt}} ET{{end}}</span>
   </h2>
   {{if .ScreenRows}}
   <table>
     <thead>
-      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num">{{.}}</th>{{end}}<th>Verdict</th><th>Action</th></tr>
+      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num">{{.}}</th>{{end}}<th>Verdict</th><th>Action</th><th></th></tr>
     </thead>
     <tbody>
       {{range .ScreenRows}}
@@ -406,6 +588,12 @@ setInterval(refresh, POLL_MS);
         {{end}}
         <td>{{if .Qualifies}}<span class="pill good">Qualifies</span>{{else}}<span class="muted">{{.Verdict}}</span>{{end}}</td>
         <td>{{if .Outcome}}<span class="{{.OutcomeTone}}">{{.Outcome}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td class="num">
+          {{if .CanOpen}}
+          <button type="button" class="mini" data-open="{{.Symbol}}"
+                  title="Buy {{.Symbol}} now, overriding the setup gate">Open</button>
+          {{end}}
+        </td>
       </tr>
       {{end}}
     </tbody>
@@ -415,39 +603,6 @@ setInterval(refresh, POLL_MS);
   {{end}}
 </section>
 
-{{if .ShowEOD}}
-<section class="card">
-  <h2>End of day <span class="meta">{{.SessionDate}} session</span></h2>
-  {{if .EODRows}}
-  <table>
-    <thead>
-      <tr>
-        <th>Symbol</th><th class="num">Shares</th><th class="num">Opened</th>
-        <th class="num">Closed</th><th class="num">P&amp;L %</th><th>Exit</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{range .EODRows}}
-      <tr>
-        <td class="sym">{{.Symbol}}</td>
-        <td class="num">{{.Shares}}</td>
-        <td class="num muted">{{.Open}}</td>
-        <td class="num">{{.Close}}</td>
-        <td class="num {{.Tone}}">{{.PnLPct}}</td>
-        <td class="muted">{{.Reason}}</td>
-      </tr>
-      {{end}}
-    </tbody>
-  </table>
-  <div class="totals">
-    <div><span class="label">Net P&amp;L</span><span class="value {{.EODNetTone}}">{{.EODNetPnL}}</span></div>
-    <div><span class="label">Result</span><span class="value">{{.EODWinLoss}}</span></div>
-  </div>
-  {{else}}
-  <div class="body"><p class="note">No positions were closed in this session.</p></div>
-  {{end}}
-</section>
-{{end}}
 
 <section class="card" style="margin-top:16px">
   <h2>Active strategy <span class="meta">as configured — restart to apply changes</span></h2>
@@ -493,6 +648,58 @@ setInterval(refresh, POLL_MS);
   {{if .Missing}}
   <div class="alert soft" style="margin-top:14px">No usable data for: {{range $i, $s := .Missing}}{{if $i}}, {{end}}{{$s}}{{end}}</div>
   {{end}}
+</div>
+{{end}}
+
+{{define "ignoreHaltModal"}}
+{{template "modalHead" .}}
+<div class="mbody">
+  <p class="kv">Screening resumes for the rest of this session.</p>
+  <p class="note" style="margin-top:12px">
+    The gate is recorded as <strong>GATE_OVERRIDDEN</strong> rather than passed, because it never
+    ran — the daemon started after the first hour, so there were no readings to judge. This
+    session therefore trades with no sentiment kill switch behind it. Every other rule is
+    unchanged.
+  </p>
+</div>
+{{end}}
+
+{{define "openModal"}}
+{{template "modalHead" .}}
+<div class="mbody">
+  {{if .Halted}}
+  <div class="alert soft">
+    The session's kill switch is on. This overrode it, and the trail records that it did.
+  </div>
+  {{end}}
+  <p class="kv">Bought {{.Shares}} {{.Symbol}} at {{.Entry}} — {{.Notional}} committed.</p>
+  <div class="totals" style="margin-top:12px">
+    <div><span class="label">Stop</span><span class="value">{{.Stop}}</span></div>
+    <div><span class="label">Risk if it fills</span><span class="value bad">{{.Risk}}</span></div>
+  </div>
+  <p class="note" style="margin-top:12px">
+    Stop {{.StopSource}}.{{if .SetupReason}} The detector said: {{.SetupReason}}.{{end}}
+  </p>
+  <p class="note">
+    From here it is an ordinary position: the same stop, the same scale-out at the first
+    target, and the same forced exit before the close.
+  </p>
+</div>
+{{end}}
+
+{{define "closeModal"}}
+{{template "modalHead" .}}
+<div class="mbody">
+  <p class="kv">
+    Sold {{.Shares}} {{.Symbol}} at {{.ExitPrice}} against an entry of {{.EntryPrice}}.
+  </p>
+  <div class="totals" style="margin-top:12px">
+    <div><span class="label">P&amp;L</span><span class="value {{.Tone}}">{{.PnLDollars}}</span></div>
+    <div><span class="label">Return on committed capital</span><span class="value {{.Tone}}">{{.PnLPct}}</span></div>
+  </div>
+  <p class="note" style="margin-top:12px">
+    Recorded with exit reason MANUAL, so nothing later reads it as a strategy rule having fired.
+  </p>
 </div>
 {{end}}
 

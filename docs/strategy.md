@@ -10,7 +10,7 @@
   - Overwhelmingly bearish → hand off to `risk`'s daily kill switch; no further trades today.
   - Anything else (clearly bullish *or* neutral/ambiguous) → proceed to screening for the rest of the day. Only a clear bearish reading halts trading — a neutral/unclear reading is treated the same as bullish, not the same as bearish.
 - **Classification rule (PROPOSED):** the session is overwhelmingly bearish when the average intraday change across SPY, QQQ and IWM is at or below **−0.8%** *and* none of the three is positive. Anything else proceeds. IWM is in the basket deliberately: the strategy trades small caps, so a small-cap index belongs in the read of the tape, not just SPY and QQQ.
-- If the daemon starts *after* the first hour, no readings exist and the gate cannot be judged. It halts for the day rather than trading without the safety check ever having run.
+- If the daemon starts *after* the first hour, no readings exist and the gate cannot be judged. It halts for the day rather than trading without the safety check ever having run. This is the one halt that can be dismissed from the status page — it is an absence of data rather than a risk decision, and a restart should not automatically cost the session. Dismissing it sets the verdict to `GATE_OVERRIDDEN` rather than `PROCEED`, so nothing later reads it as the gate having passed. A halt the gate genuinely *reached* on real readings is the kill switch and is not dismissible. See [`web-ui.md`](./web-ui.md).
 
 **Pre-market has no gate, and cannot have one.** The gate's readings are taken after the open, so anything the agent does before the bell necessarily predates it. Pre-market screening is unaffected — it never buys anything by itself — but `premarket.allow_entry` would be trading with the kill switch not merely off but nonexistent. In its place, each pre-market pass that may buy takes a **live** reading of the same basket through the same classifier (`sentiment.Classify`) and withholds entry on an overwhelmingly bearish tape, or when the reading is unavailable at all. That reading is deliberately **not persisted**: the session's verdict belongs to the first hour, and a 07:30 sample must not be able to settle the day before the market has opened. It is a weaker guarantee than the gate — one sample rather than a window of them — which is one of the reasons `allow_entry` defaults to false.
 
@@ -187,6 +187,14 @@ still stop the pass and surface as `ERROR`.
 Level 2, time and sales, the feel of a tape — has no mechanical equivalent here. If a
 meaningful part of the edge lives there, this implementation cannot capture it, and
 that is a limitation of automating the approach rather than something tuning will fix.
+
+### Overriding the gate by hand
+
+The status page offers an **Open** button on every qualifying candidate, which buys it without the setup. That is a deliberate escape hatch, not a second entry rule: the gate stays exactly as described above for everything the agent does on its own.
+
+It exists because the gate's failure mode is known and one-sided. A name moving vertically never prints a 1–5 bar pullback to reclaim, so the strongest candidates the screen finds are the ones most likely to be refused — measured in the wild on KNRX (+357%, 4846x relative volume, 7 catalysts, never bought). A human can see that; `FindSetup` by construction cannot.
+
+Everything downstream of the signal still applies to a hand-placed trade — the size, the stop, the cap, the exits. See [`web-ui.md`](./web-ui.md).
 
 ## 4. Exit
 

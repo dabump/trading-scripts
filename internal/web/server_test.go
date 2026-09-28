@@ -33,12 +33,50 @@ func (s *stubEngine) Session() (scheduler.Session, bool)     { return s.session,
 func (s *stubEngine) NextSession() (scheduler.Session, bool) { return s.next, s.nextKnown }
 func (s *stubEngine) Account() domain.AccountSnapshot        { return s.account }
 
-// stubActions stands in for the engine's manual checks.
+// stubActions stands in for the engine's manual actions.
 type stubActions struct {
 	check   domain.SentimentCheck
 	preview domain.ScreenPreview
 	err     error
 	calls   int
+
+	// closed records the position ids the page asked to close, and closedResult is
+	// what ClosePosition hands back.
+	closed       []int64
+	closedResult domain.Position
+	closeErr     error
+
+	opened     []string
+	openResult domain.ManualOpen
+	openErr    error
+
+	ignored   int
+	ignoreErr error
+}
+
+func (a *stubActions) IgnoreHalt(context.Context) error {
+	a.calls++
+	a.ignored++
+	return a.ignoreErr
+}
+
+// opened records the symbols the page asked to buy; openResult is what comes back.
+func (a *stubActions) OpenPosition(_ context.Context, symbol string) (domain.ManualOpen, error) {
+	a.calls++
+	a.opened = append(a.opened, symbol)
+	if a.openErr != nil {
+		return domain.ManualOpen{}, a.openErr
+	}
+	return a.openResult, nil
+}
+
+func (a *stubActions) ClosePosition(_ context.Context, id int64) (domain.Position, error) {
+	a.calls++
+	a.closed = append(a.closed, id)
+	if a.closeErr != nil {
+		return domain.Position{}, a.closeErr
+	}
+	return a.closedResult, nil
 }
 
 func (a *stubActions) CheckSentiment(context.Context) (domain.SentimentCheck, error) {
@@ -313,8 +351,13 @@ func TestAccountBalanceAbsentUntilRead(t *testing.T) {
 	}
 }
 
-// The end-of-day section must stay hidden mid-session and appear afterwards.
-func TestEndOfDaySectionTiming(t *testing.T) {
+// A closed position has to show up the moment it closes, with its result.
+//
+// It used to live in an end-of-day card that was hidden until the forced-exit mark,
+// which was fine while a strategy rule was the only thing that could close a
+// position. Now the page can close one by hand, and an operator who has just sold
+// something cannot be made to wait four hours to see what it made.
+func TestClosedPositionsAppearImmediately(t *testing.T) {
 	f := newFixture(t)
 	id, err := f.store.InsertPosition(domain.Position{
 		SessionDate: f.date, Symbol: "ABCD", Shares: 100,
@@ -327,34 +370,35 @@ func TestEndOfDaySectionTiming(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 11:00 is mid-session: no summary yet.
+	// 11:00, mid-session — hours before any end-of-day mark.
 	_, body := f.get(t, "/")
-	if strings.Contains(body, "End of day") {
-		t.Error("end-of-day section must not appear mid-session")
-	}
-
-	// After the close it appears with the day's result.
-	f.now = time.Date(2026, 9, 28, 16, 30, 0, 0, scheduler.ET)
-	_, body = f.get(t, "/")
-	if !strings.Contains(body, "End of day") {
-		t.Fatal("end-of-day section missing after the close")
-	}
 	for _, want := range []string{
-		"$4.00",   // opened
-		"$4.40",   // closed
-		"+10.00%", // P&L %
-		"STOP_LOSS",
-		"+40.00", // net: 100 x $0.40
+		"$4.00",     // opened
+		"$4.40",     // closed
+		"+10.00%",   // P&L %
+		"+40.00",    // P&L dollars, and the net: 100 x $0.40
+		"STOP_LOSS", // which rule closed it
 		"1 up · 0 down",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("end-of-day summary missing %q", want)
+			t.Errorf("closed position is missing %q mid-session", want)
 		}
 	}
 }
 
-// The fragment endpoint powers the poll, so it must return the content without
-// the surrounding document (otherwise each refresh would nest a whole page).
+// With nothing closed yet the tab explains itself rather than rendering an empty
+// table, and the totals footer stays off a table with no rows.
+func TestClosedTabWithNothingClosed(t *testing.T) {
+	f := newFixture(t)
+	_, body := f.get(t, "/")
+	if !strings.Contains(body, "Nothing has been closed in this session yet.") {
+		t.Error("the closed tab must say why it is empty")
+	}
+	if strings.Contains(body, "Net P&amp;L") {
+		t.Error("the net-P&L footer must not render against an empty table")
+	}
+}
+
 func TestFragmentHasNoDocumentWrapper(t *testing.T) {
 	f := newFixture(t)
 	code, body := f.get(t, "/fragment")

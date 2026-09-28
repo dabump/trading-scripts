@@ -703,6 +703,145 @@ rather than admitting everything: genuine runners land between 3x and 124x, nois
 between 0.1x and 0.3x. It is one morning's observation, not a measurement, and it
 says nothing about whether any of these would have been profitable.
 
+## 2026-09-28 — The status page can close a position
+
+Requested directly. It breaks a stated invariant — the page was "read-only by
+contract" — so the replacement invariant is written down rather than left implied:
+**the page can close a position, and can never open one.** There is no path from a
+handler to `enterPositions`, and any future page action belongs on the exit side for
+the same reason. That is what keeps the strategy the only thing deciding what to buy,
+which was the actual point of the original rule; "read-only" was the means, not the
+end.
+
+The need is real in the other direction. An operator watching a position go wrong had
+no way out except killing the daemon — which leaves the position open at the broker
+and relies on `Reconcile` at the next start — or going to Alpaca's own UI, which puts
+the store and the broker out of step until the same reconciliation. Both are worse
+than a button.
+
+Decisions worth keeping:
+
+- **It reuses the strategy's exit path** (`engine.submit` → `store.ClosePosition`)
+  rather than a shortcut of its own, so the order record, the audit event and the
+  realised P&L — which for a scaled-out position is not the entry-to-exit move — are
+  built exactly the way a rule-driven exit builds them.
+- **`domain.ExitManual`**, distinct like `ExitReconciled`, for the same reason: the
+  closed-positions table and anything later measuring the rules must not read an
+  operator's decision as a rule having fired.
+- **Refused when the exchange is shut.** A sell submitted then is queued to the next
+  open while the store has already marked the position closed, and the two disagree
+  until a restart reconciles them. A page reporting a flat book the broker does not
+  have is worse than a refusal. Pre-market is allowed and routed to the
+  extended-hours book.
+- **A per-position guard plus a re-read before acting.** The id comes from a page
+  that may be a poll interval old and may name a position the loop has since exited,
+  so the row is re-read under the guard and a second press gets `ErrPositionNotOpen`
+  rather than a second sell order.
+- **Sell-then-record, like the strategy path.** Neither ordering is safe against a
+  crash in between; this one matches what `Reconcile` is already designed to repair.
+
+The end-of-day card became the **Closed** tab of a two-tab Positions card and is now
+visible for the whole session. Hiding it until the forced-exit mark was reasonable
+while a rule was the only thing that could close a position; once the page can close
+one by hand, the result has to appear when it happens.
+
+## 2026-09-28 — KNRX, and the Open button that followed
+
+**The observation.** KNRX screened at **+357.2% on 4846x relative volume with 7
+catalysts** — comfortably the strongest candidate the screen has produced — and was
+never bought. It was not the position cap (one position all day, three slots), not
+the entry window, and not an outage. It was the setup gate, twice:
+
+```
+09:59 ET   no setup: pullback is 0 bars, need at least 1
+14:13 ET   no setup: pullback is 7 bars, more than the 5 allowed
+```
+
+**Why that is structural rather than bad luck.** `FindSetup` takes the pole as the
+session's highest high and the flag as the bars between it and the current one, and
+needs 1–5 flag bars plus a close back above the pole. On a vertical mover the pole
+keeps moving to the newest bar, so the flag is 0 for as long as the trend is clean —
+the *better* the move, the more certainly it reads "0 bars". Once it tops, the flag
+grows a bar a minute and the reclaim has to land 3–7 bars later: a window of about
+five minutes, once, per high of day. Miss it and the setup is gone until a new high
+resets the pole.
+
+So the screen's best candidates are systematically the ones the gate is least able to
+take. That is the "55 trades a year" open item, observed rather than inferred.
+
+**What was done about it.** Not a change to the gate — nothing here measures whether
+a looser gate would make money, and the gate is the single difference between this
+version and the one with no edge. Instead the page grew an **Open** button on
+qualifying rows, so a human can take the trade the detector cannot see.
+
+The line drawn: **a manual action overrides the signal, never the risk rules.** An
+operator decides *that* a trade happens; the machine still decides how big, where the
+stop is, and whether it fits. Concretely:
+
+- `risk.SizeForRisk` runs unchanged, so the trade risks the same 1% as any other.
+- There is always a stop. The chart's own if a setup happens to be there — so clicking
+  early gives the automatic trade — otherwise `entry.max_stop_distance_pct` below
+  entry. That is the widest risk the strategy accepts, which makes the hand-placed
+  position the *smallest* the budget allows rather than an arbitrary fraction of the
+  account. Sizing by fraction is exactly what the no-edge version did.
+- The position cap, one-position-per-symbol and same-day re-entry all still hold.
+- The kill switch does not block it — an instruction about one named symbol is not what
+  it exists to stop — but `overrode_halt` goes into the audit event.
+- Refused in the end-of-day window and with the exchange shut.
+
+**Also recorded.** This reverses the invariant written the same day ("the page can
+close a position but can never open one"). It was reversed on request, deliberately,
+and the replacement invariant is the signal/risk split above. The earlier one was
+protecting the wrong thing: what matters is not that the page cannot trade, it is that
+nothing can size a trade outside the risk rule.
+
+**Observability gap found while investigating, still open.** The trail could not say
+whether KNRX ever had a valid window, because `recordSkip` de-duplicates on symbol +
+the bare reason `"no setup"` — so only the first reason is ever written and the
+changing detail is lost — and `SaveScreenSnapshot` keeps only the newest pass. Two
+data points for a whole session. Recording the setup reason when it *changes* is the
+smaller fix and would make this class of question answerable.
+
+## 2026-09-28 — A late restart no longer costs the session
+
+`resolveGate` halts the day when no first-hour readings exist, which is what happens
+every time the daemon is started after the first hour. The reasoning was sound —
+trading with the safety check never having run is worse than sitting out — but the
+consequence was not: a restart at 11:00 wrote off the rest of the day, and there was
+no way back short of editing the database.
+
+The distinction that fixes it: **that halt reports an absence of data, not a bearish
+market.** So the halt banner now carries an Ignore button, and it is scoped to exactly
+that case.
+
+- **A halt the gate actually reached is not dismissible.** A bearish verdict on real
+  readings is the kill switch working, and standing it down from a small button on a
+  status page is a different decision with different consequences. Asked for as "the
+  screening will fail with *no sentiment readings were taken during the first hour*",
+  and implemented to that case rather than to halts in general.
+- **The two are told apart structurally, by whether any readings exist** — not by
+  matching the halt's wording. Matching the message would silently stop working the
+  first time anyone reworded it, and it would fail open, which is the wrong direction
+  for a safety check.
+- **The verdict becomes `GATE_OVERRIDDEN`, not `PROCEED`.** Same reasoning as
+  `ExitManual` and `ExitReconciled`: the gate did not pass, it was stood down, and
+  neither the page nor the trail should let a later reader conclude otherwise. It
+  renders amber rather than green.
+- **It persists**, so a further restart does not re-halt the day — otherwise the click
+  would buy a few minutes and nothing more.
+
+The confirmation states plainly that the session then trades with no sentiment kill
+switch behind it. That is true and worth reading before clicking: the gate cannot be
+reconstructed after the fact, because its inputs were intraday percentage moves during
+a window that has passed.
+
+**Not done, and worth considering:** taking a *live* sentiment reading at the moment
+of the restart and judging on that, instead of ignoring the gate entirely. It would be
+a weaker check than the real one — one sample rather than a window — but it is not
+nothing, and it is the same substitution `preMarketPass` already makes for pre-market
+entry. Left out because it was not what was asked, and because a live read at 14:00
+says something quite different from a first-hour one.
+
 ## Open items (not yet decided)
 
 - **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
@@ -722,6 +861,9 @@ says nothing about whether any of these would have been profitable.
 
 - **Every `premarket.*` threshold is unmeasured.** `cmd/backtest` has no pre-market bars, so the start time, scan interval, dollar-volume floor and volume multiple are reasoned rather than measured. Extending the backtest to fetch extended-hours bars is what would close this; until then the pre-market screen should be read, not traded.
 - **Pre-market entries make the PDT problem worse, not better.** A pre-market entry that exits the same session is still a day trade, and the rolling five-session count is already **64** against a limit of 3. `premarket.allow_entry` must stay off until the PDT constraint is resolved, and the live-trading guard does not cover it — that guard is about real money, and this is about trade count on paper too.
+- **Whether a dismissed gate should be replaced by a live sentiment read** rather than by nothing. The machinery exists (`readSentiment`, already used for pre-market entry); the question is whether a mid-session reading is meaningful enough to gate on, given the rule was specified against the first hour.
+- **Whether the setup gate is too strict, now that there is a case.** KNRX is one observation, not a measurement, and the manual Open button is an escape hatch rather than an answer. The things worth sweeping in `cmd/backtest` — one at a time, against the current baseline — are `entry.max_pullback_bars`, reading the pattern on 2-minute candles, and allowing a reclaim of a recent swing high rather than the session high.
+- **The setup reason is only audited once per symbol per session.** `recordSkip` de-duplicates on symbol + `"no setup"`, so a candidate whose reason changes through the day records only the first. Combined with `SaveScreenSnapshot` keeping just the latest pass, there is no way to ask afterwards whether a candidate ever had a valid entry window.
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.
 - **PDT rule resolution before going live** — fund above $25k, reduce trade frequency, or switch to a cash account; none chosen yet (`docs/operations.md`).
 - Review the claude-proposed values above — especially the profit target, trailing stop and sentiment thresholds, none of which rest on evidence.

@@ -73,9 +73,16 @@ type ScreenRow struct {
 	// and available cash all still apply.
 	Outcome     string
 	OutcomeTone string
+	// CanOpen drives the Open button: a qualifying candidate the agent is not
+	// already holding. The engine re-checks everything regardless — this only keeps
+	// the page from offering a click that is certain to be refused.
+	CanOpen bool
 }
 
 type PositionRow struct {
+	// ID is what the close button posts back. The row is otherwise display-only, but
+	// an action needs something to name the position by that survives a re-render.
+	ID     int64
 	Symbol string
 	// Shares is what is still held. SharesNote says so when the position has been
 	// partly sold, because "200" against an entry of 400 would otherwise misreport
@@ -97,9 +104,13 @@ type EODRow struct {
 	Shares int
 	Open   string
 	Close  string
-	PnLPct string
-	Reason string
-	Tone   string
+	// PnLDollars is the realised total, banked partial sales included. Shown beside
+	// the percentage because the two answer different questions, and with a scaled-out
+	// position they are not each other's obvious restatement.
+	PnLDollars string
+	PnLPct     string
+	Reason     string
+	Tone       string
 }
 
 // View is everything the template renders.
@@ -137,6 +148,12 @@ type View struct {
 	GateVerdict string
 	GateTone    string
 	HaltReason  string
+	// CanIgnoreHalt offers the dismiss button, and only for the halt that exists
+	// because the gate had nothing to judge. It is decided structurally — halted with
+	// zero readings — rather than by matching the halt's wording, which would break
+	// the moment the message was reworded. A halt the gate actually reached on real
+	// readings is the kill switch working and is not dismissed from the page.
+	CanIgnoreHalt bool
 
 	Sentiment       []SentimentRow
 	SentimentLabels []string
@@ -162,11 +179,17 @@ type View struct {
 	ExposureText  string
 	PositionsNote string
 
-	ShowEOD    bool
-	EODRows    []EODRow
+	// Closed positions are shown for the whole session, not only after the bell.
+	// They used to appear in an end-of-day card, which was fine while the only way
+	// to close a position was a strategy rule; now that the page can close one by
+	// hand, the result has to be visible the moment it happens.
+	ClosedRows []EODRow
+	ClosedNote string
 	EODNetPnL  string
 	EODNetTone string
 	EODWinLoss string
+	// ShowTotals keeps the net-P&L footer off an empty table.
+	ShowTotals bool
 
 	// Strategy is the active configuration, rendered for display. Every value is read
 	// from config rather than written into the template, so tuning a threshold and
@@ -335,6 +358,9 @@ func BuildView(
 		v.GateTone = "good"
 	case domain.VerdictBearish:
 		v.GateTone = "bad"
+	case domain.VerdictOverridden:
+		// Not green: the gate did not pass, it was stood down.
+		v.GateTone = "warn"
 	default:
 		v.GateTone = "idle"
 	}
@@ -364,6 +390,16 @@ func BuildView(
 		}
 		v.Sentiment = append(v.Sentiment, row)
 	}
+	v.CanIgnoreHalt = rec.Halted && len(readings) == 0
+
+	open, err := st.OpenPositions()
+	if err != nil {
+		return nil, err
+	}
+	held := make(map[string]bool, len(open))
+	for _, p := range open {
+		held[p.Symbol] = true
+	}
 
 	evals, takenAt, err := st.LatestScreenSnapshot(date)
 	if err != nil {
@@ -387,6 +423,7 @@ func BuildView(
 		} else {
 			row.Verdict = e.FailReason
 		}
+		row.CanOpen = e.Qualifies && !held[e.Symbol]
 		row.Outcome = e.Outcome
 		row.OutcomeTone = "idle"
 		if strings.HasPrefix(e.Outcome, "bought") {
@@ -415,10 +452,6 @@ func BuildView(
 		v.AccountNote = "The agent has not read the account balance yet."
 	}
 
-	open, err := st.OpenPositions()
-	if err != nil {
-		return nil, err
-	}
 	var exposure float64
 	for _, p := range open {
 		current := p.LastPrice
@@ -429,7 +462,7 @@ func BuildView(
 		exposure += current * float64(p.SharesOpen)
 
 		row := PositionRow{
-			Symbol: p.Symbol, Shares: p.SharesOpen,
+			ID: p.ID, Symbol: p.Symbol, Shares: p.SharesOpen,
 			Entry: money(p.EntryPrice), Stop: money(p.StopPrice),
 			Current: money(current), Peak: money(p.PeakPrice),
 			PnLDollars: signedMoney(pnl), PnLPct: pct(p.UnrealizedPct(current)),
@@ -450,37 +483,43 @@ func BuildView(
 		v.PositionsNote = "No open positions."
 	}
 
-	// The end-of-day summary appears once the exchange has closed, per
-	// docs/web-ui.md, and covers today's session only.
-	v.ShowEOD = !tradingDay || !now.Before(sess.Close) || (tradingDay && !now.Before(bounds.EODExit))
-	if v.ShowEOD {
-		positions, err := st.SessionPositions(date)
-		if err != nil {
-			return nil, err
+	// Closed positions for today's session, built whenever there are any rather than
+	// only after the bell. A position closed by hand at 11:00 has to show up at
+	// 11:00 — an operator who has just sold something needs to see the result, not
+	// wait four hours for an end-of-day card to appear.
+	positions, err := st.SessionPositions(date)
+	if err != nil {
+		return nil, err
+	}
+	var net float64
+	var wins, losses int
+	for _, p := range positions {
+		if p.Open {
+			continue
 		}
-		var net float64
-		var wins, losses int
-		for _, p := range positions {
-			if p.Open {
-				continue
-			}
-			realized := p.RealizedDollars()
-			net += realized
-			if realized > 0 {
-				wins++
-			} else if realized < 0 {
-				losses++
-			}
-			v.EODRows = append(v.EODRows, EODRow{
-				Symbol: p.Symbol, Shares: p.Shares,
-				Open: money(p.EntryPrice), Close: money(p.ExitPrice),
-				PnLPct: pct(p.RealizedPct()), Reason: string(p.ExitReason),
-				Tone: toneForPnL(realized),
-			})
+		realized := p.RealizedDollars()
+		net += realized
+		if realized > 0 {
+			wins++
+		} else if realized < 0 {
+			losses++
 		}
-		v.EODNetPnL = signedMoney(net)
-		v.EODNetTone = toneForPnL(net)
-		v.EODWinLoss = fmt.Sprintf("%d up · %d down", wins, losses)
+		v.ClosedRows = append(v.ClosedRows, EODRow{
+			Symbol: p.Symbol, Shares: p.Shares,
+			Open: money(p.EntryPrice), Close: money(p.ExitPrice),
+			PnLDollars: signedMoney(realized), PnLPct: pct(p.RealizedPct()),
+			Reason: string(p.ExitReason), Tone: toneForPnL(realized),
+		})
+	}
+	v.ShowTotals = len(v.ClosedRows) > 0
+	v.EODNetPnL = signedMoney(net)
+	v.EODNetTone = toneForPnL(net)
+	v.EODWinLoss = fmt.Sprintf("%d up · %d down", wins, losses)
+	if len(v.ClosedRows) == 0 {
+		v.ClosedNote = "Nothing has been closed in this session yet."
+		if !tradingDay || !now.Before(bounds.EODExit) {
+			v.ClosedNote = "No positions were closed in this session."
+		}
 	}
 
 	v.Strategy = strategySections(cfg)

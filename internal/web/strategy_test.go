@@ -336,7 +336,7 @@ func TestStrategyPanelPlacementAndFragment(t *testing.T) {
 
 	_, page := f.get(t, "/")
 	strategyAt := strings.Index(page, "Active strategy")
-	positionsAt := strings.Index(page, "Open positions")
+	positionsAt := strings.Index(page, "<h2>Positions")
 	if strategyAt < 0 {
 		t.Fatal("the strategy section is missing")
 	}

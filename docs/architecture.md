@@ -7,7 +7,7 @@
 A single Go binary runs as one continuously-running daemon process (not a cron job) with two concurrent responsibilities:
 
 1. **The trading loop** — sentiment gating, screening, entry/exit decisions, order placement.
-2. **A status web server** — a read-only page showing current state (open positions, today's sentiment reading, recent decisions), backed directly by the same store the trading loop writes to.
+2. **A status web server** — a page showing current state (open and closed positions, today's sentiment reading, recent decisions), backed directly by the same store the trading loop writes to. Mostly read-only: two manual checks that cannot trade, plus **Open** and **Close** controls that can, overriding the entry signal but never the risk rules.
 
 There is one Alpaca account/API key set used for both market data and order execution, so there's a single `broker` client rather than separate data and execution integrations. `broker` also ships a `Fake` implementation, which is what the tests and `-offline` mode run against; the daemon can therefore be exercised end to end with no credentials and no network.
 
@@ -27,7 +27,7 @@ There is one Alpaca account/API key set used for both market data and order exec
 | `broker` | Alpaca client, wrapped behind an interface so market data and/or execution could be swapped to a different provider later without touching strategy/risk code. |
 | `store` | SQLite persistence — positions, trade history, sentiment readings, session verdicts, screening snapshots and submitted orders. Migrations are embedded from `internal/store/migrations/` (not the repo root: `go:embed` cannot reach outside its package, and the deployment target is one self-contained binary). A partial unique index makes a second open position in the same symbol impossible at the schema level. |
 | `audit` | Append-only JSON-lines trail of decisions and actions, one file per session date, flushed on every event. Deliberately independent of `store`: the database holds current state, this holds the narrative of how that state came to be. |
-| `web` | HTTP handlers for the status page. Reads from `store`; does not itself drive trading decisions. Also exposes the two manual-check buttons, which call read-only engine methods behind an `Actions` interface — the handlers have no access to the order path. Page content/layout is specified in [`web-ui.md`](./web-ui.md). |
+| `web` | HTTP handlers for the status page. Reads from `store`; does not itself drive trading decisions. Exposes the two read-only manual checks and the **Open**/**Close** actions behind an `Actions` interface — the handlers carry a symbol or a position id and nothing else, and the engine decides whether the trade is possible and on what terms. The result types live in `domain`, so `web` still does not import `engine`. Page content/layout is specified in [`web-ui.md`](./web-ui.md). |
 
 ## Data flow (one trading day)
 
@@ -54,11 +54,15 @@ scheduler: market opens
 
 `web` runs alongside this the whole time, independently reading `store` to render status — it never blocks or is blocked by the trading loop, and it makes no broker calls of its own: the loop persists each position's last mark, so the ~12s page poll costs nothing upstream. The account balance reaches the page the same way. Every tick reads `broker.Account` and publishes the result on the engine (`engine.Account`, alongside `Session` and `NextSession`), so the figure is refreshed once per tick — bounded by the loop — rather than once per page poll by every open browser.
 
-The page is not purely passive any more: `engine.CheckSentiment` and
-`engine.ScreenNow` back the two manual buttons. Both share code with the automated
+The page is not purely passive any more. `engine.CheckSentiment` and
+`engine.ScreenNow` back the two manual buttons; both share code with the automated
 path but deliberately stop short of it — neither persists anything and neither can
-place an order, which is what makes them safe to run with the market closed. See
-[`web-ui.md`](./web-ui.md) for the reasoning.
+place an order, which is what makes them safe to run with the market closed.
+`engine.ClosePosition` and `engine.OpenPosition` back the **Close** and **Open**
+buttons and are the two controls that trade. Both go through the same `submit` path
+the strategy uses. A manual open overrides the setup gate and nothing else — sizing,
+the stop, the position cap and the same-day rules are all applied exactly as they are
+for an automatic entry. See [`web-ui.md`](./web-ui.md) for the reasoning.
 
 Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the book, and this strategy holds nothing overnight.
 

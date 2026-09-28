@@ -9,6 +9,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
@@ -34,13 +36,24 @@ type StateSource interface {
 	Account() domain.AccountSnapshot
 }
 
-// Actions are the manually triggered checks behind the page's two buttons. Both
-// are read-only by contract: they evaluate and report, never persist and never
-// place an order. Keeping that promise is the implementation's job, not the
+// Actions are the manually triggered operations behind the page's buttons.
+//
+// The two checks are read-only by contract: they evaluate and report, never persist
+// and never place an order. Keeping that promise is the implementation's job, not the
 // handler's — see engine.CheckSentiment and engine.ScreenNow.
+//
+// ClosePosition and OpenPosition trade. They exist because the operator needs both
+// directions: getting out of a position that is going wrong, and taking one the
+// mechanical setup gate refused. In both cases the engine decides whether the action
+// is possible and on what terms — the handlers carry only an id or a symbol.
 type Actions interface {
 	CheckSentiment(ctx context.Context) (domain.SentimentCheck, error)
 	ScreenNow(ctx context.Context) (domain.ScreenPreview, error)
+	ClosePosition(ctx context.Context, id int64) (domain.Position, error)
+	OpenPosition(ctx context.Context, symbol string) (domain.ManualOpen, error)
+	// IgnoreHalt dismisses a halt the gate could not judge. It does not trade; it
+	// only lets the automated path resume.
+	IgnoreHalt(ctx context.Context) error
 }
 
 type Server struct {
@@ -78,6 +91,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/actions/sentiment", s.handleCheckSentiment)
 	mux.HandleFunc("/actions/screen", s.handleScreenNow)
+	mux.HandleFunc("/actions/close", s.handleClosePosition)
+	mux.HandleFunc("/actions/open", s.handleOpenPosition)
+	mux.HandleFunc("/actions/ignore-halt", s.handleIgnoreHalt)
 	return mux
 }
 
@@ -226,6 +242,156 @@ func (s *Server) handleScreenNow(w http.ResponseWriter, r *http.Request) {
 	m.Evaluated = len(m.Rows)
 
 	s.renderModal(w, "screenModal", m)
+}
+
+// CloseModal is what the confirmation popup renders after a manual close.
+type CloseModal struct {
+	Title      string
+	Symbol     string
+	Shares     int
+	ExitPrice  string
+	EntryPrice string
+	PnLDollars string
+	PnLPct     string
+	Tone       string
+	// TakenAt is the name the shared modalHead partial reads.
+	TakenAt string
+}
+
+// handleClosePosition sells a position on the operator's instruction.
+//
+// POST only, like the other actions: this one places an order, so a prefetch or a
+// crawler following a link must not be able to set it off.
+func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.actions == nil {
+		s.renderActionError(w, "Manual actions are not available.", http.StatusServiceUnavailable)
+		return
+	}
+	id, err := strconv.ParseInt(r.FormValue("id"), 10, 64)
+	if err != nil {
+		s.renderActionError(w, "That position id is not valid.", http.StatusOK)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), actionTimeout)
+	defer cancel()
+
+	closed, err := s.actions.ClosePosition(ctx, id)
+	if err != nil {
+		s.log.Warn("manual close failed", "position", id, "err", err)
+		s.renderActionError(w, err.Error(), http.StatusOK)
+		return
+	}
+
+	pnl := closed.RealizedDollars()
+	s.renderModal(w, "closeModal", &CloseModal{
+		Title:      "Position closed",
+		Symbol:     closed.Symbol,
+		Shares:     closed.Shares,
+		EntryPrice: money(closed.EntryPrice),
+		ExitPrice:  money(closed.ExitPrice),
+		PnLDollars: signedMoney(pnl),
+		PnLPct:     pct(closed.RealizedPct()),
+		Tone:       toneForPnL(pnl),
+		TakenAt:    closed.ExitTime.In(scheduler.ET).Format("15:04:05 MST"),
+	})
+}
+
+// OpenModal is the confirmation after a manual open. It leads with the size and the
+// stop, because those are what the operator has just committed to and the last moment
+// to notice they are not what was expected.
+type OpenModal struct {
+	Title   string
+	TakenAt string
+	Symbol  string
+	Shares  int
+	Entry   string
+	Stop    string
+	// StopSource says whether the market drew the stop or the config did.
+	StopSource  string
+	SetupReason string
+	Risk        string
+	Notional    string
+	Halted      bool
+}
+
+// handleOpenPosition buys a screened candidate on the operator's instruction.
+func (s *Server) handleOpenPosition(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.actions == nil {
+		s.renderActionError(w, "Manual actions are not available.", http.StatusServiceUnavailable)
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(r.FormValue("symbol")))
+	if symbol == "" {
+		s.renderActionError(w, "No symbol was given.", http.StatusOK)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), actionTimeout)
+	defer cancel()
+
+	res, err := s.actions.OpenPosition(ctx, symbol)
+	if err != nil {
+		s.log.Warn("manual open failed", "symbol", symbol, "err", err)
+		s.renderActionError(w, err.Error(), http.StatusOK)
+		return
+	}
+
+	m := &OpenModal{
+		Title:    "Position opened",
+		TakenAt:  res.Position.EntryTime.In(scheduler.ET).Format("15:04:05 MST"),
+		Symbol:   res.Position.Symbol,
+		Shares:   res.Shares,
+		Entry:    money(res.Entry),
+		Stop:     money(res.Stop),
+		Risk:     money(res.RiskDollar),
+		Notional: accountMoney(float64(res.Shares) * res.Entry),
+		Halted:   res.Halted,
+	}
+	if res.FromSetup {
+		m.StopSource = "from the chart — a completed pullback, the same stop the agent would have used"
+	} else {
+		m.StopSource = fmt.Sprintf("the configured maximum of %s, because there was no setup to read one from",
+			trimNumber(s.cfg.Entry.MaxStopDistancePct)+"%")
+		m.SetupReason = res.SetupReason
+	}
+	s.renderModal(w, "openModal", m)
+}
+
+// handleIgnoreHalt dismisses a halt that exists only because no readings were taken.
+func (s *Server) handleIgnoreHalt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.actions == nil {
+		s.renderActionError(w, "Manual actions are not available.", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), actionTimeout)
+	defer cancel()
+
+	if err := s.actions.IgnoreHalt(ctx); err != nil {
+		s.log.Warn("halt override refused", "err", err)
+		s.renderActionError(w, err.Error(), http.StatusOK)
+		return
+	}
+	s.renderModal(w, "ignoreHaltModal", struct{ Title, TakenAt string }{
+		Title:   "Halt dismissed",
+		TakenAt: s.now().In(scheduler.ET).Format("15:04:05 MST"),
+	})
 }
 
 func (s *Server) renderModal(w http.ResponseWriter, name string, data any) {

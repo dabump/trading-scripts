@@ -351,6 +351,30 @@ func (s *Store) OpenPositions() ([]domain.Position, error) {
 	return s.scanPositions(rows)
 }
 
+// ErrPositionNotFound means no position carries that id.
+var ErrPositionNotFound = errors.New("position not found")
+
+// PositionByID returns one position, open or closed.
+//
+// The manual close needs it: the page hands back an id, and acting on it means
+// reading the current row rather than trusting what the browser last rendered, which
+// may be up to a poll interval old and may describe a position the trading loop has
+// since exited.
+func (s *Store) PositionByID(id int64) (domain.Position, error) {
+	rows, err := s.db.Query(`SELECT `+positionColumns+` FROM positions WHERE id = ?`, id)
+	if err != nil {
+		return domain.Position{}, fmt.Errorf("query position %d: %w", id, err)
+	}
+	positions, err := s.scanPositions(rows)
+	if err != nil {
+		return domain.Position{}, err
+	}
+	if len(positions) == 0 {
+		return domain.Position{}, fmt.Errorf("%w: %d", ErrPositionNotFound, id)
+	}
+	return positions[0], nil
+}
+
 // SessionPositions returns all positions opened on a date, open or closed.
 func (s *Store) SessionPositions(date string) ([]domain.Position, error) {
 	rows, err := s.db.Query(`SELECT `+positionColumns+

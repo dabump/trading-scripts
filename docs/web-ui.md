@@ -1,6 +1,10 @@
 # Status web page
 
-**Status:** implemented. The page is served by the `web` package (see [`architecture.md`](./architecture.md)) and renders state from `store`. It never places orders and never changes what the agent will do — but it is no longer purely passive: two buttons trigger read-only checks on demand (see "Manual checks" below).
+**Status:** implemented. The page is served by the `web` package (see [`architecture.md`](./architecture.md)) and renders state from `store`.
+
+It is not read-only. Two buttons trigger **read-only** checks on demand (see "Manual checks"), and two controls trade: **Close** on an open position, and **Open** on a screening row that qualified.
+
+The rule that replaced "the page cannot trade" is narrower and more useful: **a manual action overrides the signal, never the risk rules.** An operator can decide *that* a trade happens; they cannot decide how big it is, whether it fits under the position cap, or that it goes without a stop. Those are computed identically for a hand-placed trade and an automatic one.
 
 ## Visual design
 
@@ -53,7 +57,7 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 | `SENTIMENT_CHECK` | Amber | Market open, within the first hour. Polling every 10 minutes. No trades placed. |
 | `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates and may hold open positions. |
 | `EOD_WINDOW` | Amber | Final 30 minutes before the close. Flattening open positions; no new entries. |
-| `HALTED_BEARISH` | Red | First-hour sentiment came back overwhelmingly bearish. No trades for the rest of the session; waiting for next trading day. |
+| `HALTED_BEARISH` | Red | First-hour sentiment came back overwhelmingly bearish, **or** the daemon started after the first hour and the gate had no readings to judge. No trades for the rest of the session. The second case can be dismissed from the page — see "Dismissing a halt the gate could not judge". |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
 
 `PRE_MARKET` was added when pre-market coverage was, for the same reason `EOD_WINDOW` exists: neither of the neighbouring states is true. `MARKET_CLOSED` would report a scanning agent as idle, and `SCREENING` would imply entries are being taken when by default they are not. It gets its own orange, sitting between the grey of a closed market and the green of a trading one — and a warmer orange than the amber `SENTIMENT_CHECK`/`EOD_WINDOW` use, so the two are not read as variations of each other. With `premarket.enabled: false` the state never appears and the morning is `MARKET_CLOSED` exactly as before.
@@ -64,7 +68,63 @@ The market-hours badge stays on the *regular* session throughout: during pre-mar
 
 `ERROR` must be visually distinguishable from `HALTED_BEARISH` beyond color alone (e.g. a different icon or label text) since both are red but mean very different things — one is a deliberate risk decision, the other is a fault.
 
+## Dismissing a halt the gate could not judge
+
+When the daemon starts *after* the first hour, no sentiment readings exist, so `resolveGate` has nothing to judge and halts the day:
+
+> ■ Halted for the session: no sentiment readings were taken during the first hour
+
+That is the right default — trading with the safety check never having run is worse than sitting out — but it is an **absence of data, not a risk decision**, and a restart at 11:00 should not automatically cost the rest of the session. The halt banner therefore carries an **Ignore** button, which resumes screening for the rest of the day.
+
+Two things about it:
+
+- **It only appears on that halt.** A halt the gate actually *reached*, on real readings, is the kill switch working, and it is not dismissible from the page. The two are told apart structurally — halted with zero readings — rather than by matching the message text, which would break the moment the wording changed.
+- **The verdict becomes `GATE_OVERRIDDEN`, not `PROCEED`.** The gate did not pass, it was stood down, and neither the page nor the audit trail should later claim otherwise. It renders amber rather than green for the same reason. The decision is persisted, so a further restart does not re-halt the day.
+
+The confirmation says plainly that the session then trades with no sentiment kill switch behind it. Every other rule — sizing, the stop, the position cap, the exits — is unchanged.
+
+## Positions
+
+One card with two tabs, **Open** and **Closed**, so the day's outcome sits beside what is still running rather than in a separate place.
+
+**Open** carries the live marks — entry, working stop, current, peak, R multiple, P&L in dollars and percent — plus a **Close** button per row.
+
+### The Close button
+
+It sells whatever is still held in that position, immediately, at the market's current mark. It exists because the opposite need is real: an operator watching a position go wrong should not have to kill the daemon or open the broker's own UI to get out of it.
+
+What it does *not* do matters as much:
+
+- **It cannot open anything.** The page has no path to `enterPositions`. 
+- **It confirms first**, in the browser, naming the symbol.
+- **It goes through the same path as a strategy exit** — `engine.submit` then `store.ClosePosition` — so the order record, the audit trail and the realised P&L are built exactly the way a rule-driven exit builds them. It is not a shortcut with its own accounting.
+- **It records the exit reason as `MANUAL`**, kept distinct for the same reason `RECONCILED` is: nothing reading the trail or the closed-positions table later should attribute an operator's decision to a strategy rule.
+- **It is refused when the exchange is shut.** A sell submitted then would be queued to the next open while the store had already marked the position closed, and the two would disagree until a restart reconciled them. A page reporting a flat book the broker does not have is worse than a refusal. Pre-market it is allowed, routed to the extended-hours book like any other pre-market order.
+- **A second press cannot send a second order.** The engine holds a per-position guard while one is in flight, and re-reads the row before acting — the id came from a page that may be a poll interval old and may describe a position the trading loop has since exited.
+
+**Closed** lists everything closed in today's session — symbol, shares, opened, closed, P&L in dollars and percent, and which rule (or `MANUAL`) closed it — with net P&L and a win/loss count underneath.
+
+It is visible from the moment something closes, not only after the bell. It used to be an "End of day" card hidden until the forced-exit mark, which was reasonable while a strategy rule was the only thing that could close a position; once the page can close one by hand, an operator who has just sold something cannot be made to wait four hours to see what it made. After the close it reads the same way the end-of-day summary did.
+
+The selected tab is remembered per browser, because the page swaps its whole content block on every poll and would otherwise snap back to **Open** every twelve seconds.
+
 ## Screening section (visible while `SCREENING`)
+
+Each row that qualified and is not already held carries an **Open** button.
+
+### The Open button
+
+It buys that candidate now, **overriding the setup gate** — the rule the whole strategy turns on. It exists because a human reading a chart can see a pattern the mechanical detector cannot: `FindSetup` wants a 1–5 bar pullback reclaimed on the next bar, which a relentless vertical mover never prints (it reads "pullback is 0 bars" all the way up, then jumps past 5 within minutes of topping). See the KNRX case in [`decisions.md`](./decisions.md).
+
+What it overrides is the **signal**, and only the signal:
+
+- **Size is still computed, never chosen.** `risk.SizeForRisk` runs exactly as it does for an automatic entry: shares = risk budget ÷ distance to the stop.
+- **There is always a stop.** If the chart happens to show a completed setup, its stop is used and the trade is identical to the automatic one. If not, the stop goes at `entry.max_stop_distance_pct` below entry — the widest risk the strategy accepts, which makes the position the *smallest* the risk budget allows. The confirmation says which of the two you got, and quotes the detector's reason when there was no setup.
+- **The position cap, one-position-per-symbol and same-day re-entry all still apply.**
+- **The kill switch does not block it**, because an instruction about one named symbol is not the thing it exists to stop — but the confirmation warns, and the audit event carries `overrode_halt`.
+- **Refused inside the end-of-day window**, where anything bought is about to be force-sold, and refused with the exchange shut.
+
+Once open it is an ordinary position: same stop, same scale-out at the first target, same forced exit before the close.
 
 A table of tickers currently being evaluated, with a per-criterion breakdown rather than a single pass/fail — this is what lets you see *why* a candidate did or didn't qualify:
 

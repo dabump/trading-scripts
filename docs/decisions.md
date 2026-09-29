@@ -870,6 +870,27 @@ paragraphs away from its header, two sections there still describing the pre-tab
 positions layout, and `docs/README.md` still introducing the directory as a spec written
 before any code existed.
 
+## 2026-09-29 — Two exit/re-entry settings kept at their shipped values
+
+The documentation drift pass above changed `config/config.yaml` in the same commit it
+was written in, and missed the two keys it changed. `TestLoadShippedConfig` caught one
+of them; nothing guards the other, so it drifted silently. Both are kept as shipped and
+the docs now describe them.
+
+| Key | Was | Now | Note |
+|---|---|---|---|
+| `exit.eod_exit_offset_minutes` | 30 | **5** | The forced exit moves from 15:30 to 15:55. `timing.entry_window` still puts the last entry at 15:00, so it binds 55 minutes ahead of the exit and `entry_cutoff_buffer` (30m → 15:25) no longer binds at all. Unmeasured: `cmd/backtest` exits at the configured mark, so the last 25 minutes of a position's life is now held rather than closed, and nothing has been run to say whether that is better. |
+| `risk.allow_same_day_reentry` | `false` | **`true`** | A symbol may be bought again once today's position in it has closed. One-position-per-symbol is unaffected — it is not configurable and still refuses the second buy while the first is open. |
+
+Neither value is measured, and `allow_same_day_reentry` is still marked **PROPOSED** in
+both the config and `operations.md`. The reason for recording them here is the one the
+pass above makes: a shipped value that contradicts its documentation should be settled
+deliberately, not left to whichever of the two a reader happens to trust.
+
+The forced-exit interval is no longer restated as a number in `risk.md` or the
+`EOD_WINDOW` legend; both name the key, as the sentiment-window fix did for the same
+reason.
+
 ## Open items (not yet decided)
 
 - **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.

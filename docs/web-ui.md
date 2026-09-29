@@ -57,7 +57,7 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 | `PRE_MARKET` | Orange | The pre-market session (`premarket.start` → 09:30). Screening the early tape; the sentiment gate has not run yet, and nothing is bought unless `premarket.allow_entry` is set. |
 | `SENTIMENT_CHECK` | Amber | Market open, inside the gate window (`timing.sentiment_window`, 5m). Polling every `timing.sentiment_poll_interval` (2m). No trades placed. |
 | `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates and may hold open positions. |
-| `EOD_WINDOW` | Amber | Final 30 minutes before the close. Flattening open positions; no new entries. |
+| `EOD_WINDOW` | Amber | The last `exit.eod_exit_offset_minutes` before the close (currently 5m). Flattening open positions; no new entries. |
 | `HALTED_BEARISH` | Red | The gate's sentiment came back overwhelmingly bearish, **or** the daemon started after the gate window and had no readings to judge. No trades for the rest of the session. The second case can be dismissed from the page — see "Dismissing a halt the gate could not judge". |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
 

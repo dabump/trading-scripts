@@ -155,7 +155,8 @@ timing:
   sentiment_window: 5m
   # New positions are only opened in this window after the open; positions already
   # held are still managed to the close. 5h30m from a 09:30 open puts the last entry
-  # at 15:00, leaving the buffer below before the 15:30 forced exit.
+  # at 15:00, comfortably ahead of the 15:55 forced exit — at the current
+  # eod_exit_offset_minutes this window binds well before the buffer below does.
   #
   # Measured caveat, recorded in docs/decisions.md: on the backtested year, later
   # entries were worse. A 2h window ended at $8,871 against 4h at $7,162 and all-day

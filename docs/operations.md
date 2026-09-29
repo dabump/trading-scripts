@@ -57,11 +57,11 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `risk.max_position_pct` | 33.0 | `risk.md` — notional cap; must exceed `risk_per_trade_pct ÷ entry.max_stop_distance_pct` or it binds on every trade |
 | `risk.max_concurrent_positions` | 3 | `risk.md` — three at 33% keeps maximum exposure just under fully invested; validated so sizing × concurrency cannot exceed 100% |
 | `risk.stop_loss_pct` | 10.0 | `risk.md` |
-| `risk.allow_same_day_reentry` | `false` | **PROPOSED** |
+| `risk.allow_same_day_reentry` | `true` | **PROPOSED** — a symbol may be bought again once today's position in it has closed; one-position-per-symbol still holds |
 | `exit.first_target_r` | 2.0 | `strategy.md` §4 — in multiples of the trade's own initial risk |
 | `exit.first_target_fraction` | 0.5 | `strategy.md` §4 — validated in (0, 1): selling all of it is the rule that measured t = −9.76 |
 | `exit.breakeven_after_target` | `true` | `strategy.md` §4 |
-| `exit.eod_exit_offset_minutes` | 30 | `strategy.md` §4 |
+| `exit.eod_exit_offset_minutes` | 5 | `strategy.md` §4 |
 | `timing.sentiment_poll_interval` | 2m | `strategy.md` §1 — tightened with the shorter gate window |
 | `timing.sentiment_window` | 5m | `strategy.md` §1 — shortened from 1h so the opening range is tradeable |
 | `timing.entry_window` | 5h30m | `strategy.md` §3 — from a 09:30 open the last entry is 15:00; validated longer than `sentiment_window` |

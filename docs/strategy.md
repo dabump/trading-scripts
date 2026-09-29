@@ -227,7 +227,7 @@ move.
 
 ## Same-day re-entry
 
-A symbol with a position opened today is not bought again for the rest of the session, even after it closes (PROPOSED; `allow_same_day_reentry: false`). This avoids repeatedly buying back into a name that already stopped out. Enforced from the store rather than memory, so it survives a restart.
+A symbol already traded today **may** be bought again once that position has closed (PROPOSED; `allow_same_day_reentry: true`). Setting it to `false` blocks the re-entry for the rest of the session, which avoids repeatedly buying back into a name that already stopped out; that is what the docs originally specified and what the key exists to restore. Either way this is a rule about a *closed* position — one-position-per-symbol refuses the second buy while the first is still open, and it is not configurable. Enforced from the store rather than memory, so it survives a restart.
 
 ## Explicitly out of scope for v1
 

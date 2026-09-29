@@ -33,7 +33,7 @@
 
 ## End-of-day exit
 
-- Every open position is force-closed 30 minutes before market close, no exceptions — the strategy never holds overnight.
+- Every open position is force-closed `exit.eod_exit_offset_minutes` before market close (currently **5m**), no exceptions — the strategy never holds overnight.
 
 ## Not yet decided / worth revisiting once paper trading is running
 

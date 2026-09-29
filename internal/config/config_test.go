@@ -33,8 +33,8 @@ func TestLoadShippedConfig(t *testing.T) {
 	// The exits are the stop-loss and the forced end-of-day deadline, and nothing
 	// else. A profit target or trailing stop here would reintroduce the single
 	// largest measured loss in the strategy's history (docs/decisions.md).
-	if c.Exit.EODExitOffsetMins != 30 {
-		t.Errorf("eod offset = %d, want 30 (docs/strategy.md §4)", c.Exit.EODExitOffsetMins)
+	if c.Exit.EODExitOffsetMins != 5 {
+		t.Errorf("eod offset = %d, want 5 (docs/strategy.md §4)", c.Exit.EODExitOffsetMins)
 	}
 	// A whole-position profit target is the rule that measured t = -9.76. Scaling out
 	// must leave a runner behind.

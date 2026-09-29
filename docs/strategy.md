@@ -2,21 +2,21 @@
 
 **Status:** implemented. Values below marked **PROPOSED** were not settled in design; they were filled in during implementation so the agent could run and are awaiting review (see [`decisions.md`](./decisions.md)). All of them live in `config/config.yaml` — change them there, and update this doc to match.
 
-## 1. Sentiment gate (first hour)
+## 1. Sentiment gate (the opening window)
 
-- From market open, poll Alpaca market data every 10 minutes for one hour.
-- No trades are placed during this hour regardless of what the data shows.
-- At the end of the hour, classify the session as **overwhelmingly bearish** or **not overwhelmingly bearish**:
+- From market open, poll Alpaca market data every `timing.sentiment_poll_interval` (2m) for `timing.sentiment_window` (5m). The window was an hour as originally specified; §3 records why it was shortened and what that costs.
+- No trades are placed during that window regardless of what the data shows.
+- At the end of the window, classify the session as **overwhelmingly bearish** or **not overwhelmingly bearish**:
   - Overwhelmingly bearish → hand off to `risk`'s daily kill switch; no further trades today.
   - Anything else (clearly bullish *or* neutral/ambiguous) → proceed to screening for the rest of the day. Only a clear bearish reading halts trading — a neutral/unclear reading is treated the same as bullish, not the same as bearish.
 - **Classification rule (PROPOSED):** the session is overwhelmingly bearish when the average intraday change across SPY, QQQ and IWM is at or below **−0.8%** *and* none of the three is positive. Anything else proceeds. IWM is in the basket deliberately: the strategy trades small caps, so a small-cap index belongs in the read of the tape, not just SPY and QQQ.
-- If the daemon starts *after* the first hour, no readings exist and the gate cannot be judged. It halts for the day rather than trading without the safety check ever having run. This is the one halt that can be dismissed from the status page — it is an absence of data rather than a risk decision, and a restart should not automatically cost the session. Dismissing it sets the verdict to `GATE_OVERRIDDEN` rather than `PROCEED`, so nothing later reads it as the gate having passed. A halt the gate genuinely *reached* on real readings is the kill switch and is not dismissible. See [`web-ui.md`](./web-ui.md).
+- If the daemon starts *after* the gate window, no readings exist and the gate cannot be judged. It halts for the day rather than trading without the safety check ever having run. This is the one halt that can be dismissed from the status page — it is an absence of data rather than a risk decision, and a restart should not automatically cost the session. Dismissing it sets the verdict to `GATE_OVERRIDDEN` rather than `PROCEED`, so nothing later reads it as the gate having passed. A halt the gate genuinely *reached* on real readings is the kill switch and is not dismissible. See [`web-ui.md`](./web-ui.md).
 
-**Pre-market has no gate, and cannot have one.** The gate's readings are taken after the open, so anything the agent does before the bell necessarily predates it. Pre-market screening is unaffected — it never buys anything by itself — but `premarket.allow_entry` would be trading with the kill switch not merely off but nonexistent. In its place, each pre-market pass that may buy takes a **live** reading of the same basket through the same classifier (`sentiment.Classify`) and withholds entry on an overwhelmingly bearish tape, or when the reading is unavailable at all. That reading is deliberately **not persisted**: the session's verdict belongs to the first hour, and a 07:30 sample must not be able to settle the day before the market has opened. It is a weaker guarantee than the gate — one sample rather than a window of them — which is one of the reasons `allow_entry` defaults to false.
+**Pre-market has no gate, and cannot have one.** The gate's readings are taken after the open, so anything the agent does before the bell necessarily predates it. Pre-market screening is unaffected — it never buys anything by itself — but `premarket.allow_entry` would be trading with the kill switch not merely off but nonexistent. In its place, each pre-market pass that may buy takes a **live** reading of the same basket through the same classifier (`sentiment.Classify`) and withholds entry on an overwhelmingly bearish tape, or when the reading is unavailable at all. That reading is deliberately **not persisted**: the session's verdict belongs to the gate window, and a 07:30 sample must not be able to settle the day before the market has opened. It is a weaker guarantee than the gate — one sample rather than a window of them — which is one of the reasons `allow_entry` is the switch to leave off until the pre-market numbers have been watched (§2b).
 
 ## 2. Screening (momentum candidates)
 
-During the regular session, screening only starts once the sentiment gate has passed (i.e. after the first hour) — there is no background screening during the no-trade hour. Pre-market screening is separate and is described in §2b.
+During the regular session, screening only starts once the sentiment gate has passed (i.e. once `timing.sentiment_window` has elapsed and the gate has resolved) — there is no background screening during the no-trade window. Pre-market screening is separate and is described in §2b.
 
 Nothing in the screen filters on company size, so it admits large caps as readily as small ones.
 
@@ -26,7 +26,7 @@ Nothing in the screen filters on company size, so it admits large caps as readil
 
 **Evaluation order:** the tradability floors are applied first, then the intraday-move criterion from the batched snapshot, and only symbols that clear both get the per-symbol news and average-volume lookups. At a one-minute cadence, enriching every mover would multiply API calls for names already disqualified on the cheapest criterion. Symbols that fail the move gate still appear on the status page, with the un-fetched criteria shown as unevaluated.
 
-**Re-scan frequency:** every 1 minute once the sentiment gate has opened. This is deliberately much tighter than the first hour's 10-minute sentiment-poll cadence, chosen because a momentum setup can fully develop and finish within minutes — a slower interval risks discovering candidates only after the move that made them interesting is already over.
+**Re-scan frequency:** every 1 minute once the sentiment gate has opened — tighter than the gate's own 2-minute poll, chosen because a momentum setup can fully develop and finish within minutes — a slower interval risks discovering candidates only after the move that made them interesting is already over.
 
 A candidate must pass **all three** of the following (AND, not scored/weighted — any one failing disqualifies the candidate):
 
@@ -55,16 +55,16 @@ The US market trades from 04:00 ET, and the gap-and-go setups this strategy look
 
 The price band (`min_price` / `max_price`) and the move threshold are **not** split. A name is inside the strategy's band, or moving enough, regardless of which session is printing it; changing those would make it a different screen rather than the same screen on a different session.
 
-**Coverage and cadence.** `premarket.start` defaults to **04:00**, the exchange's own pre-market open, because `PRE_MARKET` is a claim about what the market is doing — a start later than the real one makes the agent report `MARKET_CLOSED` while the tape is trading, which reads as the feature being broken. What absorbs the cost instead is the cadence: `premarket.scan_interval` (default 5m) rather than the regular 1m. One pass is roughly 130 mostly-serial API requests, so 04:00–09:30 is ~66 passes averaging ~26 requests a minute against Alpaca's 200/min — affordable, where the regular cadence (~330 passes) would not be. A later `start` remains a supported way to trim calls further, at the cost of being blind to anything that moved before it.
+**Coverage and cadence.** `premarket.start` defaults to **04:00**, the exchange's own pre-market open, because `PRE_MARKET` is a claim about what the market is doing — a start later than the real one makes the agent report `MARKET_CLOSED` while the tape is trading, which reads as the feature being broken. `premarket.scan_interval` exists so the cost can be absorbed by scanning less often than the regular session, but it is currently set to the same **1m**. One pass is roughly 130 mostly-serial API requests, so 04:00–09:30 is ~330 passes and the morning runs at the regular session's ~130 requests a minute against Alpaca's 200/min — where a 5m cadence would be ~66 passes at ~26 a minute. Nothing measures pass duration, so slowing this key is the cheap way to buy headroom if the morning shows signs of overrunning. A later `start` remains a supported way to trim calls further, at the cost of being blind to anything that moved before it.
 
-**Entry is a second switch.** `premarket.allow_entry` defaults to **false**, so by default the agent screens before the bell and buys nothing. The candidate table fills, and every qualifying row carries `pre-market entry is disabled` in its Action column — the same reasoning as the closed entry window in §3, where an empty table would read as a broken scanner rather than a deliberate stand-down.
+**Entry is a second switch.** `premarket.allow_entry` is **on** in the shipped config, so the agent does buy before the bell — against the recommendation in [`decisions.md`](./decisions.md), which asks for it to stay off until the PDT count is resolved, since a pre-market entry that exits the same session is still a day trade. With it off the agent screens before the bell and buys nothing: the candidate table still fills, and every qualifying row carries `pre-market entry is disabled` in its Action column — the same reasoning as the closed entry window in §3, where an empty table would read as a broken scanner rather than a deliberate stand-down.
 
 With it on, three things change and all three are requirements rather than preferences:
 
 1. **Orders are extended-hours day limit orders**, whatever `execution.order_type` says. Alpaca accepts nothing but a day limit order for the extended session, so there is no choice to express — `execution.order_type` keeps governing the regular session alone, and `engine.submit` sends a limit order whenever the phase is pre-market. It is priced off `premarket.limit_slip_pct`, falling back to `execution.limit_slip_pct`. Both entries and exits carry the extended-hours flag.
 
    That allowance is the setting to watch. Pre-market spreads on these names are several times wider than regular-session ones, so an allowance that is generous at 14:00 may never fill at 06:00 — and on the **exit** side, an unfilled stop leaves the position open until the bell. That is a real consequence of `allow_entry`, not a theoretical one, and it is unmeasured like the rest of §2b.
-2. **Entry is gated on a live sentiment read** (see §1), because the first-hour gate has not run.
+2. **Entry is gated on a live sentiment read** (see §1), because the post-open gate has not run.
 3. **The setup is read on pre-market candles.** The chart handed to `strategy.FindSetup` starts at `premarket.start` rather than the open, so the pullback, the EMA and the VWAP are all computed from the session actually trading.
 
 Everything else is unchanged: the same position cap, the same sizing from the stop, the same exit rules. A position opened pre-market is managed from the moment it exists — its stop can fire at 08:00 rather than waiting for the bell — and is flattened at the regular forced end-of-day exit like any other.
@@ -73,7 +73,7 @@ Everything else is unchanged: the same position cap, the same sizing from the st
 
 **Where pre-market volume comes from.** Not the snapshot. Verified against a live account: before the bell, Alpaca's `dailyBar` is still the *previous* session's, and no daily bar for today exists yet, so a symbol's volume-so-far reads as **zero**. That zero fails both the liquidity floor and the relative-volume criterion, which made the first live pre-market scan reject all 66 of its movers. `broker.SessionVolumes` therefore sums each name's volume from **batched hourly bars** since `premarket.start`, and the tradability gate splits in two to accommodate it: the price band is answerable from the snapshot in either session and is applied first, then volume is fetched for the survivors, then turnover is judged. See [`decisions.md`](./decisions.md) for the raw payloads.
 
-**These numbers are unmeasured.** `cmd/backtest` fetches 09:30–16:00 bars and has no pre-market data to sweep, so unlike the regular-session thresholds none of the `premarket.*` values has been measured — they are reasoned defaults. Run with `allow_entry: false` and read the candidate table for a while before turning it on. See [`decisions.md`](./decisions.md).
+**These numbers are unmeasured.** `cmd/backtest` fetches 09:30–16:00 bars and has no pre-market data to sweep, so unlike the regular-session thresholds none of the `premarket.*` values has been measured — they are reasoned defaults. The recommendation is to run with `allow_entry: false` and read the candidate table for a while before turning it on; the shipped config has it on, which is a choice worth revisiting rather than a measured one. See [`decisions.md`](./decisions.md).
 
 ## 3. Entry — the setup gate
 
@@ -231,5 +231,5 @@ A symbol with a position opened today is not bought again for the rest of the se
 
 ## Explicitly out of scope for v1
 
-- **Backtesting.** Paper trading against live Alpaca data is the validation step for this project; no historical backtest engine is planned. Revisit only if paper-trading results suggest it's needed before going live.
-- **Multiple strategies.** This is a single strategy (small-cap momentum) for v1 — the `strategy` package doesn't need a plugin/registry architecture yet.
+- **Backtesting — superseded.** This said paper trading was the only planned validation and no backtest engine would be built. `cmd/backtest` was added on 2026-09-28 and is now how any change to these rules is measured; it imports the production rule packages so the measurement cannot drift from the daemon. See [`decisions.md`](./decisions.md).
+- **Multiple strategies.** This is a single strategy for v1 — the `strategy` package doesn't need a plugin/registry architecture yet. It is modelled on discretionary small-cap momentum, but the screen has no size criterion, so "small-cap" describes the intent rather than the filter — an open item in [`decisions.md`](./decisions.md).

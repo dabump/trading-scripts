@@ -21,7 +21,7 @@ overlay. Both are **read-only by contract**, and the contract is the point:
 - **Check sentiment** runs the same classification as the scheduled poll and reports
   what it would mean. **Nothing is persisted.** The gate verdict is decided by the
   most recent *stored* reading, so writing a manual check would let a click at any
-  hour overturn what the first hour concluded.
+  hour overturn what the gate concluded.
 - **Screen candidates** runs the screening evaluation and lists what it found,
   ranked strongest first with failures kept visible — seeing what nearly qualified
   is the point of looking. It **works with the exchange closed**, which is the case
@@ -42,7 +42,7 @@ clicks get told it is already running rather than multiplying API calls.
 
 ## Header: two separate indicators
 
-These are distinct and shouldn't be visually merged, since the agent's status doesn't always match raw market-open/closed (e.g. market is open but the agent is in its no-trade first hour, or halted for the day on bearish sentiment):
+These are distinct and shouldn't be visually merged, since the agent's status doesn't always match raw market-open/closed (e.g. market is open but the agent is in its no-trade opening window, or halted for the day on bearish sentiment):
 
 1. **Market hours badge** — green while the US exchange is open, **orange** while the pre-market session is running (`PRE-MARKET`), red while closed. Driven directly by `scheduler`'s market-hours knowledge, not by anything the agent itself decided. It also carries a **countdown**: `closes in 4h 12m` while open, `opens in 15h 42m` while closed, with the exact target moment in the badge's tooltip.
 
@@ -55,10 +55,10 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 |---|---|---|
 | `MARKET_CLOSED` | Gray | Outside exchange hours. Daemon idle, waiting for next open. |
 | `PRE_MARKET` | Orange | The pre-market session (`premarket.start` → 09:30). Screening the early tape; the sentiment gate has not run yet, and nothing is bought unless `premarket.allow_entry` is set. |
-| `SENTIMENT_CHECK` | Amber | Market open, within the first hour. Polling every 10 minutes. No trades placed. |
+| `SENTIMENT_CHECK` | Amber | Market open, inside the gate window (`timing.sentiment_window`, 5m). Polling every `timing.sentiment_poll_interval` (2m). No trades placed. |
 | `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates and may hold open positions. |
 | `EOD_WINDOW` | Amber | Final 30 minutes before the close. Flattening open positions; no new entries. |
-| `HALTED_BEARISH` | Red | First-hour sentiment came back overwhelmingly bearish, **or** the daemon started after the first hour and the gate had no readings to judge. No trades for the rest of the session. The second case can be dismissed from the page — see "Dismissing a halt the gate could not judge". |
+| `HALTED_BEARISH` | Red | The gate's sentiment came back overwhelmingly bearish, **or** the daemon started after the gate window and had no readings to judge. No trades for the rest of the session. The second case can be dismissed from the page — see "Dismissing a halt the gate could not judge". |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
 
 `PRE_MARKET` was added when pre-market coverage was, for the same reason `EOD_WINDOW` exists: neither of the neighbouring states is true. `MARKET_CLOSED` would report a scanning agent as idle, and `SCREENING` would imply entries are being taken when by default they are not. It gets its own orange, sitting between the grey of a closed market and the green of a trading one — and a warmer orange than the amber `SENTIMENT_CHECK`/`EOD_WINDOW` use, so the two are not read as variations of each other. With `premarket.enabled: false` the state never appears and the morning is `MARKET_CLOSED` exactly as before.
@@ -71,9 +71,11 @@ The market-hours badge stays on the *regular* session throughout: during pre-mar
 
 ## Dismissing a halt the gate could not judge
 
-When the daemon starts *after* the first hour, no sentiment readings exist, so `resolveGate` has nothing to judge and halts the day:
+When the daemon starts *after* the gate window, no sentiment readings exist, so `resolveGate` has nothing to judge and halts the day:
 
 > ■ Halted for the session: no sentiment readings were taken during the first hour
+
+(The wording is quoted as the engine prints it; it predates `timing.sentiment_window` being shortened from the hour originally specified.)
 
 That is the right default — trading with the safety check never having run is worse than sitting out — but it is an **absence of data, not a risk decision**, and a restart at 11:00 should not automatically cost the rest of the session. The halt banner therefore carries an **Ignore** button, which resumes screening for the rest of the day.
 
@@ -130,6 +132,11 @@ Once open it is an ordinary position: same stop, same scale-out at the first tar
 A table of tickers currently being evaluated, with a per-criterion breakdown rather than a single pass/fail — this is what lets you see *why* a candidate did or didn't qualify:
 
 | Ticker | News catalyst today | ≥10% intraday move | ≥5x avg volume | Overall |
+|---|---|---|---|---|
+| e.g. `ABCD` | ✅ 2 today | ✅ +14% | ✅ 6.1x | **Qualifies** |
+| e.g. `WXYZ` | ❌ 0 today | ✅ +11% | ✅ 5.3x | Fails (no news) |
+
+Each cell shows both the pass/fail and the underlying value, not just a checkmark, so the numbers are visible without cross-referencing anything else.
 
 The Action column carries the setup's verdict too, which is usually why a qualifying
 candidate was not bought: "no setup: close 9.93 has not cleared the 10.02 pullback
@@ -140,11 +147,6 @@ The open-positions table shows each position's **stop** and its **R multiple**, 
 position that has scaled out shows what is still held with the banked profit beside
 it ("100 of 200, +$20.00"). Showing only the remaining share count would misreport
 both the exposure and any P&L a reader works out in their head.
-|---|---|---|---|---|
-| e.g. `ABCD` | ✅ 2 today | ✅ +14% | ✅ 6.1x | **Qualifies** |
-| e.g. `WXYZ` | ❌ 0 today | ✅ +11% | ✅ 5.3x | Fails (no news) |
-
-Each cell shows both the pass/fail and the underlying value, not just a checkmark, so the numbers are visible without cross-referencing anything else.
 
 A final **Action** column says what the entry pass did with each qualifying
 candidate — bought (with size and price), or why not: the position cap, already
@@ -181,23 +183,21 @@ Balances are printed with thousands separators, unlike the per-share prices
 elsewhere on the page: these are the only figures large enough to be misread by a
 factor of ten at a glance.
 
-## Open positions section
+## Scope of the two position views
 
-| Ticker | Purchase price | Shares | Current price | Unrealized P&L ($ and %) |
-|---|---|---|---|---|
+Both views live in the Positions card described above. What is worth recording is where
+they depart from the original spec, and where v1 stops:
 
-Current price and unrealized P&L were added beyond what was originally specified (purchase price + share count) because showing a position's cost basis without its live performance would mean checking somewhere else for the number that actually matters day-to-day.
-
-## End-of-day section (appears after market close)
-
-Scope for v1: **today's session only** — not a browsable multi-day history. This appears once the exchange has closed, summarizing what happened that day:
-
-| Ticker | Shares | Opening (purchase) price | Closing (sale) price | P&L % |
-|---|---|---|---|---|
-
-Plus a totals row: net P&L for the day (aggregate $ and %) and a win/loss count, so the day's outcome is visible without adding up the rows by hand.
-
-**Not yet decided:** whether a later version should support browsing prior days' sessions (would need `store` queries across days and a day-picker UI). Flagged as a possible v2 item in [`decisions.md`](./decisions.md), not to be built now.
+- **Current price and unrealized P&L go beyond what was originally specified** (purchase
+  price + share count). A cost basis without live performance would mean looking
+  somewhere else for the number that matters day-to-day.
+- **The closed view covers today's session only**, with a totals row for net P&L and a
+  win/loss count so the day's outcome needs no mental arithmetic. It is no longer gated
+  on the closing bell — see "Positions" above for why that changed once the page could
+  close a position by hand.
+- **Not yet decided:** whether a later version should support browsing prior days'
+  sessions (would need `store` queries across days and a day-picker UI). Flagged as a
+  possible v2 item in [`decisions.md`](./decisions.md), not to be built now.
 
 ## Active strategy section (bottom of the page)
 

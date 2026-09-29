@@ -11,10 +11,9 @@
 - **Two caps bound the size:** `risk.max_position_pct` (33%) on one position's notional, and available cash. The notional cap does bind on tight stops, and when it does the trade risks *less* than 1% — conservative, and visible in the audit trail's `risk_dollars`. The cap must stay above `risk_per_trade_pct ÷ entry.max_stop_distance_pct`, or it binds on every trade and sizing silently reverts to a fixed fraction of the account. Config validation does not check that ratio; a test in `internal/config` does.
 
 - **Concurrency is 3, not 5.** The approach being followed runs a small number of positions at a time rather than a basket. Three at 33% keeps maximum exposure just under fully invested, and total simultaneous risk at 3%.
-- The allocation is clamped to available cash. The target is a percentage of total portfolio *value*, which includes the market value of positions already held, so on a heavily deployed account the untouched percentage could still exceed the cash left to spend; submitting an order the account cannot fund just earns a broker rejection mid-session.
-- If the allocation cannot buy a single share, the candidate is skipped with a logged reason rather than rounded up.
-- Maximum **5 concurrent open positions** → maximum 50% of portfolio exposed at once, minimum 50% held in cash.
-- If a qualifying candidate appears while 5 positions are already open, it is skipped — there is no queueing or displacing an existing position.
+- The size is clamped to available cash. Sizing is computed from equity, which includes the market value of positions already held, so on a heavily deployed account the share count the risk budget allows can still cost more than the cash left to spend; submitting an order the account cannot fund just earns a broker rejection mid-session.
+- If the budget cannot buy a single share, the candidate is skipped with a logged reason rather than rounded up.
+- If a qualifying candidate appears while `risk.max_concurrent_positions` are already open, it is skipped — there is no queueing, and nothing already held is displaced to make room.
 
 ## Per-trade stop-loss
 
@@ -22,15 +21,15 @@
 - **`risk.stop_loss_pct` (10%) is now a gap backstop**, not the working stop. It is only reachable when price jumps straight through the chart stop. Config validation requires it to be wider than `entry.max_stop_distance_pct`; otherwise it would fire first and the chart stop would never be reached, silently reverting the strategy to a fixed-percentage stop.
 - A price sitting exactly on either threshold counts as a hit (`strategy.priceEpsilon`).
 - **Once the first target is banked the stop moves to the entry price**, so a winner cannot become a loser.
-- This is a hard floor — it should be checked independently of (and take priority over) the momentum-based exit signal, so a bug or gap in the exit-signal logic can't turn into an unbounded loss on a single position.
+- This is a hard floor, checked independently of — and ahead of — the profit target, so a bug or gap in the target/scale-out logic cannot turn into an unbounded loss on a single position. `strategy.EvaluateExit` checks the forced end-of-day exit, then the stop, then the target, in that order.
 
 ## Daily kill switch
 
-- If the first-hour sentiment read comes back overwhelmingly bearish, no trades are placed for the rest of that session. The agent waits for the next trading day. The verdict is persisted, so a restart does not re-open a halted day.
-- Open positions are still monitored while halted: the kill switch stops new entries, it does not abandon anything already held. (In practice nothing can be open when the gate halts, since no entries happen during the first hour — but a restart that adopted a broker position, or a pre-market entry, are the cases where this matters.)
+- If the gate's sentiment read comes back overwhelmingly bearish, no trades are placed for the rest of that session. The agent waits for the next trading day. The verdict is persisted, so a restart does not re-open a halted day.
+- Open positions are still monitored while halted: the kill switch stops new entries, it does not abandon anything already held. (In practice nothing can be open when the gate halts, since no entries happen during the gate window — but a restart that adopted a broker position, or a pre-market entry, are the cases where this matters.)
 - **The kill switch does not cover pre-market, because it cannot.** Its readings are taken after the open, so anything before the bell necessarily predates the verdict. Pre-market screening is unaffected — it buys nothing by itself — but `premarket.allow_entry` trades with the switch nonexistent rather than merely off. A live sentiment read through the same classifier stands in for it (`docs/strategy.md` §1 and §2b); one sample is a weaker guarantee than a window of them, which is why `allow_entry` defaults to false. A position opened pre-market is then covered by everything else in this document from the moment it exists: the same stop, the same sizing, the same forced end-of-day exit.
 - This is a pre-emptive halt (based on sentiment, before any position is opened) — distinct from the per-trade stop-loss, which protects an already-open position.
-- **A halt is only dismissible when the gate never ran.** Starting the daemon after the first hour leaves no readings, and the resulting halt reports an absence of data rather than a bearish market; the status page can dismiss that one, recording the verdict as `GATE_OVERRIDDEN`. A halt the gate reached on real readings is the kill switch doing its job and cannot be dismissed from the page. The distinction is made on whether any readings exist, not on the halt's wording.
+- **A halt is only dismissible when the gate never ran.** Starting the daemon after the gate window leaves no readings, and the resulting halt reports an absence of data rather than a bearish market; the status page can dismiss that one, recording the verdict as `GATE_OVERRIDDEN`. A halt the gate reached on real readings is the kill switch doing its job and cannot be dismissed from the page. The distinction is made on whether any readings exist, not on the halt's wording.
 
 ## End-of-day exit
 

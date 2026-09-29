@@ -56,10 +56,11 @@ premarket:
   # than none. A later start is a supported way to trim API calls, at the cost of
   # being blind to anything that has already moved by then.
   start: "04:00"
-  # Deliberately slower than timing.screener_scan_interval. One pass is ~130 mostly
-  # serial requests, so 04:00-09:30 at this cadence is ~66 passes, averaging ~26
-  # requests a minute against Alpaca's 200/min — affordable, where the regular
-  # one-minute cadence would not be.
+  # A separate key from timing.screener_scan_interval so pre-market can be scanned
+  # less often, but currently set to the same 1m. One pass is ~130 mostly serial
+  # requests, so 04:00-09:30 at this cadence is ~330 passes averaging ~130 requests a
+  # minute against Alpaca's 200/min; 5m would be ~66 passes at ~26 a minute. Nothing
+  # measures pass duration, so slowing this is the cheap way to buy headroom.
   scan_interval: 1m
   # Replaces screening.min_dollar_volume while pre-market. The regular $1,000,000
   # floor is a regular-session number and rejects essentially every pre-market name,
@@ -126,7 +127,7 @@ risk:
   # exposure just under fully invested.
   max_concurrent_positions: 3
   stop_loss_pct: 10.0 # docs/risk.md
-  allow_same_day_reentry: false # PROPOSED (docs left same-day re-entry undecided)
+  allow_same_day_reentry: true # PROPOSED (docs left same-day re-entry undecided)
 
 exit:
   # Scale out of a winner, keep a runner. The target is in multiples of the trade's
@@ -143,7 +144,7 @@ exit:
   first_target_r: 2.0
   first_target_fraction: 0.5
   breakeven_after_target: true
-  eod_exit_offset_minutes: 30 # docs/strategy.md §4
+  eod_exit_offset_minutes: 5 # docs/strategy.md §4
 
 timing:
   sentiment_poll_interval: 2m # docs/strategy.md §1

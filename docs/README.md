@@ -1,6 +1,6 @@
 # Documentation
 
-This directory is the working spec for the automated trading agent, written before any code exists. The goal is to front-load design decisions and open questions so implementation starts from an agreed plan rather than assumptions made mid-coding.
+This directory is the working spec for the automated trading agent. It was written before the code existed, to front-load design decisions and open questions so implementation started from an agreed plan rather than assumptions made mid-coding; it is now kept current with what the daemon actually does, and each document states its status at the top.
 
 - [`architecture.md`](./architecture.md) — components, data flow, how the daemon is structured
 - [`strategy.md`](./strategy.md) — sentiment gate, screening criteria, entry/exit rules

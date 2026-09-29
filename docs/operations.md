@@ -9,7 +9,7 @@
 
 ### Pattern Day Trader (PDT) constraint — hard blocker before going live
 
-FINRA's Pattern Day Trader rule restricts margin accounts under $25,000 equity to 3 day-trades per rolling 5 business days. This strategy is designed to open and close up to 5 day-trades *per day* — as of 2026-09-26 the account is under $25k (or funding level undecided), so running this live as designed would very quickly get the account flagged/restricted by Alpaca.
+FINRA's Pattern Day Trader rule restricts margin accounts under $25,000 equity to 3 day-trades per rolling 5 business days. This strategy is designed to open and close up to `risk.max_concurrent_positions` (3) day-trades *per day*, and a one-year backtest measured a worst rolling five-session count of **64** — as of 2026-09-26 the account is under $25k (or funding level undecided), so running this live as designed would very quickly get the account flagged/restricted by Alpaca.
 
 This does not block paper trading (Alpaca's paper environment doesn't carry real regulatory consequences either way), but it **must** be resolved before any live-trading switch. Options, none yet chosen:
 - Fund the account above $25k before going live.
@@ -41,10 +41,10 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `screening.news_lookback` | 18h | **PROPOSED** — must reach back past the open so pre-market catalysts are visible; validated to be ≥7h |
 | `premarket.enabled` | `true` | `strategy.md` §2b — screening and scanning before the bell. Off means the morning is `MARKET_CLOSED` and no requests are made |
 | `premarket.start` | `04:00` | HH:MM exchange time, matching the exchange's own pre-market open; validated to parse and to fall before the 09:30 open. A later value is supported to trim API calls, but reports `MARKET_CLOSED` while the market is in pre-market |
-| `premarket.scan_interval` | 5m | **PROPOSED** — deliberately slower than `timing.screener_scan_interval`. 04:00–09:30 at 5m is ~66 passes of ~130 requests, averaging ~26 req/min against Alpaca's 200/min |
+| `premarket.scan_interval` | 1m | **PROPOSED** — a separate key from `timing.screener_scan_interval` so pre-market can be slowed down independently, but currently set to the same 1m. That is ~330 passes of ~130 requests across 04:00–09:30, so the pre-market rate is the same ~130 req/min the regular session runs at, against Alpaca's 200/min. 5m would be ~66 passes at ~26 req/min; nothing measures pass duration, so a slower value is the cheap way to buy headroom |
 | `premarket.min_dollar_volume` | 100000 | **PROPOSED** — replaces `screening.min_dollar_volume` while pre-market; the regular floor rejects the whole early tape |
 | `premarket.min_volume_multiple` | 0.5 | **PROPOSED** — replaces `screening.min_volume_multiple` while pre-market; still measured against the 20-session **daily** average, so half a day's volume before the bell is an extreme reading |
-| `premarket.allow_entry` | `false` | `strategy.md` §2b — buying before the bell. Validated to require `premarket.enabled`, and a non-zero limit allowance from either `premarket.limit_slip_pct` or `execution.limit_slip_pct` |
+| `premarket.allow_entry` | `true` | `strategy.md` §2b — buying before the bell, and **on** in the shipped config against the recommendation in `decisions.md` (pre-market entries are day trades, and the PDT count is the open blocker). Validated to require `premarket.enabled`, and a non-zero limit allowance from either `premarket.limit_slip_pct` or `execution.limit_slip_pct` |
 | `premarket.limit_slip_pct` | 1.0 | **PROPOSED** — limit allowance on pre-market orders. Extended-hours orders are always limit orders, so `execution.order_type` does not apply before the bell. Wider than the regular 0.5% because pre-market spreads are wider; 0 falls back to `execution.limit_slip_pct` |
 | `entry.pattern_interval` | 1m | `strategy.md` §3 — the candle the setup is read on |
 | `entry.ema_period` | 9 | `strategy.md` §3 — trend filter |
@@ -55,7 +55,7 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `entry.max_stop_distance_pct` | 4.0 | `strategy.md` §3 — a wider setup is refused; validated below `risk.stop_loss_pct` |
 | `risk.risk_per_trade_pct` | 1.0 | `risk.md` — the account fraction put at risk per trade; sizing follows from the stop |
 | `risk.max_position_pct` | 33.0 | `risk.md` — notional cap; must exceed `risk_per_trade_pct ÷ entry.max_stop_distance_pct` or it binds on every trade |
-| `risk.max_concurrent_positions` | 5 | `risk.md`; validated so sizing × concurrency cannot exceed 100% |
+| `risk.max_concurrent_positions` | 3 | `risk.md` — three at 33% keeps maximum exposure just under fully invested; validated so sizing × concurrency cannot exceed 100% |
 | `risk.stop_loss_pct` | 10.0 | `risk.md` |
 | `risk.allow_same_day_reentry` | `false` | **PROPOSED** |
 | `exit.first_target_r` | 2.0 | `strategy.md` §4 — in multiples of the trade's own initial risk |
@@ -89,7 +89,7 @@ expensive way to find out.
 
 - SQLite, single file under `data/` (gitignored — this holds real trade history, not something to check in).
 - Schema changes go through `internal/store/migrations/` rather than ad-hoc `ALTER TABLE` in application code, so the schema's history stays reviewable. They are embedded in the binary and applied idempotently on open; they live inside the package rather than at the repo root because `go:embed` cannot reach outside its own directory and the deployment target is a single self-contained binary.
-- The daemon restarts mid-day and resumes from whatever `store` has: open positions, today's sentiment readings (the 10-minute cadence is derived from them, so a restart neither double-polls nor skips), the session's gate verdict, and which symbols have already been traded today.
+- The daemon restarts mid-day and resumes from whatever `store` has: open positions, today's sentiment readings (the poll cadence is derived from them, so a restart neither double-polls nor skips), the session's gate verdict, and which symbols have already been traded today.
 - On startup `engine.Reconcile` treats the broker as the authority — adopting positions the store does not know about, closing ones the broker no longer holds as `RECONCILED`, and resolving orders that were submitted but never confirmed.
 
 ## Audit trail

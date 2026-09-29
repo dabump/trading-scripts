@@ -842,6 +842,34 @@ nothing, and it is the same substitution `preMarketPass` already makes for pre-m
 entry. Left out because it was not what was asked, and because a live read at 14:00
 says something quite different from a first-hour one.
 
+## 2026-09-29 — Symbols link to TradingView, and a documentation drift pass
+
+| Decision | Rationale |
+|---|---|
+| Every symbol on the status page is a link to `tradingview.com/chart/?symbol=<SYM>`, opened in a new tab | The page explains *why* the agent acted but shows no chart, and reading the tape is the first thing an operator does with a ticker they have just seen. One shared template (`symbolCell`) so positions, screening and both modals link identically. |
+| A plain anchor rather than a JS handler | The page's click handlers all match on `button`, so an anchor cannot be swallowed by them, and it survives the ~12s fragment swap with no extra code. Link colour is pinned to the body text colour in every state, since a default blue is unreadable on the dark theme. |
+| TradingView remains **not** a data source | Unchanged from 2026-09-26: this is a link out to a chart a human reads, not an integration. Nothing is fetched from it. |
+
+Then a read-through of every doc against the code and `config/config.yaml`, which found
+drift in three groups. All of it is now fixed in the docs; no behaviour changed.
+
+- **The sentiment gate was still documented as "every 10 minutes for one hour"** in `strategy.md` §1, `architecture.md`, `web-ui.md`'s legend and `operations.md`, although `timing.sentiment_window` was shortened to **5m** and the poll to **2m** — and `strategy.md` §3 already recorded that change, so the same document contradicted itself. Docs now name the config keys instead of restating an interval.
+- **Numbers left over from the pre-rewrite sizing model.** `operations.md` tabled `max_concurrent_positions` as 5, and `risk.md` still had "maximum 5 concurrent positions → 50% exposure, 50% cash" three lines below the paragraph explaining why it is 3 at 33%. `risk.md` also described sizing as a percentage of portfolio value and gave the stop priority over "the momentum-based exit signal", which was the MACD exit removed on 2026-09-28.
+- **`strategy.md` still listed backtesting as out of scope for v1**, which `cmd/backtest` superseded on 2026-09-28. Marked superseded rather than deleted.
+
+Two of the findings are **config against doc, not doc against itself**, and the docs were
+updated to describe the shipped values while keeping the recommendation visible:
+
+| Key | Shipped | Documented | Note |
+|---|---|---|---|
+| `premarket.allow_entry` | `true` | `false` | The open item below asks for this to stay off until the PDT count is resolved: a pre-market entry that exits the same session is still a day trade. |
+| `premarket.scan_interval` | `1m` | `5m` | The affordability arithmetic in both the docs and the key's own comment ("~66 passes, ~26 req/min") only holds at 5m. At 1m the morning runs ~330 passes at roughly the regular session's ~130 req/min against Alpaca's 200/min, and nothing measures pass duration. |
+
+Also fixed: a broken markdown table in `web-ui.md` whose delimiter row had drifted three
+paragraphs away from its header, two sections there still describing the pre-tabs
+positions layout, and `docs/README.md` still introducing the directory as a spec written
+before any code existed.
+
 ## Open items (not yet decided)
 
 - **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
@@ -860,7 +888,8 @@ says something quite different from a first-hour one.
 - **The strategy has no demonstrated edge, and this is the load-bearing open item.** Screening floors and the MACD removal address composition and dead weight; neither creates an edge. Before any real money: measure realised slippage in paper trading, since that single number decides the outcome, and decide whether entries must be limit orders.
 
 - **Every `premarket.*` threshold is unmeasured.** `cmd/backtest` has no pre-market bars, so the start time, scan interval, dollar-volume floor and volume multiple are reasoned rather than measured. Extending the backtest to fetch extended-hours bars is what would close this; until then the pre-market screen should be read, not traded.
-- **Pre-market entries make the PDT problem worse, not better.** A pre-market entry that exits the same session is still a day trade, and the rolling five-session count is already **64** against a limit of 3. `premarket.allow_entry` must stay off until the PDT constraint is resolved, and the live-trading guard does not cover it — that guard is about real money, and this is about trade count on paper too.
+- **Pre-market entries make the PDT problem worse, not better.** A pre-market entry that exits the same session is still a day trade, and the rolling five-session count is already **64** against a limit of 3. `premarket.allow_entry` must stay off until the PDT constraint is resolved, and the live-trading guard does not cover it — that guard is about real money, and this is about trade count on paper too. **As of 2026-09-29 the shipped config has it on**, which contradicts this item: either the switch goes back off, or this item is retired deliberately rather than by drift.
+- **`premarket.scan_interval` is set to the regular session's 1m**, so the pre-market morning costs ~330 passes at roughly ~130 requests a minute against Alpaca's 200/min, not the ~26 the key's own comment describes. Nothing measures pass duration or warns on an overrun, so the decision is whether to slow the key back to 5m or to add that measurement first.
 - **Whether a dismissed gate should be replaced by a live sentiment read** rather than by nothing. The machinery exists (`readSentiment`, already used for pre-market entry); the question is whether a mid-session reading is meaningful enough to gate on, given the rule was specified against the first hour.
 - **Whether the setup gate is too strict, now that there is a case.** KNRX is one observation, not a measurement, and the manual Open button is an escape hatch rather than an answer. The things worth sweeping in `cmd/backtest` — one at a time, against the current baseline — are `entry.max_pullback_bars`, reading the pattern on 2-minute candles, and allowing a reclaim of a recent swing high rather than the session high.
 - **The setup reason is only audited once per symbol per session.** `recordSkip` de-duplicates on symbol + `"no setup"`, so a candidate whose reason changes through the day records only the first. Combined with `SaveScreenSnapshot` keeping just the latest pass, there is no way to ask afterwards whether a candidate ever had a valid entry window.

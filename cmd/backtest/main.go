@@ -41,16 +41,17 @@ func main() {
 				"which is the only size the setup detector's answers are valid at")
 		limit = flag.Int("symbols", 0, "cap the universe (0 = every tradable US equity)")
 		grid  = flag.Bool("grid", true, "sweep exit parameters and report the surface")
+		pats  = flag.Bool("patterns", false, "compare entry settings even when -grid=false")
 	)
 	flag.Parse()
 
-	if err := run(*cfgPath, *fromFlag, *toFlag, *cacheDir, *timeframe, *limit, *grid); err != nil {
+	if err := run(*cfgPath, *fromFlag, *toFlag, *cacheDir, *timeframe, *limit, *grid, *pats); err != nil {
 		fmt.Fprintf(os.Stderr, "backtest: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid bool) error {
+func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid, patterns bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -168,6 +169,10 @@ func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid 
 		reportStopWidth(cfg, days, benchPrev)
 		reportEntryWindow(cfg, days, benchPrev)
 		reportMoveCaps(cfg, prepared)
+	}
+	if grid || patterns {
+		reportEntryPatterns(cfg, days, benchPrev)
+		reportCandleTrail(cfg, prepared)
 	}
 	return nil
 }
@@ -491,6 +496,82 @@ func reportEntryWindow(base *config.Config, raw []*DayData, benchPrev map[string
 		}
 		fmt.Printf("%-12s %7d %8.2f%% %7.2f %8.2f%% %9.0f %6.1f%%\n",
 			durationLabel(w), len(r), mean(r), tStat(r), median(r), s.EndEquity, s.MaxDrawdownPc)
+	}
+}
+
+// reportEntryPatterns varies the micro pullback's settings one at a time, and
+// compares entering on the trigger close (what the daemon does) with a buy-stop at
+// the pause high. Each row re-prepares, because the settings decide which candidates
+// set up at all.
+//
+// The buy-stop rows measure an order the daemon does not place: it scans closed
+// candles and buys at a close. They exist to say whether building that is worth it.
+func reportEntryPatterns(base *config.Config, raw []*DayData, benchPrev map[string]map[string]float64) {
+	fmt.Printf("\n## Entry pattern (0.25%% slippage per side)\n\n")
+	rows := []struct {
+		label   string
+		mutate  func(*config.Entry)
+		buyStop bool
+	}{
+		{"as configured: close above pause high", nil, false},
+		{"as configured: buy-stop at pause high", nil, true},
+		{"  + MACD above signal", func(e *config.Entry) { e.RequireMACD = true }, false},
+		{"  + lighter pause volume", func(e *config.Entry) { e.RequireVolumeDecline = true }, false},
+		{"  pause of 1 bar only", func(e *config.Entry) { e.MaxPullbackBars = 1 }, false},
+		{"  pause up to 3 bars", func(e *config.Entry) { e.MaxPullbackBars = 3 }, false},
+		{"  no minimum surge", func(e *config.Entry) { e.MinSurgePct = 0 }, false},
+		{"  surge of 6% or more", func(e *config.Entry) { e.MinSurgePct = 6 }, false},
+		{"  any retrace", func(e *config.Entry) { e.MaxRetracePct = 100 }, false},
+	}
+	fmt.Printf("%-40s %7s %7s %9s %7s %7s %6s %9s %7s\n",
+		"entry", "setups", "trades", "mean", "t", "mean R", "win", "equity", "maxDD")
+	for _, row := range rows {
+		cfg := *base
+		if row.mutate != nil {
+			row.mutate(&cfg.Entry)
+		}
+		s := simulate(&cfg, prepareWith(&cfg, raw, benchPrev, row.buyStop), 0.25)
+		r := returns(s.Trades)
+		if len(r) == 0 {
+			fmt.Printf("%-40s %7d %7d\n", row.label, s.Funnel.EverSetUp, 0)
+			continue
+		}
+		rs := make([]float64, len(s.Trades))
+		for i, tr := range s.Trades {
+			rs[i] = tr.TotalR
+		}
+		fmt.Printf("%-40s %7d %7d %8.2f%% %7.2f %+7.2f %5.0f%% %9.0f %6.1f%%\n",
+			row.label, s.Funnel.EverSetUp, len(r), mean(r), tStat(r), mean(rs),
+			winRate(r), s.EndEquity, s.MaxDrawdownPc)
+	}
+}
+
+// reportCandleTrail measures the micro pullback's candle-low exit in each of its
+// modes. It varies only cfg.Exit, so the prepared sessions are reused.
+func reportCandleTrail(base *config.Config, days []*preparedDay) {
+	fmt.Printf("\n## Candle trail: sell on the first candle to make a new low (0.25%% slippage per side)\n\n")
+	fmt.Printf("%-28s %7s %9s %7s %7s %9s %6s %9s %7s\n",
+		"exit.candle_trail", "trades", "mean", "t", "mean R", "median", "win", "equity", "maxDD")
+	for _, mode := range []string{config.CandleTrailOff, config.CandleTrailAfterTarget, config.CandleTrailAlways} {
+		cfg := *base
+		cfg.Exit.CandleTrail = mode
+		s := simulate(&cfg, days, 0.25)
+		r := returns(s.Trades)
+		if len(r) == 0 {
+			fmt.Printf("%-28s %7d\n", mode, 0)
+			continue
+		}
+		rs := make([]float64, len(s.Trades))
+		for i, tr := range s.Trades {
+			rs[i] = tr.TotalR
+		}
+		label := mode
+		if mode == base.Exit.CandleTrail || (mode == config.CandleTrailOff && base.Exit.CandleTrail == "") {
+			label += " (current)"
+		}
+		fmt.Printf("%-28s %7d %8.2f%% %7.2f %+7.2f %8.2f%% %5.0f%% %9.0f %6.1f%%\n",
+			label, len(r), mean(r), tStat(r), mean(rs), median(r), winRate(r),
+			s.EndEquity, s.MaxDrawdownPc)
 	}
 }
 

@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"testing"
+	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
@@ -266,4 +267,54 @@ func TestScaleOutOnTinyPositions(t *testing.T) {
 			t.Errorf("got %+v, want 2 of 3 sold so a runner survives", got)
 		}
 	})
+}
+
+func TestCandleTrailStop(t *testing.T) {
+	entry := time.Date(2026, 9, 28, 10, 35, 20, 0, time.UTC)
+	candle := func(mm int, low float64) domain.Bar {
+		return domain.Bar{Time: time.Date(2026, 9, 28, 10, mm, 0, 0, time.UTC), Low: low}
+	}
+	cfgFor := func(mode string) *config.Config {
+		c := &config.Config{}
+		c.Entry.PatternInterval = time.Minute
+		c.Exit.CandleTrail = mode
+		return c
+	}
+	pos := domain.Position{EntryTime: entry}
+	scaled := domain.Position{EntryTime: entry, TargetHit: true}
+
+	cases := []struct {
+		name string
+		mode string
+		pos  domain.Position
+		bar  domain.Bar
+		want float64
+	}{
+		{"always trails from the entry candle", config.CandleTrailAlways, pos, candle(35, 4.97), 4.97},
+		{"a candle closed before entry is not held through", config.CandleTrailAlways, pos, candle(34, 4.90), 0},
+		{"after_target waits for the target", config.CandleTrailAfterTarget, pos, candle(36, 5.02), 0},
+		{"after_target trails the runner", config.CandleTrailAfterTarget, scaled, candle(36, 5.02), 5.02},
+		{"off never trails", config.CandleTrailOff, scaled, candle(36, 5.02), 0},
+		{"empty means off", "", scaled, candle(36, 5.02), 0},
+	}
+	for _, tc := range cases {
+		if got := CandleTrailStop(tc.pos, tc.bar, cfgFor(tc.mode)); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestLastCompletedBarSkipsTheFormingCandle(t *testing.T) {
+	at := func(mm, ss int) time.Time { return time.Date(2026, 9, 28, 10, mm, ss, 0, time.UTC) }
+	bars := []domain.Bar{{Time: at(35, 0), Low: 1}, {Time: at(36, 0), Low: 2}, {Time: at(37, 0), Low: 3}}
+
+	if b, ok := LastCompletedBar(bars, at(37, 10), time.Minute); !ok || b.Low != 2 {
+		t.Errorf("at 10:37:10 got %+v ok=%v, want the 10:36 candle", b, ok)
+	}
+	if b, ok := LastCompletedBar(bars, at(38, 0), time.Minute); !ok || b.Low != 3 {
+		t.Errorf("at 10:38:00 got %+v ok=%v, want the 10:37 candle, which has just closed", b, ok)
+	}
+	if _, ok := LastCompletedBar(bars, at(35, 30), time.Minute); ok {
+		t.Error("at 10:35:30 no candle has closed yet")
+	}
 }

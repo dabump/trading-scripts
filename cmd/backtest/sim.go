@@ -43,9 +43,13 @@ type qualifier struct {
 	SetupClose float64
 	Stop       float64
 	StopPct    float64
-	FlagBars   int
+	PauseBars  int
 	VolMult    float64
 	MovePct    float64
+	// BuyStop, when set, makes this an armed buy-stop rather than a buy at the next
+	// open: it fills only if the next bar trades above it. Only a prepare run with
+	// buyStop set produces these (see prepareWith).
+	BuyStop float64
 }
 
 // preparedDay is one session reduced to the decisions the screen produced, plus
@@ -93,6 +97,14 @@ type funnel struct {
 // prepare applies the sentiment gate and the three screening criteria to every
 // session, leaving the exit rules to simulate.
 func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[string]float64) []*preparedDay {
+	return prepareWith(cfg, days, benchPrev, false)
+}
+
+// prepareWith is prepare with the entry read as a buy-stop: with buyStop set, each
+// qualifier comes from strategy.ArmMicroPullback and fills intrabar at its trigger
+// price rather than at the next open. This measures an order type the daemon does
+// not place, so it is only reachable from the report comparing entry patterns.
+func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[string]float64, buyStop bool) []*preparedDay {
 	// Regular-session thresholds, because that is the only session this measures. The
 	// bars fetched here are 09:30-16:00; pre-market screening (config premarket.*)
 	// runs on a tape this backtest has no data for, so its own thresholds are
@@ -231,15 +243,21 @@ func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[strin
 			if t.Before(p.EntryEndAt) {
 				for _, e := range screener.Qualifying(evals) {
 					closed := day.Intraday[e.Symbol][:cursor[e.Symbol]]
-					setup := strategy.FindSetup(toDomainBars(closed), cfg)
+					var setup strategy.Setup
+					if buyStop {
+						setup = strategy.ArmMicroPullback(toDomainBars(closed), cfg)
+					} else {
+						setup = strategy.FindSetup(toDomainBars(closed), cfg)
+					}
 					if !setup.Triggered {
 						continue
 					}
 					seen[e.Symbol].setUp = true
 					p.qualifiers[i] = append(p.qualifiers[i], qualifier{
 						Symbol: e.Symbol, SetupClose: setup.Entry, Stop: setup.Stop,
-						StopPct: setup.StopDistancePct, FlagBars: setup.FlagBars,
+						StopPct: setup.StopDistancePct, PauseBars: setup.PauseBars,
 						VolMult: e.VolumeMultiple, MovePct: moves[e.Symbol],
+						BuyStop: setup.BuyStop,
 					})
 				}
 			}
@@ -295,6 +313,11 @@ type Trade struct {
 	Scaled    bool
 	StopPrice float64
 	RMultiple float64
+	// TotalR is the whole trade's P&L, banked part included, in multiples of the
+	// dollars it put at risk. With risk-based sizing this is what compounds into
+	// equity; ReturnPct weights a small wide-stop position the same as a large
+	// tight-stop one, and so can be positive while the account falls.
+	TotalR    float64
 	ReturnPct float64
 	PnL       float64
 	VolMult   float64
@@ -382,6 +405,43 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 		enteredToday := map[string]bool{}
 		firstBlock := map[string]string{}
 
+		// apply carries out one exit decision for the position held in sym.
+		apply := func(sym string, pos *domain.Position, act action, t time.Time) {
+			switch {
+			case act.scale > 0:
+				// Bank part of the position at the target and keep the runner. The
+				// fill is the target price, which is inside the bar by construction.
+				proceeds := act.price * (1 - slippagePct/100)
+				cash += proceeds * float64(act.scale)
+				pos.BankedDollars += (proceeds - pos.EntryPrice) * float64(act.scale)
+				pos.SharesOpen -= act.scale
+				pos.TargetHit = true
+				if act.newStop > pos.StopPrice {
+					pos.StopPrice = act.newStop
+				}
+				st.ScaleOuts++
+			case act.reason != "":
+				st.Trades = append(st.Trades, closeTrade(&cash, day, sym, pos,
+					act.price*(1-slippagePct/100), t, act.reason,
+					volMult[sym], movePct[sym]))
+				delete(open, sym)
+				dayTrades[day.Date]++
+			}
+		}
+
+		// trail raises the stop to the candle trail's level once bar has completed
+		// with the position still held, as engine.managePositions does.
+		trail := func(sym string, bar Bar) {
+			pos, held := open[sym]
+			if !held {
+				return
+			}
+			lvl := strategy.CandleTrailStop(*pos, toDomainBars([]Bar{bar})[0], cfg)
+			if lvl > pos.StopPrice {
+				pos.StopPrice = lvl
+			}
+		}
+
 		for i, t := range day.Boundaries {
 			// Positions are managed before screening, as engine.Tick does: a stop
 			// that fires on this bar frees its slot for this bar's entries.
@@ -390,28 +450,8 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 				if !ok {
 					continue
 				}
-				forced := !t.Before(day.EODAt)
-				act := checkExit(pos, bar, forced, cfg)
-				switch {
-				case act.scale > 0:
-					// Bank part of the position at the target and keep the runner. The
-					// fill is the target price, which is inside the bar by construction.
-					proceeds := act.price * (1 - slippagePct/100)
-					cash += proceeds * float64(act.scale)
-					pos.BankedDollars += (proceeds - pos.EntryPrice) * float64(act.scale)
-					pos.SharesOpen -= act.scale
-					pos.TargetHit = true
-					if act.newStop > pos.StopPrice {
-						pos.StopPrice = act.newStop
-					}
-					st.ScaleOuts++
-				case act.reason != "":
-					st.Trades = append(st.Trades, closeTrade(&cash, day, sym, pos,
-						act.price*(1-slippagePct/100), t, act.reason,
-						volMult[sym], movePct[sym]))
-					delete(open, sym)
-					dayTrades[day.Date]++
-				}
+				apply(sym, pos, checkExit(pos, bar, !t.Before(day.EODAt), cfg), t)
+				trail(sym, bar)
 			}
 			if !t.Before(day.EODAt) {
 				continue
@@ -435,7 +475,24 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 				if !ok {
 					continue
 				}
-				fill := entryBar.O * (1 + slippagePct/100)
+				// Before slippage. A buy-stop fills at its trigger, or at the open if
+				// the bar gapped past it, and not at all if the bar never got there —
+				// which is not a gate turning it away, so nothing is recorded.
+				px := entryBar.O
+				if q.BuyStop > 0 {
+					if entryBar.H <= q.BuyStop {
+						continue
+					}
+					px = math.Max(entryBar.O, q.BuyStop)
+					// A bar that gapped over the trigger fills at its open, which can
+					// put the stop well beyond the distance limit the setup was checked
+					// against. Model the order as a stop-limit capped at that limit: the
+					// daemon refuses such a trade, so the measurement must too.
+					if (px-q.Stop)/px*100 > cfg.Entry.MaxStopDistancePct {
+						continue
+					}
+				}
+				fill := px * (1 + slippagePct/100)
 				if fill <= q.Stop {
 					// The stop was already gone by the time the order could fill.
 					if _, seen := firstBlock[q.Symbol]; !seen {
@@ -464,6 +521,16 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 				movePct[q.Symbol] = q.MovePct
 				tradedToday[q.Symbol] = true
 				enteredToday[q.Symbol] = true
+
+				// The rest of the entry bar happens while the position is held, and the
+				// next boundary only looks at the next bar, so check this one now. Its
+				// low is tested first, as everywhere: for a buy-stop, whose fill came
+				// part-way through the bar, that assumes the worst about whether the
+				// low printed before or after it.
+				rest := entryBar
+				rest.O = px
+				apply(q.Symbol, open[q.Symbol], checkExit(open[q.Symbol], rest, false, cfg), t)
+				trail(q.Symbol, entryBar)
 			}
 		}
 
@@ -657,6 +724,10 @@ func closeTrade(cash *float64, day *preparedDay, sym string, pos *domain.Positio
 	if committed > 0 {
 		ret = pnl / committed * 100
 	}
+	totalR := 0.0
+	if risked := pos.InitialRisk * float64(pos.Shares); risked > 0 {
+		totalR = pnl / risked
+	}
 
 	return Trade{
 		Symbol: sym, Date: day.Date, EntryTime: pos.EntryTime, EntryPrice: pos.EntryPrice,
@@ -664,6 +735,7 @@ func closeTrade(cash *float64, day *preparedDay, sym string, pos *domain.Positio
 		Scaled:    pos.TargetHit,
 		StopPrice: pos.StopPrice,
 		RMultiple: pos.RMultiple(fill),
+		TotalR:    totalR,
 		ReturnPct: ret,
 		PnL:       pnl,
 		VolMult:   volMult,

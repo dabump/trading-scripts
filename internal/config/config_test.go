@@ -113,7 +113,7 @@ func valid() *Config {
 		AvgVolumeLookbackDays: 20, MaxEnriched: 100, NewsLookback: 18 * time.Hour,
 		MinPrice: 1, MaxPrice: 20, MinDollarVolume: 1_000_000}
 	c.Entry = Entry{PatternInterval: time.Minute, EMAPeriod: 9, RequireAboveVWAP: true,
-		MinPullbackBars: 1, MaxPullbackBars: 5, StopBufferPct: 0.1,
+		MaxPullbackBars: 2, SurgeBars: 3, MinSurgePct: 3, MaxRetracePct: 50, StopBufferPct: 0.1,
 		MinStopDistancePct: 0.5, MaxStopDistancePct: 4}
 	c.Risk = Risk{RiskPerTradePct: 1, MaxPositionPct: 33, MaxConcurrentPositions: 3,
 		StopLossPct: 10}
@@ -169,9 +169,19 @@ func TestValidate(t *testing.T) {
 			"must be below risk.stop_loss_pct",
 		},
 		{
-			"a pullback range that cannot be satisfied is rejected",
-			func(c *Config) { c.Entry.MinPullbackBars = 6; c.Entry.MaxPullbackBars = 3 },
-			"max_pullback_bars",
+			"a pause of no bars is rejected",
+			func(c *Config) { c.Entry.MaxPullbackBars = 0 },
+			"entry.max_pullback_bars",
+		},
+		{
+			"a setup with no surge window is rejected",
+			func(c *Config) { c.Entry.SurgeBars = 0 },
+			"entry.surge_bars",
+		},
+		{
+			"a retrace limit over 100% is rejected",
+			func(c *Config) { c.Entry.MaxRetracePct = 150 },
+			"entry.max_retrace_pct",
 		},
 		{
 			"selling the whole position at the target is rejected",

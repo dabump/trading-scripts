@@ -49,8 +49,11 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `entry.pattern_interval` | 1m | `strategy.md` §3 — the candle the setup is read on |
 | `entry.ema_period` | 9 | `strategy.md` §3 — trend filter |
 | `entry.require_above_vwap` | `true` | `strategy.md` §3 |
-| `entry.min_pullback_bars` / `max_pullback_bars` | 1 / 5 | `strategy.md` §3; validated max ≥ min |
-| `entry.stop_buffer_pct` | 0.1 | `strategy.md` §3 — the stop sits under the flag low, not on it |
+| `entry.max_pullback_bars` | 2 | `strategy.md` §3 — the longest pause a micro pullback allows |
+| `entry.surge_bars` / `min_surge_pct` | 3 / 3.0 | `strategy.md` §3 — the surge the pause must follow |
+| `entry.max_retrace_pct` | 50 | `strategy.md` §3 — share of the surge the pause may give back |
+| `entry.require_macd` / `require_volume_decline` | false / false | `strategy.md` §3 — optional filters |
+| `entry.stop_buffer_pct` | 0.1 | `strategy.md` §3 — the stop sits under the pause low, not on it |
 | `entry.min_stop_distance_pct` | 0.5 | `strategy.md` §3 — a nearer stop is widened to this |
 | `entry.max_stop_distance_pct` | 4.0 | `strategy.md` §3 — a wider setup is refused; validated below `risk.stop_loss_pct` |
 | `risk.risk_per_trade_pct` | 1.0 | `risk.md` — the account fraction put at risk per trade; sizing follows from the stop |
@@ -62,6 +65,7 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `exit.first_target_fraction` | 0.5 | `strategy.md` §4 — validated in (0, 1): selling all of it is the rule that measured t = −9.76 |
 | `exit.breakeven_after_target` | `true` | `strategy.md` §4 |
 | `exit.eod_exit_offset_minutes` | 5 | `strategy.md` §4 |
+| `exit.candle_trail` | `always` | `strategy.md` §4 — `off` / `after_target` / `always`; empty means `off` |
 | `timing.sentiment_poll_interval` | 2m | `strategy.md` §1 — tightened with the shorter gate window |
 | `timing.sentiment_window` | 5m | `strategy.md` §1 — shortened from 1h so the opening range is tradeable |
 | `timing.entry_window` | 5h30m | `strategy.md` §3 — from a 09:30 open the last entry is 15:00; validated longer than `sentiment_window` |

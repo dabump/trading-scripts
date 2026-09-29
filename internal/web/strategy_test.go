@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"github.com/martincoetzee/trading-agent/internal/config"
 	"strings"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			name:      "maximum stop distance",
 			label:     "Stop",
 			mutate:    func(f *fixture) { f.cfg.Entry.MaxStopDistancePct = 2.5 },
-			wantValue: "just below the pullback low",
+			wantValue: "just below the pause low",
 		},
 		{
 			name:      "first target",
@@ -213,19 +214,33 @@ func TestStrategyPanelDerivesValues(t *testing.T) {
 	t.Run("the setup warm-up follows the interval and the EMA period", func(t *testing.T) {
 		f := newFixture(t)
 		f.cfg.Entry.EMAPeriod = 9
-		f.cfg.Entry.MinPullbackBars = 1
+		f.cfg.Entry.SurgeBars = 3
 		f.cfg.Entry.PatternInterval = time.Minute
-		// 9 + 1 + 2 = 12 bars of one minute.
-		if got, _ := rowValue(t, f, "Setup warm-up"); got != "12m" {
-			t.Errorf("warm-up = %q, want 12m", got)
+		// The EMA's 9 bars outlast the surge, a pause and a trigger (3 + 2).
+		if got, _ := rowValue(t, f, "Setup warm-up"); got != "9m" {
+			t.Errorf("warm-up = %q, want 9m", got)
 		}
 
 		f2 := newFixture(t)
 		f2.cfg.Entry.EMAPeriod = 9
-		f2.cfg.Entry.MinPullbackBars = 1
+		f2.cfg.Entry.SurgeBars = 10
 		f2.cfg.Entry.PatternInterval = 5 * time.Minute
+		// Now the surge is the longer: 10 + 2 = 12 bars of five minutes.
 		if got, _ := rowValue(t, f2, "Setup warm-up"); got != "1h" {
 			t.Errorf("warm-up at 5m candles = %q, want 1h", got)
+		}
+	})
+
+	t.Run("the candle trail replaces the runner row when it is on", func(t *testing.T) {
+		f := newFixture(t)
+		f.cfg.Exit.CandleTrail = config.CandleTrailAlways
+		if got, _ := rowValue(t, f, "Candle trail"); !strings.Contains(got, "first candle below") {
+			t.Errorf("candle trail = %q", got)
+		}
+		f2 := newFixture(t)
+		f2.cfg.Exit.CandleTrail = config.CandleTrailOff
+		if got, _ := rowValue(t, f2, "Runner"); got != "held to the forced exit" {
+			t.Errorf("runner with the trail off = %q", got)
 		}
 	})
 

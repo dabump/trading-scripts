@@ -83,7 +83,7 @@ func TestAuditTrailCoversATradingDay(t *testing.T) {
 		"portfolio_value", "cash_before", "risk_per_trade_pct",
 		// Sizing from the stop is only auditable if the stop and the risk it implied
 		// are both on the record.
-		"stop_price", "risk_dollars", "stop_distance_pct", "setup_pole_high",
+		"stop_price", "risk_dollars", "stop_distance_pct", "setup_pause_high",
 	} {
 		if _, ok := opened.Detail[key]; !ok {
 			t.Errorf("buy record is missing %q, so the decision cannot be reconstructed", key)

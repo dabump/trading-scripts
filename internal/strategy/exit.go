@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"math"
+	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
@@ -113,6 +114,43 @@ func EvaluateExit(in ExitInput, cfg *config.Config) ExitDecision {
 	}
 
 	return ExitDecision{}
+}
+
+// CandleTrailStop is the stop the candle trail (exit.candle_trail) puts under a
+// position once last has completed: that candle's low, so the next candle to trade
+// below it sells what is held. It returns 0 when the trail does not apply — switched
+// off, waiting for the first target, or a candle that closed before the position was
+// opened.
+//
+// Callers only ever raise the stop to this, never lower it, which is what makes it a
+// trail: a lower low after a higher one does not give ground back.
+func CandleTrailStop(p domain.Position, last domain.Bar, cfg *config.Config) float64 {
+	switch cfg.Exit.CandleTrail {
+	case config.CandleTrailAlways:
+	case config.CandleTrailAfterTarget:
+		if !p.TargetHit {
+			return 0
+		}
+	default:
+		return 0
+	}
+	// The candle the entry was made in counts: it is the first one held through.
+	if last.Time.Before(p.EntryTime.Truncate(cfg.Entry.PatternInterval)) || last.Low <= 0 {
+		return 0
+	}
+	return last.Low
+}
+
+// LastCompletedBar returns the most recent bar that had closed by now, and false if
+// none had. Bar feeds include the candle still forming; trailing on its low would be
+// trailing on a price that can still move.
+func LastCompletedBar(bars []domain.Bar, now time.Time, interval time.Duration) (domain.Bar, bool) {
+	for i := len(bars) - 1; i >= 0; i-- {
+		if !bars[i].Time.Add(interval).After(now) {
+			return bars[i], true
+		}
+	}
+	return domain.Bar{}, false
 }
 
 // scaleShares is how many shares the partial sale takes, rounded down but never to

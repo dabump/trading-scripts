@@ -85,26 +85,50 @@ momentum approach it was always modelled on.
 Entry uses **the same evaluation** the status page displays — one `screener.Evaluate`
 pass per scan feeds both, so the two can never disagree about what qualifies.
 
-### The pattern
+### The pattern: a micro pullback
 
-A qualifying candidate is bought only when its chart prints a **pullback and
-resumption** (`strategy.FindSetup`), read on `entry.pattern_interval` candles:
+A qualifying candidate is bought only when its chart prints a **micro pullback**
+(`strategy.FindSetup`), read on `entry.pattern_interval` candles:
 
 ```
-         ← pole: the session's high so far
-        /|
-       / |  ‾\__   ← flag: one to a few bars that stay below the pole
-      /  |      \__
-  ___/                ▲ trigger: a bar closes back above the pole high
+            ┃ ← top of the surge: the high of day
+          ┃ ┃ ╻   ← pause: 1–2 candles that close red or fail to make a higher high
+        ┃   ╹ ┃ ← trigger: closes above the last pause candle's high
+      ┃
+  surge_bars candles, up at least min_surge_pct
 ```
+
+- **The surge.** The `entry.surge_bars` candles before the pause must have risen at
+  least `entry.min_surge_pct`, from their lowest low to the top, and the top must be
+  the high of day.
+- **The pause.** 1 to `entry.max_pullback_bars` candles that each close red or fail
+  to make a higher high than the candle before. A candle that ticks a marginal new
+  high and then closes red still counts. The pause may give back at most
+  `entry.max_retrace_pct` of the surge's range.
+- **The trigger.** A candle closes above the last pause candle's high.
 
 Plus two trend filters, because the strategy only buys strength: price must be above
 its `entry.ema_period` EMA, and above the session VWAP — the line separating a name
-being accumulated from one being distributed into.
+being accumulated from one being distributed into. Two more filters are optional and
+off: MACD(12, 26, 9) above its signal line (`entry.require_macd`), and lighter volume
+on the pause than on the surge (`entry.require_volume_decline`).
+
+**It replaced a flag detector** that waited for a close above the *session* high after
+a 1–5 candle pullback. That detector read every marginal-new-high candle as a new pole,
+so on a vertical mover it reported a 0-bar pullback for as long as the move was clean.
+That is why KNRX was refused at 09:59 (docs/decisions.md). The two were compared on a
+year of history before the switch; the numbers are in docs/decisions.md.
+
+**The daemon enters at the close, not the break.** It scans closed candles once a
+minute, so it waits for the trigger candle to close above the level and buys at that
+close. The discretionary approach buys the moment price trades through, using a
+buy-stop order. That order type is not built. `cmd/backtest` measures both entries
+(`strategy.ArmMicroPullback` gives the buy-stop price) so the gap between them is a
+number, not a guess.
 
 ### Why the pattern matters more than the pattern
 
-The setup's real output is not the entry price, it is **the stop**. The flag's low is
+The setup's real output is not the entry price, it is **the stop**. The pause's low is
 the price that says the pullback was not a pullback, so it is where the stop belongs —
 and that means *risk per share is known before the position is sized*. Buying on the
 screen alone gives neither: there is no reference price, so the stop has to be an
@@ -192,13 +216,14 @@ that is a limitation of automating the approach rather than something tuning wil
 
 The status page offers an **Open** button on every qualifying candidate, which buys it without the setup. That is a deliberate escape hatch, not a second entry rule: the gate stays exactly as described above for everything the agent does on its own.
 
-It exists because the gate's failure mode is known and one-sided. A name moving vertically never prints a 1–5 bar pullback to reclaim, so the strongest candidates the screen finds are the ones most likely to be refused — measured in the wild on KNRX (+357%, 4846x relative volume, 7 catalysts, never bought). A human can see that; `FindSetup` by construction cannot.
+It exists because the gate's failure mode is known and one-sided. It was added when the flag detector refused KNRX (+357%, 4846x relative volume, 7 catalysts, never bought), because a vertical mover never printed the 1–5 bar pullback that detector wanted. The micro pullback that replaced it can see a one-candle pause, but any mechanical rule still misses charts a human reads correctly.
 
 Everything downstream of the signal still applies to a hand-placed trade — the size, the stop, the cap, the exits. See [`web-ui.md`](./web-ui.md).
 
 ## 4. Exit
 
-Three things can close or reduce a position, checked in this order:
+Three things can close or reduce a position, checked in this order. The candle trail
+described below works through the second, raising the stop:
 
 1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, no exceptions.
 2. **The stop.** The working stop is the chart stop the setup defined, moved up to the entry price once the first target is banked. Behind it sits `risk.stop_loss_pct` as a **gap backstop**, reachable only when price jumps straight through the chart stop. Config validation requires the backstop to be the wider of the two, or it would fire first and silently turn this back into a fixed-percentage stop.
@@ -207,6 +232,26 @@ Three things can close or reduce a position, checked in this order:
 Risk before reward: on a bar that traded through both the stop and the target, the
 stop is what is recorded. `strategy.EvaluateExit` returns the first action due, and
 the order it checks them in **is** the priority.
+
+### The candle trail: sell on the first candle to make a new low
+
+This is the micro pullback's own exit (`exit.candle_trail`): sell when a candle trades
+below the previous candle's low. It raises the stop to the low of each
+`entry.pattern_interval` candle that completes while the position is held
+(`strategy.CandleTrailStop`), so the stop rule above does the selling. It records
+`STOP_LOSS`; the close event's `initial_stop` shows how far the trail had raised it.
+It never lowers a stop.
+
+- `always` (the current setting, and the discretionary version) trails from the entry
+  candle on. A trade that makes a new low before it pays is abandoned rather than held
+  to the pause-low stop. After the target, it trails what is left.
+- `after_target` trails only what is left after the first target.
+- `off` holds what is left to the breakeven stop or the bell.
+
+The engine reads one bar request per held position per completed candle, and never
+trails on the candle still forming. **On a year of history it did not improve the
+strategy** (docs/decisions.md): it is on because it is the approach's exit, not
+because it measured better.
 
 ### Why the target is a fraction and a multiple of risk
 

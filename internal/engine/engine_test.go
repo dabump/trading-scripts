@@ -48,7 +48,7 @@ func newHarness(t *testing.T) *harness {
 	cfg.Exit = config.Exit{FirstTargetR: 2, FirstTargetFraction: 0.5,
 		BreakevenAfterTarget: true, EODExitOffsetMins: 30}
 	cfg.Entry = config.Entry{PatternInterval: time.Minute, EMAPeriod: 9,
-		MinPullbackBars: 1, MaxPullbackBars: 5, StopBufferPct: 0.1,
+		MaxPullbackBars: 2, SurgeBars: 3, MinSurgePct: 3, MaxRetracePct: 50, StopBufferPct: 0.1,
 		MinStopDistancePct: 0.5, MaxStopDistancePct: 4}
 	cfg.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute,
 		SentimentWindow: time.Hour, EntryWindow: 4 * time.Hour,

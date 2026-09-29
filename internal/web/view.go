@@ -669,6 +669,16 @@ func strategySections(cfg *config.Config) []StrategySection {
 	// shown are the figures enforced.
 	maxExposure := cfg.Risk.MaxPositionPct * float64(cfg.Risk.MaxConcurrentPositions)
 	maxAtRisk := cfg.Risk.RiskPerTradePct * float64(cfg.Risk.MaxConcurrentPositions)
+	setupNote := fmt.Sprintf("up to %d pause bars after a %s rise over %d bars, "+
+		"giving back at most %s of it, on %s candles",
+		cfg.Entry.MaxPullbackBars, pctOf(cfg.Entry.MinSurgePct), cfg.Entry.SurgeBars,
+		pctOf(cfg.Entry.MaxRetracePct), durationText(cfg.Entry.PatternInterval))
+	if cfg.Entry.RequireMACD {
+		setupNote += "; MACD above its signal"
+	}
+	if cfg.Entry.RequireVolumeDecline {
+		setupNote += "; lighter volume on the pause"
+	}
 	entry := StrategySection{
 		Title: "3 · Entry — setup, then size",
 		Note: "Screening says a name is interesting; the setup says whether now is the " +
@@ -676,10 +686,8 @@ func strategySections(cfg *config.Config) []StrategySection {
 		Rows: []StrategyRow{
 			{
 				Label: "Setup",
-				Value: "pullback, then a close back above its high",
-				Note: fmt.Sprintf("%d–%d %s pullback bars, on %s candles",
-					cfg.Entry.MinPullbackBars, cfg.Entry.MaxPullbackBars,
-					"consecutive", durationText(cfg.Entry.PatternInterval)),
+				Value: "micro pullback at the high of day, then a close above the pause candle's high",
+				Note:  setupNote,
 			},
 			{
 				Label: "Trend filter",
@@ -689,7 +697,7 @@ func strategySections(cfg *config.Config) []StrategySection {
 			},
 			{
 				Label: "Stop",
-				Value: "just below the pullback low",
+				Value: "just below the pause low",
 				Note: fmt.Sprintf("placed %s under it, and refused beyond %s away",
 					pctOf(cfg.Entry.StopBufferPct), pctOf(cfg.Entry.MaxStopDistancePct)),
 			},
@@ -740,6 +748,30 @@ func strategySections(cfg *config.Config) []StrategySection {
 		})
 	}
 
+	// The candle trail replaces "held to the forced exit" for whatever it covers.
+	trailRow := StrategyRow{
+		Label: "Runner",
+		Value: "held to the forced exit",
+		Note: "no fixed profit target on it: a +15% target with a 5% trailing stop " +
+			"was measured capping gains at +9% while losses ran to −10%",
+	}
+	switch cfg.Exit.CandleTrail {
+	case config.CandleTrailAlways:
+		trailRow = StrategyRow{
+			Label: "Candle trail",
+			Value: "sold on the first candle below the previous candle's low",
+			Note: "from the entry candle on: the stop rises to each completed " +
+				durationText(cfg.Entry.PatternInterval) + " candle's low",
+		}
+	case config.CandleTrailAfterTarget:
+		trailRow = StrategyRow{
+			Label: "Candle trail",
+			Value: "runner sold on the first candle below the previous candle's low",
+			Note: "once the first target is banked, the stop rises to each completed " +
+				durationText(cfg.Entry.PatternInterval) + " candle's low",
+		}
+	}
+
 	// Listed in the order strategy.EvaluateExit checks them, because that order is
 	// the priority: the first match wins, and showing them in any other order would
 	// misrepresent which rule takes effect.
@@ -771,12 +803,7 @@ func strategySections(cfg *config.Config) []StrategySection {
 					false: "the rest runs to the close",
 				}[cfg.Exit.BreakevenAfterTarget],
 			},
-			{
-				Label: "Runner",
-				Value: "held to the forced exit",
-				Note: "no fixed profit target on it: a +15% target with a 5% trailing stop " +
-					"was measured capping gains at +9% while losses ran to −10%",
-			},
+			trailRow,
 		},
 	}
 

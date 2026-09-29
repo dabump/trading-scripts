@@ -97,8 +97,15 @@ entry:
   pattern_interval: 1m # the candle the setup is read on
   ema_period: 9 # the trend line price must hold above
   require_above_vwap: true # accumulation, not distribution
-  min_pullback_bars: 1 # the shallowest pullback worth calling one
-  max_pullback_bars: 5 # beyond this the move has stalled, not paused
+  # The setup is a micro pullback (docs/strategy.md §3): a surge to the high of day,
+  # a 1-2 candle pause, then a close above the last pause candle's high. These values
+  # are the ones measured in docs/decisions.md; they have not been tuned.
+  max_pullback_bars: 2 # one or two pause candles; three or more is a flag
+  surge_bars: 3 # candles, ending just before the pause, that the surge spans
+  min_surge_pct: 3.0 # rise across those candles, lowest low to the top
+  max_retrace_pct: 50 # most of the surge's range the pause may give back
+  require_macd: false # MACD(12,26,9) above its signal line
+  require_volume_decline: false # pause lighter on volume than the surge
   stop_buffer_pct: 0.1 # placed just under the pullback low, not on it
   min_stop_distance_pct: 0.5 # nearer than this and ordinary noise triggers it
   # If the chart stop is further away than this, the trade is not taken at all. This
@@ -145,6 +152,11 @@ exit:
   first_target_fraction: 0.5
   breakeven_after_target: true
   eod_exit_offset_minutes: 5 # docs/strategy.md §4
+  # The micro pullback's exit: sell on the first candle to trade below the previous
+  # candle's low, by raising the stop to each completed candle's low. off |
+  # after_target (the runner only) | always (from the entry candle). See
+  # docs/decisions.md for how each measured.
+  candle_trail: always
 
 timing:
   sentiment_poll_interval: 2m # docs/strategy.md §1

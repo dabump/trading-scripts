@@ -249,17 +249,18 @@ func (f *Fake) SetBars(symbol string, bars []domain.Bar) {
 	f.bars[symbol] = bars
 }
 
-// SetSetupBars builds a textbook pullback-and-resumption and installs it, so a test
-// does not have to hand-write a chart every time it wants a valid entry.
+// SetSetupBars builds a textbook micro pullback and installs it, so a test does not
+// have to hand-write a chart every time it wants a valid entry.
 //
-// The shape is: a rising run that establishes the pole, one flag bar that holds
-// below it, then a trigger bar closing above the pole high. Prices are scaled to
-// `top`, which becomes the trigger close.
+// The shape is: a steep rising run to the high of day (about 5% over its last three
+// candles), one lighter pause candle that holds below that high and gives back about
+// a third of the surge, then a trigger bar closing above the pause candle's high.
+// Prices are scaled to `top`, which becomes the trigger close.
 func (f *Fake) SetSetupBars(symbol string, top float64, start time.Time, interval time.Duration) {
 	// A rising ramp long enough for the EMA to warm up, so the close sits above it.
 	const ramp = 14
 	bars := make([]domain.Bar, 0, ramp+2)
-	base := top * 0.90
+	base := top * 0.80
 	step := (top*0.985 - base) / float64(ramp-1)
 	for i := 0; i < ramp; i++ {
 		c := base + step*float64(i)
@@ -268,18 +269,18 @@ func (f *Fake) SetSetupBars(symbol string, top float64, start time.Time, interva
 			Open: c - step/2, High: c + step/4, Low: c - step, Close: c, Volume: 50_000,
 		})
 	}
-	pole := bars[len(bars)-1].High
-	// One flag bar: it pulls back and stays under the pole high.
-	flagLow := pole * 0.985
+	high := bars[len(bars)-1].High
+	// One pause candle: it pulls back and stays under the high of day.
+	pauseLow := high * 0.985
 	bars = append(bars, domain.Bar{
 		Time: start.Add(time.Duration(ramp) * interval),
-		Open: pole * 0.995, High: pole * 0.998, Low: flagLow, Close: flagLow * 1.002,
+		Open: high * 0.995, High: high * 0.998, Low: pauseLow, Close: pauseLow * 1.002,
 		Volume: 30_000,
 	})
-	// The trigger bar closes above the pole high.
+	// The trigger bar closes above the pause candle's high.
 	bars = append(bars, domain.Bar{
 		Time: start.Add(time.Duration(ramp+1) * interval),
-		Open: flagLow * 1.004, High: top * 1.001, Low: flagLow * 1.001, Close: top,
+		Open: pauseLow * 1.004, High: top * 1.001, Low: pauseLow * 1.001, Close: top,
 		Volume: 80_000,
 	})
 	f.SetBars(symbol, bars)

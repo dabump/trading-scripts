@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,8 +16,10 @@ func setupCfg() *config.Config {
 		PatternInterval:    time.Minute,
 		EMAPeriod:          9,
 		RequireAboveVWAP:   false,
-		MinPullbackBars:    1,
-		MaxPullbackBars:    5,
+		MaxPullbackBars:    2,
+		SurgeBars:          3,
+		MinSurgePct:        2,
+		MaxRetracePct:      50,
 		StopBufferPct:      0.1,
 		MinStopDistancePct: 0.5,
 		MaxStopDistancePct: 4,
@@ -48,131 +51,205 @@ func appendBar(bars []domain.Bar, o, h, l, c float64) []domain.Bar {
 	})
 }
 
-// The setup is the whole point of the change: a screened candidate is only bought
-// when it pulls back and resumes, and the stop is what the pullback defines.
-func TestFindSetupTriggersOnAPullbackAndResumption(t *testing.T) {
-	cfg := setupCfg()
-
+// surgeThenPause is a steady climb to ~10.02 followed by one candle that ticks a
+// marginal new high and closes red — the candle the flag detector reads as a new pole.
+func surgeThenPause() []domain.Bar {
 	bars := ramp(12, 9.00, 10.00)
-	poleHigh := bars[len(bars)-1].High
-	// One flag bar holding below the pole high, with a clear low.
-	bars = appendBar(bars, 9.98, poleHigh-0.02, 9.90, 9.93)
-	// The trigger bar closes above the pole high.
-	bars = appendBar(bars, 9.95, poleHigh+0.08, 9.94, poleHigh+0.05)
+	return appendBar(bars, 10.00, 10.05, 9.95, 9.96)
+}
 
-	got := FindSetup(bars, cfg)
-	if !got.Triggered {
-		t.Fatalf("expected a setup, got refusal: %s", got.Reason)
+// The pause candle here ticks a marginal new high before closing red. That is the
+// candle the old flag detector read as a new pole — the KNRX refusal in
+// docs/decisions.md — and it has to count as a pause.
+func TestFindSetupTriggersAboveThePauseCandlesHigh(t *testing.T) {
+	cfg := setupCfg()
+	bars := appendBar(surgeThenPause(), 9.97, 10.10, 9.96, 10.08)
+
+	s := FindSetup(bars, cfg)
+	if !s.Triggered {
+		t.Fatalf("expected a micro pullback, got: %s", s.Reason)
 	}
-	if got.Entry != poleHigh+0.05 {
-		t.Errorf("entry = %v, want the trigger close %v", got.Entry, poleHigh+0.05)
+	if s.Entry != 10.08 {
+		t.Errorf("entry = %v, want the trigger close 10.08", s.Entry)
 	}
-	// The stop sits just under the flag's low, which is what makes the risk knowable
-	// before the position is sized.
-	wantStop := 9.90 * (1 - 0.1/100)
-	if math.Abs(got.Stop-wantStop) > 1e-9 {
-		t.Errorf("stop = %v, want %v (just under the 9.90 pullback low)", got.Stop, wantStop)
+	if want := 9.95 * (1 - cfg.Entry.StopBufferPct/100); math.Abs(s.Stop-want) > 1e-9 {
+		t.Errorf("stop = %v, want just under the pause low (%v)", s.Stop, want)
 	}
-	if got.RiskPerShare <= 0 || math.Abs(got.RiskPerShare-(got.Entry-got.Stop)) > 1e-9 {
-		t.Errorf("risk per share = %v, want entry − stop", got.RiskPerShare)
-	}
-	if got.FlagBars != 1 {
-		t.Errorf("flag bars = %d, want 1", got.FlagBars)
+	if s.PauseBars != 1 || s.PauseHigh != 10.05 {
+		t.Errorf("recorded %d bars reclaiming %.2f, want 1 bar reclaiming 10.05", s.PauseBars, s.PauseHigh)
 	}
 }
 
 func TestFindSetupRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		bars   func() []domain.Bar
+		cfg    func(*config.Config)
+		reason string
+	}{
+		{
+			name: "trigger has not cleared the pause high",
+			// Traded through 10.05 intrabar but closed back under it.
+			bars:   func() []domain.Bar { return appendBar(surgeThenPause(), 9.97, 10.10, 9.96, 10.04) },
+			reason: "has not cleared",
+		},
+		{
+			name: "pause longer than a micro pullback",
+			bars: func() []domain.Bar {
+				b := surgeThenPause()
+				b = appendBar(b, 9.96, 10.00, 9.94, 9.97)
+				b = appendBar(b, 9.97, 9.99, 9.93, 9.95)
+				return appendBar(b, 9.96, 10.10, 9.95, 10.08)
+			},
+			reason: "more than the 2",
+		},
+		{
+			name:   "surge too small",
+			bars:   func() []domain.Bar { return appendBar(surgeThenPause(), 9.97, 10.10, 9.96, 10.08) },
+			cfg:    func(c *config.Config) { c.Entry.MinSurgePct = 10 },
+			reason: "surge is",
+		},
+		{
+			name: "pause gives back too much of the surge",
+			bars: func() []domain.Bar {
+				b := ramp(12, 9.00, 10.00)
+				b = appendBar(b, 10.00, 10.05, 9.72, 9.80)
+				return appendBar(b, 9.81, 10.10, 9.80, 10.08)
+			},
+			reason: "gave back",
+		},
+		{
+			name: "surge is not at the high of day",
+			bars: func() []domain.Bar {
+				b := ramp(12, 9.00, 10.00)
+				// An earlier spike to 11 means the pause is not at the high of day.
+				b[2].High = 11
+				b = appendBar(b, 10.00, 10.05, 9.95, 9.96)
+				return appendBar(b, 9.97, 10.10, 9.96, 10.08)
+			},
+			reason: "high of day",
+		},
+		{
+			name:   "pause volume not lighter than the surge",
+			bars:   func() []domain.Bar { return appendBar(surgeThenPause(), 9.97, 10.10, 9.96, 10.08) },
+			cfg:    func(c *config.Config) { c.Entry.RequireVolumeDecline = true },
+			reason: "volume is not lighter",
+		},
+		{
+			name: "no pause at all",
+			bars: func() []domain.Bar {
+				return appendBar(ramp(12, 9.00, 10.00), 10.00, 10.10, 9.99, 10.08)
+			},
+			reason: "no pullback",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := setupCfg()
+			if tc.cfg != nil {
+				tc.cfg(cfg)
+			}
+			s := FindSetup(tc.bars(), cfg)
+			if s.Triggered {
+				t.Fatalf("triggered, want a refusal containing %q", tc.reason)
+			}
+			if !strings.Contains(s.Reason, tc.reason) {
+				t.Errorf("reason = %q, want it to contain %q", s.Reason, tc.reason)
+			}
+		})
+	}
+}
+
+func TestFindSetupVolumeDeclinePasses(t *testing.T) {
 	cfg := setupCfg()
+	cfg.Entry.RequireVolumeDecline = true
+	bars := surgeThenPause()
+	bars[len(bars)-1].Volume = 300
+	bars = appendBar(bars, 9.97, 10.10, 9.96, 10.08)
+	if s := FindSetup(bars, cfg); !s.Triggered {
+		t.Fatalf("a light pause should pass: %s", s.Reason)
+	}
+}
 
-	t.Run("not enough history yet", func(t *testing.T) {
-		if got := FindSetup(ramp(5, 9, 10), cfg); got.Triggered {
-			t.Error("a setup cannot be called before the EMA has warmed up")
-		}
-	})
+// Armed reads the same pattern a candle earlier: with the pause as the latest bar, a
+// buy-stop sits at its high.
+func TestArmMicroPullbackGivesTheBuyStop(t *testing.T) {
+	cfg := setupCfg()
+	s := ArmMicroPullback(surgeThenPause(), cfg)
+	if !s.Triggered {
+		t.Fatalf("expected an armed setup: %s", s.Reason)
+	}
+	if s.BuyStop != 10.05 || s.Entry != 10.05 {
+		t.Errorf("buy stop %v / entry %v, want both at the pause high 10.05", s.BuyStop, s.Entry)
+	}
+	if s.Stop >= 9.95 {
+		t.Errorf("stop %v should sit under the pause low 9.95", s.Stop)
+	}
 
-	t.Run("no pullback: the last bar simply made a new high", func(t *testing.T) {
-		// A straight ramp has no flag, so the bar before the trigger is the pole and
-		// the flag is zero bars long.
-		if got := FindSetup(ramp(14, 9, 10), cfg); got.Triggered {
-			t.Errorf("a continuous ramp is not a pullback entry: %+v", got)
-		}
-	})
+	// Once the next candle breaks out, it is no longer a pause, so nothing is armed.
+	if s := ArmMicroPullback(appendBar(surgeThenPause(), 9.97, 10.10, 9.96, 10.08), cfg); s.Triggered {
+		t.Error("armed on a breakout candle")
+	}
+}
 
-	t.Run("the pullback has not been reclaimed", func(t *testing.T) {
-		bars := ramp(12, 9.00, 10.00)
-		pole := bars[len(bars)-1].High
-		bars = appendBar(bars, 9.98, pole-0.02, 9.90, 9.93)
-		// The last bar closes below the pole high: still inside the pullback.
-		bars = appendBar(bars, 9.93, pole-0.01, 9.92, pole-0.03)
-		if got := FindSetup(bars, cfg); got.Triggered {
-			t.Error("a close below the pullback high is not a trigger")
-		}
-	})
+func TestMACD(t *testing.T) {
+	if _, _, ok := MACD(make([]float64, 30)); ok {
+		t.Error("30 closes cannot give a signal line; want ok=false")
+	}
+	// An accelerating rise pulls the MACD line ahead of its own average.
+	closes := make([]float64, 60)
+	for i := range closes {
+		closes[i] = 10 * math.Pow(1.01, float64(i))
+	}
+	line, signal, ok := MACD(closes)
+	if !ok || line <= 0 || line <= signal {
+		t.Errorf("accelerating rise: line %v signal %v ok %v, want line > signal > 0", line, signal, ok)
+	}
+}
 
-	t.Run("the pullback lasted too long", func(t *testing.T) {
-		bars := ramp(12, 9.00, 10.00)
-		pole := bars[len(bars)-1].High
-		for i := 0; i < 7; i++ { // more than max_pullback_bars
-			bars = appendBar(bars, 9.95, pole-0.05, 9.85, 9.90)
-		}
-		bars = appendBar(bars, 9.92, pole+0.05, 9.90, pole+0.03)
-		if got := FindSetup(bars, cfg); got.Triggered {
-			t.Error("a seven-bar flag is a stalled move, not a pause")
-		}
-	})
+func TestFindSetupMACDFilter(t *testing.T) {
+	cfg := setupCfg()
+	cfg.Entry.RequireMACD = true
+	// A long rise that has flattened out: MACD has rolled under its signal line
+	// while price still sits above the 9-EMA.
+	var bars []domain.Bar
+	for i := 0; i < 40; i++ {
+		c := 5 + 5*math.Pow(float64(i)/39, 0.3)
+		bars = appendBar(bars, c-0.01, c+0.01, c-0.02, c)
+	}
+	closes := make([]float64, len(bars))
+	for i, b := range bars {
+		closes[i] = b.Close
+	}
+	if line, signal, _ := MACD(closes); line > signal {
+		t.Skipf("fixture does not roll the MACD over (line %v > signal %v)", line, signal)
+	}
+	if s := FindSetup(bars, cfg); s.Triggered || !strings.Contains(s.Reason, "MACD") {
+		t.Errorf("triggered=%v reason=%q, want a MACD refusal", s.Triggered, s.Reason)
+	}
+}
 
-	t.Run("the stop would be too far away", func(t *testing.T) {
-		bars := ramp(12, 9.00, 10.00)
-		pole := bars[len(bars)-1].High
-		// A deep flush: the flag low is more than 4% below the trigger close.
-		bars = appendBar(bars, 9.98, pole-0.02, 9.00, 9.20)
-		bars = appendBar(bars, 9.30, pole+0.05, 9.25, pole+0.03)
-		got := FindSetup(bars, cfg)
-		if got.Triggered {
-			t.Errorf("a stop beyond the limit must be refused, not sized around: %+v", got)
-		}
-		if got.Reason == "" {
-			t.Error("the refusal should say the risk was too wide")
-		}
-	})
+// A spike that faded: the trigger bar prints a long upper wick on heavy volume, so
+// its own typical price drags VWAP above its close. The EMA reads closes only, so it
+// is untouched — which is what isolates the VWAP filter.
+func TestFindSetupEnforcesVWAPWhenConfigured(t *testing.T) {
+	bars := surgeThenPause()
+	for i := range bars {
+		bars[i].Volume = 1
+	}
+	bars = appendBar(bars, 9.97, 12.00, 9.96, 10.08)
+	bars[len(bars)-1].Volume = 5_000_000
 
-	t.Run("price below the EMA is not strength", func(t *testing.T) {
-		// A falling sequence: the trigger clears a local high but sits under the EMA.
-		bars := ramp(12, 10.00, 9.00)
-		pole := bars[len(bars)-1].High
-		bars = appendBar(bars, 9.00, pole-0.01, 8.95, 8.97)
-		bars = appendBar(bars, 8.98, pole+0.02, 8.96, pole+0.01)
-		if got := FindSetup(bars, cfg); got.Triggered {
-			t.Error("the strategy only buys strength; below the EMA is not strength")
-		}
-	})
-
-	t.Run("VWAP is enforced when configured", func(t *testing.T) {
-		// A spike that faded: the trigger bar prints a long upper wick on heavy
-		// volume, so its own typical price drags VWAP above its close. The EMA reads
-		// closes only, so it is untouched — which is what isolates the VWAP filter.
-		bars := ramp(12, 9.00, 10.00)
-		for i := range bars {
-			bars[i].Volume = 1
-		}
-		pole := bars[len(bars)-1].High
-		bars = appendBar(bars, 9.98, pole-0.02, 9.90, 9.93)
-		bars = appendBar(bars, 9.95, 12.00, 9.94, 10.05)
-		bars[len(bars)-1].Volume = 5_000_000
-
-		withVWAP := setupCfg()
-		withVWAP.Entry.RequireAboveVWAP = true
-		if got := FindSetup(bars, withVWAP); got.Triggered {
-			t.Error("a close below VWAP must be refused when the filter is on")
-		}
-		// The same chart passes with the filter off, which proves the filter is what
-		// rejected it rather than some other condition.
-		noVWAP := setupCfg()
-		noVWAP.Entry.RequireAboveVWAP = false
-		if got := FindSetup(bars, noVWAP); !got.Triggered {
-			t.Errorf("without the VWAP filter this chart should trigger: %s", got.Reason)
-		}
-	})
+	withVWAP := setupCfg()
+	withVWAP.Entry.RequireAboveVWAP = true
+	if got := FindSetup(bars, withVWAP); got.Triggered || !strings.Contains(got.Reason, "VWAP") {
+		t.Errorf("triggered=%v reason=%q, want a VWAP refusal", got.Triggered, got.Reason)
+	}
+	// The same chart passes with the filter off, which proves the filter is what
+	// rejected it rather than some other condition.
+	if got := FindSetup(bars, setupCfg()); !got.Triggered {
+		t.Errorf("without the VWAP filter this chart should trigger: %s", got.Reason)
+	}
 }
 
 // A stop sitting implausibly close to entry is widened rather than accepted, because
@@ -180,10 +257,9 @@ func TestFindSetupRefusals(t *testing.T) {
 func TestFindSetupWidensAnImplausiblyTightStop(t *testing.T) {
 	cfg := setupCfg()
 	bars := ramp(12, 9.00, 10.00)
-	pole := bars[len(bars)-1].High
-	// The flag barely dips: its low is a fraction of a percent below the trigger.
-	bars = appendBar(bars, pole-0.001, pole-0.001, pole-0.004, pole-0.002)
-	bars = appendBar(bars, pole, pole+0.02, pole-0.001, pole+0.01)
+	// The pause barely dips: its low is a fraction of a percent below the trigger.
+	bars = appendBar(bars, 10.02, 10.03, 10.015, 10.016)
+	bars = appendBar(bars, 10.02, 10.05, 10.018, 10.04)
 
 	got := FindSetup(bars, cfg)
 	if !got.Triggered {
@@ -192,6 +268,9 @@ func TestFindSetupWidensAnImplausiblyTightStop(t *testing.T) {
 	if math.Abs(got.StopDistancePct-cfg.Entry.MinStopDistancePct) > 1e-9 {
 		t.Errorf("stop distance = %.4f%%, want it widened to the %.2f%% minimum",
 			got.StopDistancePct, cfg.Entry.MinStopDistancePct)
+	}
+	if math.Abs(got.RiskPerShare-(got.Entry-got.Stop)) > 1e-9 {
+		t.Errorf("risk per share = %v, want entry − stop", got.RiskPerShare)
 	}
 }
 

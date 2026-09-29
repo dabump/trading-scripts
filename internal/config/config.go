@@ -189,12 +189,30 @@ type Entry struct {
 	// RequireAboveVWAP additionally demands price above the session VWAP, which is
 	// the line that separates a stock being accumulated from one being distributed.
 	RequireAboveVWAP bool `yaml:"require_above_vwap"`
-	// MinPullbackBars and MaxPullbackBars bound the flag. One bar is the shallowest
-	// pullback worth calling one; too many and it is no longer a pause inside a
-	// move but a stalled trend.
-	MinPullbackBars int `yaml:"min_pullback_bars"`
+	// The setup is a micro pullback: a stock surging to a new high of day pauses for
+	// one or two candles and is bought when a candle closes back above the last
+	// pause candle's high. See internal/strategy/setup.go and docs/strategy.md §3.
+	//
+	// MaxPullbackBars is the longest pause that still counts. A pause candle is one
+	// that closes red or fails to make a higher high than the candle before it; three
+	// or more of them is a flag, which is a different setup.
 	MaxPullbackBars int `yaml:"max_pullback_bars"`
-	// StopBufferPct places the stop just under the flag's low rather than exactly on
+	// SurgeBars is how many candles, ending at the one before the pause, the surge is
+	// measured over.
+	SurgeBars int `yaml:"surge_bars"`
+	// MinSurgePct is how far price has to have risen across those candles, from their
+	// lowest low to the top of the surge, for the pause to be a pause in a move.
+	MinSurgePct float64 `yaml:"min_surge_pct"`
+	// MaxRetracePct is how much of the surge the pause may give back, as a percentage
+	// of the surge's range.
+	MaxRetracePct float64 `yaml:"max_retrace_pct"`
+	// RequireMACD demands the MACD (12, 26, 9) line above its signal line. With fewer
+	// candles than it needs, the filter has no opinion rather than refusing.
+	RequireMACD bool `yaml:"require_macd"`
+	// RequireVolumeDecline demands lighter average volume on the pause than on the
+	// surge.
+	RequireVolumeDecline bool `yaml:"require_volume_decline"`
+	// StopBufferPct places the stop just under the pause's low rather than exactly on
 	// it, so the obvious price does not take the position out.
 	StopBufferPct float64 `yaml:"stop_buffer_pct"`
 	// MaxStopDistancePct refuses a setup whose stop is too far below entry. This is
@@ -244,7 +262,25 @@ type Exit struct {
 	// target is banked, so a winner cannot become a loser.
 	BreakevenAfterTarget bool `yaml:"breakeven_after_target"`
 	EODExitOffsetMins    int  `yaml:"eod_exit_offset_minutes"`
+	// CandleTrail is the micro pullback's exit for what is still held: sell on the
+	// first candle that trades below the previous candle's low. It works by raising
+	// the stop to the low of each entry.pattern_interval candle that completes while
+	// the position is held, so the stop rule does the selling.
+	//
+	// "off" (or empty) disables it. "after_target" trails only the runner left after the first
+	// target is banked. "always" trails from the entry candle on, which is the
+	// discretionary version: a trade that makes a new low before paying is abandoned
+	// rather than held to the pause-low stop. See docs/decisions.md for how each
+	// measured.
+	CandleTrail string `yaml:"candle_trail"`
 }
+
+// The values Exit.CandleTrail accepts.
+const (
+	CandleTrailOff         = "off"
+	CandleTrailAfterTarget = "after_target"
+	CandleTrailAlways      = "always"
+)
 
 type Timing struct {
 	SentimentPollInterval time.Duration `yaml:"sentiment_poll_interval"`
@@ -365,12 +401,17 @@ func (c *Config) Validate() error {
 	if c.Entry.EMAPeriod < 2 {
 		add("entry.ema_period must be >= 2")
 	}
-	if c.Entry.MinPullbackBars < 1 {
-		add("entry.min_pullback_bars must be >= 1")
+	if c.Entry.MaxPullbackBars < 1 {
+		add("entry.max_pullback_bars must be >= 1")
 	}
-	if c.Entry.MaxPullbackBars < c.Entry.MinPullbackBars {
-		add("entry.max_pullback_bars (%d) must be >= entry.min_pullback_bars (%d)",
-			c.Entry.MaxPullbackBars, c.Entry.MinPullbackBars)
+	if c.Entry.SurgeBars < 1 {
+		add("entry.surge_bars must be >= 1")
+	}
+	if c.Entry.MinSurgePct < 0 {
+		add("entry.min_surge_pct must be >= 0")
+	}
+	if c.Entry.MaxRetracePct <= 0 || c.Entry.MaxRetracePct > 100 {
+		add("entry.max_retrace_pct must be in (0, 100]")
 	}
 	if c.Entry.StopBufferPct < 0 || c.Entry.StopBufferPct >= 100 {
 		add("entry.stop_buffer_pct must be in [0, 100)")
@@ -467,6 +508,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Exit.EODExitOffsetMins < 1 {
 		add("exit.eod_exit_offset_minutes must be >= 1")
+	}
+	switch c.Exit.CandleTrail {
+	case "", CandleTrailOff, CandleTrailAfterTarget, CandleTrailAlways:
+	default:
+		add("exit.candle_trail must be %q, %q or %q, got %q",
+			CandleTrailOff, CandleTrailAfterTarget, CandleTrailAlways, c.Exit.CandleTrail)
 	}
 
 	if c.Timing.SentimentPollInterval <= 0 {

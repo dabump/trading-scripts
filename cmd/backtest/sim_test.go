@@ -20,8 +20,10 @@ func testCfg() *config.Config {
 	c.Exit.EODExitOffsetMins = 30
 	c.Entry.PatternInterval = time.Minute
 	c.Entry.EMAPeriod = 9
-	c.Entry.MinPullbackBars = 1
-	c.Entry.MaxPullbackBars = 5
+	c.Entry.MaxPullbackBars = 2
+	c.Entry.SurgeBars = 3
+	c.Entry.MinSurgePct = 3
+	c.Entry.MaxRetracePct = 50
 	c.Entry.StopBufferPct = 0.1
 	c.Entry.MinStopDistancePct = 0.5
 	c.Entry.MaxStopDistancePct = 4
@@ -290,5 +292,101 @@ func TestPreFilterAdmitsOnlyDaysAnIntradayMomentCouldPass(t *testing.T) {
 	})
 	if got := scanSeries(cfg, "PENNY", penny, from); len(got) != 0 {
 		t.Errorf("a $0.90 high must fail the price floor, got %+v", got)
+	}
+}
+
+// oneSymbolDay is a hand-built session for simulate: one qualifier at the first
+// boundary, then the bars given, a minute apart.
+func oneSymbolDay(q qualifier, bars ...Bar) *preparedDay {
+	start := time.Date(2026, 9, 28, 10, 0, 0, 0, scheduler.ET)
+	p := &preparedDay{
+		Date:       "2026-09-28",
+		EODAt:      start.Add(5 * time.Hour),
+		EntryEndAt: start.Add(time.Hour),
+		bars:       map[string]map[int64]Bar{q.Symbol: {}},
+		series:     map[string][]Bar{},
+	}
+	for i, b := range bars {
+		b.T = start.Add(time.Duration(i) * time.Minute)
+		p.Boundaries = append(p.Boundaries, b.T)
+		p.bars[q.Symbol][b.T.Unix()] = b
+		p.series[q.Symbol] = append(p.series[q.Symbol], b)
+	}
+	p.qualifiers = make([][]qualifier, len(bars))
+	p.qualifiers[0] = []qualifier{q}
+	return p
+}
+
+func TestSimulateEntryFills(t *testing.T) {
+	cfg := testCfg()
+	cfg.Risk.MaxConcurrentPositions = 3
+
+	t.Run("a buy-stop fills at its trigger, not the open", func(t *testing.T) {
+		day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.8, BuyStop: 10.0},
+			Bar{O: 9.9, H: 10.2, L: 9.88, C: 10.1},
+			Bar{O: 10.1, H: 10.2, L: 10.0, C: 10.1})
+		s := simulate(cfg, []*preparedDay{day}, 0)
+		if len(s.Trades) != 1 {
+			t.Fatalf("got %d trades, want 1", len(s.Trades))
+		}
+		if s.Trades[0].EntryPrice != 10.0 {
+			t.Errorf("entry %v, want the 10.00 buy-stop", s.Trades[0].EntryPrice)
+		}
+	})
+
+	t.Run("a buy-stop the bar never reached does not fill", func(t *testing.T) {
+		day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.8, BuyStop: 10.0},
+			Bar{O: 9.9, H: 9.99, L: 9.85, C: 9.95})
+		if s := simulate(cfg, []*preparedDay{day}, 0); len(s.Trades) != 0 {
+			t.Fatalf("got %d trades, want none", len(s.Trades))
+		}
+	})
+
+	t.Run("a gap over the buy-stop past the stop-distance limit does not fill", func(t *testing.T) {
+		// Opens at 10.50 over a 10.00 trigger: the 9.80 stop is 6.7% away, beyond 4%.
+		day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.8, BuyStop: 10.0},
+			Bar{O: 10.5, H: 10.8, L: 10.4, C: 10.7})
+		if s := simulate(cfg, []*preparedDay{day}, 0); len(s.Trades) != 0 {
+			t.Fatalf("got %+v, want no fill", s.Trades)
+		}
+	})
+
+	// The entry bar is the only bar the exit loop would otherwise never look at.
+	t.Run("the entry bar can stop the position out", func(t *testing.T) {
+		for _, q := range []qualifier{
+			{Symbol: "X", Stop: 9.8},                // buys the open
+			{Symbol: "X", Stop: 9.8, BuyStop: 9.95}, // buy-stop inside the bar
+		} {
+			day := oneSymbolDay(q,
+				Bar{O: 9.9, H: 10.0, L: 9.7, C: 9.75},
+				Bar{O: 9.75, H: 12, L: 9.7, C: 11})
+			s := simulate(cfg, []*preparedDay{day}, 0)
+			if len(s.Trades) != 1 || s.Trades[0].Reason != domain.ExitStopLoss {
+				t.Fatalf("buy-stop %v: got %+v, want one stop-out", q.BuyStop, s.Trades)
+			}
+			if !s.Trades[0].ExitTime.Equal(s.Trades[0].EntryTime) {
+				t.Errorf("buy-stop %v: exited %v, want on the entry bar", q.BuyStop, s.Trades[0].ExitTime)
+			}
+		}
+	})
+}
+
+// The candle trail sells on the first bar to trade below the previous bar's low,
+// far above the chart stop.
+func TestSimulateCandleTrail(t *testing.T) {
+	cfg := testCfg()
+	cfg.Risk.MaxConcurrentPositions = 3
+	cfg.Exit.CandleTrail = config.CandleTrailAlways
+
+	day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.6},
+		Bar{O: 10.0, H: 10.2, L: 9.95, C: 10.1},  // entry bar: trail to 9.95
+		Bar{O: 10.1, H: 10.3, L: 10.05, C: 10.2}, // trail to 10.05
+		Bar{O: 10.2, H: 10.25, L: 10.0, C: 10.1}) // trades under 10.05: sold
+	s := simulate(cfg, []*preparedDay{day}, 0)
+	if len(s.Trades) != 1 {
+		t.Fatalf("got %d trades, want 1", len(s.Trades))
+	}
+	if tr := s.Trades[0]; tr.Reason != domain.ExitStopLoss || tr.ExitPrice != 10.05 {
+		t.Errorf("exit %s at %v, want STOP_LOSS at the 10.05 trailed low", tr.Reason, tr.ExitPrice)
 	}
 }

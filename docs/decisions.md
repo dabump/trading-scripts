@@ -891,9 +891,105 @@ The forced-exit interval is no longer restated as a number in `risk.md` or the
 `EOD_WINDOW` legend; both name the key, as the sentiment-window fix did for the same
 reason.
 
+## 2026-09-29 — The micro pullback replaces the flag as the only entry pattern
+
+**Why.** `FindSetup` did not describe the pattern the strategy is modelled on. It waited
+for a close above the *session* high after a 1–5 candle pullback, a bull-flag breakout.
+The micro pullback enters above the *previous candle's* high after a 1–2 candle pause
+in a stock that is surging right now. It also counts a candle that ticks a marginal new
+high and closes red as a pause, which is exactly the candle that made the flag read
+KNRX as "pullback is 0 bars".
+
+**What changed.** `strategy.FindSetup` is now the micro pullback, and the flag detector,
+`entry.pattern` and `entry.min_pullback_bars` are gone. New settings:
+`entry.surge_bars` (3), `min_surge_pct` (3.0), `max_retrace_pct` (50), and
+`max_pullback_bars`, which now means the pause, at 2. There are two optional filters,
+off by default: `require_macd` and `require_volume_decline`. The trend filters, the
+stop rules and sizing are unchanged. The daemon still enters on the trigger candle's
+*close*, because it scans closed candles; it places no buy-stop orders.
+
+**The comparison** (one year, 2025-09-28 → 2026-09-26, 0.25% slippage per side, same
+data). The flag row was measured before its code was removed:
+
+```
+entry                              setups  trades   mean     t     equity   maxDD
+flag: close above session high       169     201   -0.94%  -4.21    5434   47.1%
+micro: close above pause high        143     152   -0.70%  -1.62    7413   26.6%
+micro: buy-stop at pause high        503     455   -0.79%  -3.50    3223   68.1%
+```
+
+The micro pullback on the close is better than the flag on every line: smaller loss
+per trade, a much shallower drawdown, and $2k more equity at the end. **It is still
+not profitable**: −0.30R a trade, and a t of −1.62 means the loss itself is not
+clearly different from zero. It loses less; it has not shown an edge.
+
+**The last two months** (2026-07-29 → 2026-09-28): 16 trades, 38% winners, −0.83% a
+trade (−0.41R) at 0.25% slippage, equity 10,000 → 9,602, max drawdown 5.7%. Sixteen
+trades are far too few to conclude anything (t = −1.18).
+
+**What the sweep says about the settings** (one year, mean R per trade): as configured
+−0.30. MACD −0.27 and pause up to 3 bars −0.33 are within noise of that. Every other
+change is clearly worse: lighter pause volume −0.45, a 1-bar-only pause −0.46, a 6%+
+surge −0.49, no minimum surge −1.16. **The shipped values are the best of those
+tried, and none was tuned.**
+
+**The buy-stop entry is not worth building on this evidence.** It fires three times as
+often and loses at least as much per trade. The first run appeared to favour it, but
+that came from a simulator bug: a bar that gapped over the trigger filled at its open
+with the stop far beyond the 4% limit (YJ: fill 13.18, stop 10.90). The buy-stop is now
+modelled as a stop-limit capped at that limit. It is still one of the report's rows.
+
+**Two measurement fixes came with this, and they move earlier numbers.**
+- `simulate` now checks the entry bar for a stop or target hit straight after the
+  fill. Before, the bar a position was bought on was never examined. On the year's
+  flag baseline this moved the no-slippage mean from −0.53% to −0.47%: small, but
+  every earlier figure in this file was measured without it.
+- The entry-pattern report adds **mean R** (P&L over dollars risked). With risk-based
+  sizing, a percentage mean can be positive while the account falls, because a small
+  wide-stop winner counts as much as a large tight-stop loser.
+
+**Still open.** Both headline runs lose money after slippage, and the worst rolling
+five-session day-trade count is 9 for the year, against a PDT limit of 3. Nothing
+here changes the case for staying on paper.
+
+## 2026-09-29 — The micro pullback's exit: the candle trail
+
+**Why.** The exits already matched the micro pullback in three respects: the stop
+under the pause low, half sold at 2R, and the rest of the position moved to
+breakeven. What was missing was the rule for what is left: *sell on the first candle
+to make a new low*, a trade below the previous candle's low. The discretionary
+version applies it from entry, so a trade that makes a new low before paying is
+abandoned rather than held to the stop.
+
+**What changed.** `exit.candle_trail` (`off` / `after_target` / `always`), set to
+`always`. `strategy.CandleTrailStop` raises the stop to the low of each completed
+candle held through. The engine applies it through `store.MoveStop`, which never
+lowers a stop, and makes one bar request per held position per completed candle. The
+backtest calls the same function on every bar it holds through. The close event gains
+`initial_stop` and `candle_trail`, so a trailed exit can be told apart from the chart
+stop.
+
+**The measurement** (0.25% slippage per side, the micro-pullback entry):
+
+```
+                    ── one year (2025-09-28 → 2026-09-26) ──   ── two months (2026-07-29 → 2026-09-28) ──
+exit.candle_trail   trades   mean   mean R   equity   maxDD     trades   mean   mean R   equity   maxDD
+off                   152   -0.70%   -0.30    7413    26.6%       16   -0.83%   -0.41    9602    5.7%
+after_target          160   -0.76%   -0.29    7141    30.6%       16   -0.08%   -0.10    9954    3.4%
+always                172   -0.82%   -0.31    6676    34.5%       17   -0.36%   -0.21    9828    3.7%
+```
+
+Per trade in R the three are the same within noise over the year. The trail frees
+positions sooner, so more trades are taken, and over the year that turns into a lower
+ending equity and a deeper drawdown. The last two months favour it, on 16–17 trades.
+**It is on because it is the approach's exit, not because it measured better.** Over
+the year `off` was the best of the three and `after_target` the least harmful way to
+keep the rule. This is consistent with the earlier finding that this strategy's return
+lives in a thin right tail that trailing exits cut into.
+
 ## Open items (not yet decided)
 
-- **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
+- **(Superseded 2026-09-29: the micro pullback trades ~150 times a year and still measured no edge; see above.)** **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
 - **Float is still absent and still matters.** Low float is the mechanism that makes these moves extend, and it is the one part of the approach that could not be aligned. It needs a fundamentals provider Alpaca does not offer; no provider has been chosen.
 - **Tape reading is not automated and cannot be.** Any comparison against published discretionary results has to carry that caveat.
 - **Still no demonstrated edge, and still not a candidate for live capital.** t = −0.53. The risk profile is now defensible where it was not; the expectancy is not.

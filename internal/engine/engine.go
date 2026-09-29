@@ -74,6 +74,11 @@ type Engine struct {
 	auditedSkipsDate string
 
 	manual manualGuards
+
+	// trailedTo is the start of the last completed candle the candle trail has read,
+	// per position, so the bar request is made once per candle rather than on every
+	// position poll. Only managePositions touches it, and only from Tick.
+	trailedTo map[int64]time.Time
 }
 
 func New(d Deps) *Engine {
@@ -1059,8 +1064,8 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 				"risk_dollars":         sizing.RiskDollar,
 				"stop_price":           setup.Stop,
 				"stop_distance_pct":    setup.StopDistancePct,
-				"setup_pole_high":      setup.PoleHigh,
-				"setup_flag_bars":      setup.FlagBars,
+				"setup_pause_high":     setup.PauseHigh,
+				"setup_pause_bars":     setup.PauseBars,
 				"open_positions_after": openCount + 1,
 				"pre_market":           p.preMarket,
 			})
@@ -1113,6 +1118,10 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			return err
 		}
 
+		if !forceEOD {
+			p.StopPrice = e.trailStop(ctx, p)
+		}
+
 		decision := strategy.EvaluateExit(strategy.ExitInput{
 			Position: p, Price: price, EODReached: forceEOD,
 		}, e.cfg)
@@ -1156,6 +1165,8 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 				"entry_price":    p.EntryPrice,
 				"exit_price":     exitPrice,
 				"stop_price":     p.StopPrice,
+				"initial_stop":   p.EntryPrice - p.InitialRisk,
+				"candle_trail":   e.cfg.Exit.CandleTrail,
 				"peak_price":     p.PeakPrice,
 				"banked_earlier": p.BankedDollars,
 				"pnl_dollars":    pnl,
@@ -1164,6 +1175,60 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			})
 	}
 	return nil
+}
+
+// trailStop applies the candle trail (exit.candle_trail) to p and returns the stop to
+// evaluate it against: raised to the low of the last completed candle when the trail
+// applies and that is higher, otherwise unchanged.
+//
+// A failure to read bars leaves the stop where it was. The trail only ever tightens a
+// stop that already protects the position, so missing one candle costs a little
+// profit, never the floor under the trade.
+func (e *Engine) trailStop(ctx context.Context, p domain.Position) float64 {
+	switch e.cfg.Exit.CandleTrail {
+	case config.CandleTrailAlways:
+	case config.CandleTrailAfterTarget:
+		if !p.TargetHit {
+			return p.StopPrice
+		}
+	default:
+		return p.StopPrice
+	}
+
+	interval := e.cfg.Entry.PatternInterval
+	now := e.now()
+	// Already read the candle that closed most recently: nothing new until the next
+	// one does. A bar published late is simply picked up on a later poll.
+	if e.trailedTo[p.ID].Equal(now.Truncate(interval).Add(-interval)) {
+		return p.StopPrice
+	}
+	bars, err := e.data.IntradayBars(ctx, p.Symbol, interval, p.EntryTime.Truncate(interval))
+	if err != nil {
+		e.log.Warn("candle trail: bars unavailable", "symbol", p.Symbol, "err", err)
+		return p.StopPrice
+	}
+	last, ok := strategy.LastCompletedBar(bars, now, interval)
+	if !ok {
+		return p.StopPrice
+	}
+	if e.trailedTo == nil {
+		e.trailedTo = map[int64]time.Time{}
+	}
+	e.trailedTo[p.ID] = last.Time
+
+	lvl := strategy.CandleTrailStop(p, last, e.cfg)
+	if lvl <= p.StopPrice {
+		return p.StopPrice
+	}
+	if err := e.store.MoveStop(p.ID, lvl); err != nil {
+		e.log.Warn("candle trail: stop not saved", "symbol", p.Symbol, "err", err)
+		return p.StopPrice
+	}
+	// Logged, not audited: it moves once a minute per position. The close event
+	// records the stop it sold at alongside the initial one.
+	e.log.Debug("candle trail raised stop", "symbol", p.Symbol,
+		"from", p.StopPrice, "to", lvl, "candle", last.Time)
+	return lvl
 }
 
 // scaleOut banks part of a winning position and, when configured, lifts the stop on

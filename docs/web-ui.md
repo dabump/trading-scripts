@@ -117,7 +117,7 @@ Each row that qualified and is not already held carries an **Open** button.
 
 ### The Open button
 
-It buys that candidate now, **overriding the setup gate** — the rule the whole strategy turns on. It exists because a human reading a chart can see a pattern the mechanical detector cannot: `FindSetup` wants a 1–5 bar pullback reclaimed on the next bar, which a relentless vertical mover never prints (it reads "pullback is 0 bars" all the way up, then jumps past 5 within minutes of topping). See the KNRX case in [`decisions.md`](./decisions.md).
+It buys that candidate now, **overriding the setup gate** — the rule the whole strategy turns on. It exists because a human reading a chart can see a pattern the mechanical detector cannot: `FindSetup` wants a surge, a 1–2 candle pause and a close above the pause candle's high on the very next candle. A name can move in a way no rule captures, or set up a candle before the scan sees it. See the KNRX case in [`decisions.md`](./decisions.md).
 
 What it overrides is the **signal**, and only the signal:
 

@@ -73,9 +73,11 @@ type ScreenRow struct {
 	// and available cash all still apply.
 	Outcome     string
 	OutcomeTone string
-	// CanOpen drives the Open button: a qualifying candidate the agent is not
-	// already holding. The engine re-checks everything regardless — this only keeps
-	// the page from offering a click that is certain to be refused.
+	// CanOpen drives the Open button: any screened symbol the agent is not already
+	// holding, qualifying or not. On a failing row the click overrides the screen as
+	// well as the setup gate, and the confirmation says so. The engine re-checks the
+	// risk rules regardless — this only keeps the page from offering a click that is
+	// certain to be refused.
 	CanOpen bool
 }
 
@@ -97,6 +99,8 @@ type PositionRow struct {
 	PnLDollars string
 	PnLPct     string
 	Tone       string
+	// Manual marks a position opened from the page, which no exit rule touches.
+	Manual bool
 }
 
 type EODRow struct {
@@ -423,7 +427,7 @@ func BuildView(
 		} else {
 			row.Verdict = e.FailReason
 		}
-		row.CanOpen = e.Qualifies && !held[e.Symbol]
+		row.CanOpen = !held[e.Symbol]
 		row.Outcome = e.Outcome
 		row.OutcomeTone = "idle"
 		if strings.HasPrefix(e.Outcome, "bought") {
@@ -466,7 +470,15 @@ func BuildView(
 			Entry: money(p.EntryPrice), Stop: money(p.StopPrice),
 			Current: money(current), Peak: money(p.PeakPrice),
 			PnLDollars: signedMoney(pnl), PnLPct: pct(p.UnrealizedPct(current)),
-			Tone: toneForPnL(pnl),
+			Tone: toneForPnL(pnl), Manual: p.Manual,
+		}
+		if p.Manual {
+			// The stored stop only sized it; showing it as a price would suggest it
+			// protects the position.
+			row.Stop = "manual"
+			if p.SessionDate != date {
+				row.SharesNote = "held since " + p.SessionDate
+			}
 		}
 		if p.SharesOpen != p.Shares {
 			row.SharesNote = fmt.Sprintf("of %d, %s banked",
@@ -483,11 +495,16 @@ func BuildView(
 		v.PositionsNote = "No open positions."
 	}
 
-	// Closed positions for today's session, built whenever there are any rather than
-	// only after the bell. A position closed by hand at 11:00 has to show up at
-	// 11:00 — an operator who has just sold something needs to see the result, not
-	// wait four hours for an end-of-day card to appear.
-	positions, err := st.SessionPositions(date)
+	// Positions closed today, built whenever there are any rather than only after the
+	// bell. A position closed by hand at 11:00 has to show up at 11:00 — an operator
+	// who has just sold something needs to see the result, not wait four hours for an
+	// end-of-day card to appear. Selected by when they closed, not when they opened:
+	// a manual position can be held overnight and closed in a later session.
+	dayStart, err := time.ParseInLocation("2006-01-02", date, scheduler.ET)
+	if err != nil {
+		return nil, err
+	}
+	positions, err := st.PositionsClosedBetween(dayStart, dayStart.AddDate(0, 0, 1))
 	if err != nil {
 		return nil, err
 	}

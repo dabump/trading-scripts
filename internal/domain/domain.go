@@ -152,6 +152,11 @@ type Position struct {
 	ExitPrice  float64
 	ExitTime   time.Time
 	ExitReason ExitReason
+	// Manual marks a position opened from the status page. No exit rule applies to
+	// it — not the stop, the backstop, the candle trail, the target or the forced
+	// end-of-day exit — so it is held, across sessions if need be, until it is closed
+	// by hand. StopPrice and InitialRisk still describe the stop it was sized from.
+	Manual bool
 }
 
 // RMultiple expresses a price as a multiple of the position's initial risk, which
@@ -262,6 +267,11 @@ type ManualOpen struct {
 	SetupReason string
 	// Halted records that the session's kill switch was on and this overrode it.
 	Halted bool
+	// Qualified is whether the symbol passed the screen on the latest pass, and
+	// ScreenReason is why not when it did not. A manual open is allowed either way;
+	// on a failing row it overrides the screen as well as the setup gate.
+	Qualified    bool
+	ScreenReason string
 }
 
 // SentimentReading is one 10-minute poll during the first hour.

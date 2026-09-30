@@ -1031,6 +1031,27 @@ manual pre-market opens that overrode the setup gate (the recorded reasons inclu
 "below VWAP" and "no pullback"). Only the four NAUT trades were the strategy's own
 entries, so the day says little about the strategy either way.
 
+## 2026-09-30 — Positions opened by hand are closed only by hand
+
+**On request.** A position opened from the page's Open button is now exempt from every
+exit rule: the chart stop, the `risk.stop_loss_pct` backstop, the candle trail, the
+scale-out at the first target, and the forced end-of-day exit. It is flagged `manual`
+(migration 006), `managePositions` keeps its mark current and does nothing else, and
+only its Close button sells it — overnight and across sessions if it is not pressed.
+The first question asked was whether the forced exit should stay; the answer was that
+it should not.
+
+**What this gives up, stated so it is not rediscovered.** The page's invariant had been
+"a manual action overrides the signal, never the risk rules". It now holds on the way
+in only: sizing still comes from a stop, but the stop is not enforced afterwards, so a
+manual position's loss is not bounded by `risk.risk_per_trade_pct`, and it can carry
+overnight gap risk the rest of the strategy excludes. The automated positions are
+unaffected, and so is the backtest, which never opens a position by hand.
+
+**Still refused inside the end-of-day window.** Opening there was refused because the
+position would be force-sold within minutes, which no longer happens to a manual
+position. Left as it was; whether to lift it is open.
+
 ## Open items (not yet decided)
 
 - **(Superseded 2026-09-29: the micro pullback trades ~150 times a year and still measured no edge; see above.)** **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.

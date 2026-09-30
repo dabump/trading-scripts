@@ -33,7 +33,8 @@
 
 ## End-of-day exit
 
-- Every open position is force-closed `exit.eod_exit_offset_minutes` before market close (currently **5m**), no exceptions — the strategy never holds overnight.
+- Every position the strategy opened is force-closed `exit.eod_exit_offset_minutes` before market close (currently **5m**) — the strategy never holds overnight.
+- **Positions opened by hand are the exception to every exit rule, this one included** (2026-09-30, on request). A manual position has no stop, no gap backstop, no candle trail, no scale-out and no forced exit: it is sold only by its Close button, and it is held overnight and across sessions if it is not pressed. Its stop still exists — it is what sized the position — but nothing acts on it, so **a manual position's loss is not capped at the risk budget**. Entry-side rules (the cap, one position per symbol, same-day re-entry, sizing) still apply to opening one, and it occupies a slot until closed. It also removes a manual position from the PDT arithmetic when it is held overnight, and adds overnight gap risk this document otherwise excludes.
 
 ## Not yet decided / worth revisiting once paper trading is running
 

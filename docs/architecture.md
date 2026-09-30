@@ -7,7 +7,7 @@
 A single Go binary runs as one continuously-running daemon process (not a cron job) with two concurrent responsibilities:
 
 1. **The trading loop** — sentiment gating, screening, entry/exit decisions, order placement.
-2. **A status web server** — a page showing current state (open and closed positions, today's sentiment reading, recent decisions), backed directly by the same store the trading loop writes to. Mostly read-only: two manual checks that cannot trade, plus **Open** and **Close** controls that can, overriding the entry signal but never the risk rules.
+2. **A status web server** — a page showing current state (open and closed positions, today's sentiment reading, recent decisions), backed directly by the same store the trading loop writes to. Mostly read-only: two manual checks that cannot trade, plus **Open** and **Close** controls that can. Open overrides the entry signal but not the entry-side risk rules; a position it opens is then exempt from every exit rule and closes only by hand.
 
 There is one Alpaca account/API key set used for both market data and order execution, so there's a single `broker` client rather than separate data and execution integrations. `broker` also ships a `Fake` implementation, which is what the tests and `-offline` mode run against; the daemon can therefore be exercised end to end with no credentials and no network.
 
@@ -60,11 +60,13 @@ path but deliberately stop short of it — neither persists anything and neither
 place an order, which is what makes them safe to run with the market closed.
 `engine.ClosePosition` and `engine.OpenPosition` back the **Close** and **Open**
 buttons and are the two controls that trade. Both go through the same `submit` path
-the strategy uses. A manual open overrides the setup gate and nothing else — sizing,
-the stop, the position cap and the same-day rules are all applied exactly as they are
-for an automatic entry. See [`web-ui.md`](./web-ui.md) for the reasoning.
+the strategy uses. A manual open overrides the setup gate and nothing else on the way
+in — sizing from a stop, the position cap and the same-day rules are all applied
+exactly as they are for an automatic entry. Once open, the position is flagged
+`manual` and **no exit rule applies to it**, the forced end-of-day exit included:
+`managePositions` only keeps its mark current, and only Close sells it. See [`web-ui.md`](./web-ui.md) for the reasoning.
 
-Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the book, and this strategy holds nothing overnight.
+Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the strategy's positions, and the strategy holds nothing overnight. A manual position can be held overnight; no phase acts on it.
 
 On startup, before the loop begins, `engine.Reconcile` compares the broker's positions against the store: anything the broker holds that the store does not know about is adopted, anything the store thinks is open that the broker does not hold is closed as `RECONCILED`, and orders recorded as submitted but never confirmed are resolved. This is what closes the crash-between-submit-and-confirm hole.
 

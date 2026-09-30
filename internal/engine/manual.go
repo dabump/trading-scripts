@@ -305,8 +305,7 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 // ErrAlreadyHeld and friends explain a refused manual open in terms the page can
 // show without translation.
 var (
-	ErrNotQualifying = errors.New("that symbol is not on the current screen")
-	ErrCannotEnter   = errors.New("entry is not allowed right now")
+	ErrCannotEnter = errors.New("entry is not allowed right now")
 )
 
 // OpenPosition buys a screened candidate on an operator's instruction, overriding
@@ -383,7 +382,17 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 		return domain.ManualOpen{}, fmt.Errorf("no price available for %s", symbol)
 	}
 
-	res := domain.ManualOpen{Entry: snap.Price}
+	res := domain.ManualOpen{Entry: snap.Price, ScreenReason: "not on the latest screen"}
+	// Recorded rather than required: the page offers Open on failing rows too, and the
+	// trail should say which kind of override this was.
+	if evals, _, err := e.store.LatestScreenSnapshot(sess.Date); err == nil {
+		for _, ev := range evals {
+			if ev.Symbol == symbol {
+				res.Qualified, res.ScreenReason = ev.Qualifies, ev.FailReason
+				break
+			}
+		}
+	}
 
 	// Prefer the chart's own stop when the pattern is actually there: an operator who
 	// clicks a fraction early should still get the stop the strategy would have used.
@@ -439,7 +448,7 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 	id, err := e.store.InsertPosition(domain.Position{
 		SessionDate: sess.Date, Symbol: symbol, Shares: res.Shares,
 		EntryPrice: res.Entry, EntryTime: now, PeakPrice: res.Entry,
-		StopPrice: res.Stop, InitialRisk: riskPerShare,
+		StopPrice: res.Stop, InitialRisk: riskPerShare, Manual: true,
 	})
 	if err != nil {
 		return domain.ManualOpen{}, err
@@ -465,6 +474,9 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 			"cash_before":        acct.Cash,
 			"overrode_halt":      res.Halted,
 			"pre_market":         extendedHours,
+			"exit_rules":         "none: closed only by hand",
+			"screen_qualified":   res.Qualified,
+			"screen_reason":      res.ScreenReason,
 		}, f, quoted, sizing.Shares))
 
 	stored, err := e.store.PositionByID(id)

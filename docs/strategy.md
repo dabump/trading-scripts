@@ -67,9 +67,9 @@ With it on, three things change and all three are requirements rather than prefe
 2. **Entry is gated on a live sentiment read** (see §1), because the post-open gate has not run.
 3. **The setup is read on pre-market candles.** The chart handed to `strategy.FindSetup` starts at `premarket.start` rather than the open, so the pullback, the EMA and the VWAP are all computed from the session actually trading.
 
-Everything else is unchanged: the same position cap, the same sizing from the stop, the same exit rules. A position opened pre-market is managed from the moment it exists — its stop can fire at 08:00 rather than waiting for the bell — and is flattened at the regular forced end-of-day exit like any other.
+Everything else is unchanged: the same position cap, the same sizing from the stop, the same exit rules. A position opened pre-market is managed from the moment it exists — its stop can fire at 08:00 rather than waiting for the bell — and is flattened at the regular forced end-of-day exit like any other — unless it was opened by hand, which no exit rule touches (§4).
 
-**Post-market is deliberately not covered.** The forced end-of-day exit flattens the book before the close, so after 16:00 there is nothing to manage; and opening a position into the 16:00–20:00 session would mean holding it overnight, which this strategy never does.
+**Post-market is deliberately not covered.** The forced end-of-day exit flattens the strategy's book before the close, so after 16:00 there is nothing it manages (a manual position may still be held, but no rule acts on it); and opening a position into the 16:00–20:00 session would mean holding it overnight, which this strategy never does.
 
 **Where pre-market volume comes from.** Not the snapshot. Verified against a live account: before the bell, Alpaca's `dailyBar` is still the *previous* session's, and no daily bar for today exists yet, so a symbol's volume-so-far reads as **zero**. That zero fails both the liquidity floor and the relative-volume criterion, which made the first live pre-market scan reject all 66 of its movers. `broker.SessionVolumes` therefore sums each name's volume from **batched hourly bars** since `premarket.start`, and the tradability gate splits in two to accommodate it: the price band is answerable from the snapshot in either session and is applied first, then volume is fetched for the survivors, then turnover is judged. See [`decisions.md`](./decisions.md) for the raw payloads.
 
@@ -214,7 +214,7 @@ that is a limitation of automating the approach rather than something tuning wil
 
 ### Overriding the gate by hand
 
-The status page offers an **Open** button on every qualifying candidate, which buys it without the setup. That is a deliberate escape hatch, not a second entry rule: the gate stays exactly as described above for everything the agent does on its own.
+The status page offers an **Open** button on every screened symbol not already held — qualifying or not — which buys it without the setup (and, on a failing row, without the screen). That is a deliberate escape hatch, not a second entry rule: the gate stays exactly as described above for everything the agent does on its own.
 
 It exists because the gate's failure mode is known and one-sided. It was added when the flag detector refused KNRX (+357%, 4846x relative volume, 7 catalysts, never bought), because a vertical mover never printed the 1–5 bar pullback that detector wanted. The micro pullback that replaced it can see a one-candle pause, but any mechanical rule still misses charts a human reads correctly.
 
@@ -225,9 +225,15 @@ Everything downstream of the signal still applies to a hand-placed trade — the
 Three things can close or reduce a position, checked in this order. The candle trail
 described below works through the second, raising the stop:
 
-1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, no exceptions.
+1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, with one exception: nothing in this section applies to a position opened by hand (see below).
 2. **The stop.** The working stop is the chart stop the setup defined, moved up to the entry price once the first target is banked. Behind it sits `risk.stop_loss_pct` as a **gap backstop**, reachable only when price jumps straight through the chart stop. Config validation requires the backstop to be the wider of the two, or it would fire first and silently turn this back into a fixed-percentage stop.
 3. **The first profit target**, at `exit.first_target_r` multiples of *this trade's own initial risk*. `exit.first_target_fraction` of the position is sold there and the rest keeps running, with its stop at breakeven.
+
+**Positions opened by hand are exempt from all of it** — the stop, the backstop, the
+candle trail, the target and the forced exit. `engine.managePositions` keeps their
+mark current for the page and does nothing else, and records `POSITION_HELD` once
+per session when one is left open through the forced exit. They are closed only by
+the page's Close button, and can be held overnight. See [`risk.md`](./risk.md).
 
 Risk before reward: on a bar that traded through both the stop and the target, the
 stop is what is recorded. `strategy.EvaluateExit` returns the first action due, and

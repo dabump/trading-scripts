@@ -2,7 +2,7 @@
 
 **Status:** implemented. The page is served by the `web` package (see [`architecture.md`](./architecture.md)) and renders state from `store`.
 
-It is not read-only. Two buttons trigger **read-only** checks on demand (see "Manual checks"), and two controls trade: **Close** on an open position, and **Open** on a screening row that qualified.
+It is not read-only. Two buttons trigger **read-only** checks on demand (see "Manual checks"), and two controls trade: **Close** on an open position, and **Open** on any screening row not already held — qualifying or not.
 
 The rule that replaced "the page cannot trade" is narrower and more useful: **a manual action overrides the signal, never the risk rules.** An operator can decide *that* a trade happens; they cannot decide how big it is, whether it fits under the position cap, or that it goes without a stop. Those are computed identically for a hand-placed trade and an automatic one.
 
@@ -106,7 +106,7 @@ What it does *not* do matters as much:
 - **It is refused when the exchange is shut.** A sell submitted then would be queued to the next open while the store had already marked the position closed, and the two would disagree until a restart reconciled them. A page reporting a flat book the broker does not have is worse than a refusal. Pre-market it is allowed, routed to the extended-hours book like any other pre-market order.
 - **A second press cannot send a second order.** The engine holds a per-position guard while one is in flight, and re-reads the row before acting — the id came from a page that may be a poll interval old and may describe a position the trading loop has since exited.
 
-**Closed** lists everything closed in today's session — symbol, shares, opened, closed, P&L in dollars and percent, and which rule (or `MANUAL`) closed it — with net P&L and a win/loss count underneath.
+**Closed** lists everything closed today — selected by when it closed, not when it opened, since a manual position may have been opened in an earlier session — symbol, shares, opened, closed, P&L in dollars and percent, and which rule (or `MANUAL`) closed it — with net P&L and a win/loss count underneath.
 
 It is visible from the moment something closes, not only after the bell. It used to be an "End of day" card hidden until the forced-exit mark, which was reasonable while a strategy rule was the only thing that could close a position; once the page can close one by hand, an operator who has just sold something cannot be made to wait four hours to see what it made. After the close it reads the same way the end-of-day summary did.
 
@@ -114,7 +114,7 @@ The selected tab is remembered per browser, because the page swaps its whole con
 
 ## Screening section (visible while `SCREENING`)
 
-Each row that qualified and is not already held carries an **Open** button.
+Every row not already held carries an **Open** button — on a qualifying row it overrides the setup gate; on a row that failed the screen (drawn dashed) it overrides the screen as well, and both the browser confirmation and the result modal say the symbol did not qualify and why. The audit event records `screen_qualified` and `screen_reason` either way. Offered on failing rows on request (2026-09-30); before that only qualifying rows had it.
 
 ### The Open button
 
@@ -128,7 +128,7 @@ What it overrides is the **signal**, and only the signal:
 - **The kill switch does not block it**, because an instruction about one named symbol is not the thing it exists to stop — but the confirmation warns, and the audit event carries `overrode_halt`.
 - **Refused inside the end-of-day window**, where anything bought is about to be force-sold, and refused with the exchange shut.
 
-Once open it is an ordinary position: same stop, same scale-out at the first target, same forced exit before the close.
+**Once open, nothing sells it but its Close button.** A position opened here has no stop, no gap backstop, no candle trail, no scale-out and no forced exit before the close; it is held overnight and into later sessions until it is closed by hand (changed 2026-09-30, on request — before that it was managed like any other position). The stop above still sizes it, but a loss past that stop is not capped. In the positions table its Stop cell reads `manual`, and a position carried from an earlier session says `held since <date>` under its share count. The confirmation says all of this.
 
 A table of tickers currently being evaluated, with a per-criterion breakdown rather than a single pass/fail — this is what lets you see *why* a candidate did or didn't qualify:
 

@@ -105,6 +105,7 @@ later to answer "why did it buy that, and what did it know at the time?".
 
 Recorded events: `AGENT_STARTED`, `SENTIMENT_READING`, `GATE_RESOLVED`,
 `TRADING_HALTED`, `POSITION_OPENED`, `POSITION_SCALED_OUT`, `POSITION_CLOSED`,
+`POSITION_HELD` (a manual position left open through the forced exit, once per session),
 `ENTRY_SKIPPED`, `ORDER_NOT_FILLED`, `RECONCILED`, `FAULT`. Every event that traded
 carries the broker's fill as `price` alongside `quoted_price` (what the daemon read
 when it decided), `shares_ordered`, `order_status` and `fill_confirmed`, so slippage

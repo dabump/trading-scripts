@@ -650,3 +650,36 @@ func TestReduceSharesBanksAPartialExit(t *testing.T) {
 		t.Error("reducing by everything held must be refused: that is a close")
 	}
 }
+
+// A manual position is flagged in the store, and "closed today" finds it by when it
+// closed rather than the session it was opened in — it may have been held overnight.
+func TestManualPositionClosedInALaterSession(t *testing.T) {
+	s := newStore(t)
+	opened := time.Date(2026, 9, 29, 14, 0, 0, 0, time.UTC)
+	id, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-09-29", Symbol: "HAND", Shares: 100,
+		EntryPrice: 5, EntryTime: opened, StopPrice: 4.8, InitialRisk: 0.2, Manual: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.PositionByID(id); !got.Manual {
+		t.Fatal("the manual flag did not survive a round trip")
+	}
+	closedAt := time.Date(2026, 9, 30, 15, 0, 0, 123456789, time.UTC)
+	if err := s.ClosePosition(id, 5.5, closedAt, domain.ExitManual); err != nil {
+		t.Fatal(err)
+	}
+
+	day := time.Date(2026, 9, 30, 4, 0, 0, 0, time.UTC) // midnight ET
+	got, err := s.PositionsClosedBetween(day, day.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Symbol != "HAND" {
+		t.Errorf("closed on 2026-09-30 = %+v, want HAND though it opened the day before", got)
+	}
+	if got, _ := s.PositionsClosedBetween(day.AddDate(0, 0, -1), day); len(got) != 0 {
+		t.Errorf("closed on 2026-09-29 = %+v, want nothing", got)
+	}
+}

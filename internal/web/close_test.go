@@ -124,10 +124,10 @@ func itoa(v int64) string {
 	return strconv.FormatInt(v, 10)
 }
 
-// The Open button belongs only on rows that qualified — that is the whole selector
-// the operator asked for — and never on a symbol already held, where the engine
-// would refuse the click anyway.
-func TestOpenButtonOnlyOnQualifyingRows(t *testing.T) {
+// The Open button is on every screened row, qualifying or not (a failing row's button
+// overrides the screen as well as the setup), and never on a symbol already held,
+// where the engine would refuse the click anyway.
+func TestOpenButtonOnEveryScreenedRowNotHeld(t *testing.T) {
 	f := newFixture(t)
 	if err := f.store.SaveScreenSnapshot(f.date, f.now, []domain.Evaluation{
 		{Symbol: "GOOD", Qualifies: true, Criteria: []domain.Criterion{
@@ -145,8 +145,8 @@ func TestOpenButtonOnlyOnQualifyingRows(t *testing.T) {
 	if !strings.Contains(body, `data-open="GOOD"`) {
 		t.Error("a qualifying candidate must offer an Open button")
 	}
-	if strings.Contains(body, `data-open="BAD"`) {
-		t.Error("a failing candidate must not offer an Open button")
+	if !strings.Contains(body, `data-open="BAD" data-qualifies="false"`) {
+		t.Error("a failing candidate must offer an Open button marked as not qualifying")
 	}
 	if strings.Contains(body, `data-open="HELD"`) {
 		t.Error("a symbol already held must not offer an Open button")

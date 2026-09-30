@@ -149,6 +149,8 @@ button.mini {
 }
 button.mini:hover:not(:disabled) { color: var(--text); }
 button.mini:disabled { opacity: .45; cursor: default; }
+/* Open on a row that failed the screen: the same action, visibly the weaker case. */
+button.mini.ghost { background: transparent; border-style: dashed; }
 button.mini.danger:hover:not(:disabled) {
   color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
 }
@@ -309,9 +311,12 @@ document.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-open]');
   if (!btn) return;
   const symbol = btn.dataset.open;
-  if (!confirm('Buy ' + symbol + ' now?\n\nThis overrides the setup gate. Size comes from the ' +
+  const overrides = btn.dataset.qualifies === 'true'
+    ? 'This overrides the setup gate.'
+    : symbol + ' did NOT qualify on the screen. This overrides the screen and the setup gate.';
+  if (!confirm('Buy ' + symbol + ' now?\n\n' + overrides + ' Size comes from the ' +
                'risk budget and the stop, which may be the configured maximum rather than one ' +
-               'read off the chart.')) return;
+               'read off the chart. Once open, nothing sells it but its Close button.')) return;
 
   btn.disabled = true;
   modalContent.innerHTML = '<div class="mhead"><h3>Opening…</h3></div>' +
@@ -516,7 +521,7 @@ setInterval(refresh, POLL_MS);
         {{template "symbolCell" .Symbol}}
         <td class="num">{{.Shares}}{{if .SharesNote}}<span class="meta"> {{.SharesNote}}</span>{{end}}</td>
         <td class="num muted">{{.Entry}}</td>
-        <td class="num muted">{{.Stop}}</td>
+        <td class="num muted"{{if .Manual}} title="Opened by hand: no stop, target or end-of-day exit applies. Only Close sells it."{{end}}>{{.Stop}}</td>
         <td class="num">{{.Current}}</td>
         <td class="num muted">{{.Peak}}</td>
         <td class="num muted">{{.RMultiple}}</td>
@@ -594,8 +599,8 @@ setInterval(refresh, POLL_MS);
         <td>{{if .Outcome}}<span class="{{.OutcomeTone}}">{{.Outcome}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
         <td class="num">
           {{if .CanOpen}}
-          <button type="button" class="mini" data-open="{{.Symbol}}"
-                  title="Buy {{.Symbol}} now, overriding the setup gate">Open</button>
+          <button type="button" class="mini{{if not .Qualifies}} ghost{{end}}" data-open="{{.Symbol}}" data-qualifies="{{.Qualifies}}"
+                  title="Buy {{.Symbol}} now, overriding {{if .Qualifies}}the setup gate{{else}}the screen and the setup gate{{end}}">Open</button>
           {{end}}
         </td>
       </tr>
@@ -678,17 +683,24 @@ setInterval(refresh, POLL_MS);
     The session's kill switch is on. This overrode it, and the trail records that it did.
   </div>
   {{end}}
+  {{if .NotQualified}}
+  <div class="alert soft">
+    {{.Symbol}} did not qualify on the screen ({{.NotQualified}}). This overrode the screen as
+    well as the setup gate.
+  </div>
+  {{end}}
   <p class="kv">Bought {{.Shares}} {{.Symbol}} at {{.Entry}} — {{.Notional}} committed.</p>
   <div class="totals" style="margin-top:12px">
-    <div><span class="label">Stop</span><span class="value">{{.Stop}}</span></div>
-    <div><span class="label">Risk if it fills</span><span class="value bad">{{.Risk}}</span></div>
+    <div><span class="label">Sizing stop</span><span class="value">{{.Stop}}</span></div>
+    <div><span class="label">Risk at that stop</span><span class="value bad">{{.Risk}}</span></div>
   </div>
   <p class="note" style="margin-top:12px">
-    Stop {{.StopSource}}.{{if .SetupReason}} The detector said: {{.SetupReason}}.{{end}}
+    Sized from a stop {{.StopSource}}.{{if .SetupReason}} The detector said: {{.SetupReason}}.{{end}}
   </p>
   <p class="note">
-    From here it is an ordinary position: the same stop, the same scale-out at the first
-    target, and the same forced exit before the close.
+    <strong>Nothing sells this position but you.</strong> No stop, no scale-out at a target,
+    and no forced exit before the close — it is held overnight if you leave it. The stop
+    above only decided the size; a loss beyond it is not capped.
   </p>
 </div>
 {{end}}

@@ -318,6 +318,9 @@ type OpenModal struct {
 	Risk        string
 	Notional    string
 	Halted      bool
+	// NotQualified is the screen's reason when the symbol failed it, so the modal
+	// can say the open overrode the screen too.
+	NotQualified string
 }
 
 // handleOpenPosition buys a screened candidate on the operator's instruction.
@@ -357,6 +360,12 @@ func (s *Server) handleOpenPosition(w http.ResponseWriter, r *http.Request) {
 		Risk:     money(res.RiskDollar),
 		Notional: accountMoney(float64(res.Shares) * res.Entry),
 		Halted:   res.Halted,
+	}
+	if !res.Qualified {
+		m.NotQualified = res.ScreenReason
+		if m.NotQualified == "" {
+			m.NotQualified = "it did not qualify"
+		}
 	}
 	if res.FromSetup {
 		m.StopSource = "from the chart — a completed pullback, the same stop the agent would have used"

@@ -79,6 +79,10 @@ type Engine struct {
 	// per position, so the bar request is made once per candle rather than on every
 	// position poll. Only managePositions touches it, and only from Tick.
 	trailedTo map[int64]time.Time
+	// heldThroughClose latches the session in which each manual position's hold
+	// through the forced exit was audited, so it is recorded once rather than on
+	// every EOD-window tick.
+	heldThroughClose map[int64]string
 
 	// fillWait bounds how long submit waits for an order to finish filling before
 	// cancelling what is left, and fillPoll is how often it asks in the meantime.
@@ -1138,6 +1142,19 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 
 	for _, p := range open {
 		price := snaps[p.Symbol].Price
+		if p.Manual {
+			// Opened by hand, closed by hand: no stop, trail, target or forced exit.
+			// Only the mark is kept current, for the page.
+			if price > 0 {
+				if err := e.store.UpdateMark(p.ID, price, max(p.PeakPrice, price)); err != nil {
+					return err
+				}
+			}
+			if forceEOD {
+				e.noteHeldThroughClose(sess, p, price)
+			}
+			continue
+		}
 		if price <= 0 && !forceEOD {
 			// Without a price the exit rules cannot be evaluated; skip rather than
 			// acting on a zero that would read as a catastrophic loss.
@@ -1217,6 +1234,34 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			}, f, quoted, p.SharesOpen))
 	}
 	return nil
+}
+
+// noteHeldThroughClose records, once per position per session, that a manual position
+// was left open through the forced exit. The EOD window re-runs managePositions on
+// every tick, so without the latch this would be written dozens of times.
+func (e *Engine) noteHeldThroughClose(sess scheduler.Session, p domain.Position, price float64) {
+	if e.heldThroughClose == nil {
+		e.heldThroughClose = map[int64]string{}
+	}
+	if e.heldThroughClose[p.ID] == sess.Date {
+		return
+	}
+	e.heldThroughClose[p.ID] = sess.Date
+	if price <= 0 {
+		price = p.LastPrice
+	}
+	e.log.Info("manual position held through the forced exit", "symbol", p.Symbol,
+		"shares", p.SharesOpen, "price", price)
+	e.record(audit.PositionHeld, p.Symbol,
+		fmt.Sprintf("held %d shares through the forced exit: opened by hand, so only a manual close sells it",
+			p.SharesOpen),
+		map[string]any{
+			"shares_held":    p.SharesOpen,
+			"entry_price":    p.EntryPrice,
+			"price":          price,
+			"unrealized_pnl": p.UnrealizedDollars(price),
+			"opened_session": p.SessionDate,
+		})
 }
 
 // shortExit handles an exit order that sold less than the position held, and reports

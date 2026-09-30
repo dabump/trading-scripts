@@ -112,6 +112,13 @@ func (s *Store) migrate() error {
 
 func nowUTC() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func formatTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -230,10 +237,10 @@ func (s *Store) InsertPosition(p domain.Position) (int64, error) {
 	res, err := s.db.Exec(
 		`INSERT INTO positions
 		 (session_date, symbol, shares, shares_open, entry_price, entry_time, peak_price,
-		  last_price, stop_price, initial_risk, is_open)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+		  last_price, stop_price, initial_risk, manual, is_open)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
 		p.SessionDate, p.Symbol, p.Shares, p.Shares, p.EntryPrice, formatTime(p.EntryTime),
-		peak, p.EntryPrice, p.StopPrice, p.InitialRisk)
+		peak, p.EntryPrice, p.StopPrice, p.InitialRisk, boolInt(p.Manual))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return 0, fmt.Errorf("%w: %s", ErrDuplicateOpenPosition, p.Symbol)
@@ -343,17 +350,18 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 	for rows.Next() {
 		var p domain.Position
 		var entryTime, exitTime string
-		var isOpen, targetHit int
+		var isOpen, targetHit, manual int
 		if err := rows.Scan(&p.ID, &p.SessionDate, &p.Symbol, &p.Shares, &p.SharesOpen,
 			&p.EntryPrice, &entryTime, &p.PeakPrice, &p.LastPrice, &p.StopPrice,
 			&p.InitialRisk, &targetHit, &p.BankedDollars, &isOpen, &p.ExitPrice,
-			&exitTime, &p.ExitReason); err != nil {
+			&exitTime, &p.ExitReason, &manual); err != nil {
 			return nil, err
 		}
 		p.EntryTime = parseTime(entryTime)
 		p.ExitTime = parseTime(exitTime)
 		p.TargetHit = targetHit == 1
 		p.Open = isOpen == 1
+		p.Manual = manual == 1
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -361,7 +369,7 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 
 const positionColumns = `id, session_date, symbol, shares, shares_open, entry_price,
 	entry_time, peak_price, last_price, stop_price, initial_risk, target_hit,
-	banked_dollars, is_open, exit_price, exit_time, exit_reason`
+	banked_dollars, is_open, exit_price, exit_time, exit_reason, manual`
 
 // OpenPositions returns every currently-held position, regardless of session.
 func (s *Store) OpenPositions() ([]domain.Position, error) {
@@ -394,6 +402,32 @@ func (s *Store) PositionByID(id int64) (domain.Position, error) {
 		return domain.Position{}, fmt.Errorf("%w: %d", ErrPositionNotFound, id)
 	}
 	return positions[0], nil
+}
+
+// PositionsClosedBetween returns the positions closed at or after from and before to,
+// whatever session they were opened in. A manual position can be held overnight, so
+// "closed today" is no longer the same set as "opened today and closed".
+func (s *Store) PositionsClosedBetween(from, to time.Time) ([]domain.Position, error) {
+	// exit_time is RFC 3339 with trimmed nanoseconds, which does not sort exactly as
+	// text within one second; the SQL bound is a coarse prefilter and the exact
+	// comparison is done on parsed times.
+	rows, err := s.db.Query(`SELECT `+positionColumns+
+		` FROM positions WHERE is_open = 0 AND exit_time >= ? ORDER BY id`,
+		formatTime(from.Add(-time.Second)))
+	if err != nil {
+		return nil, fmt.Errorf("query closed positions: %w", err)
+	}
+	all, err := s.scanPositions(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := all[:0]
+	for _, p := range all {
+		if !p.ExitTime.Before(from) && p.ExitTime.Before(to) {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 // SessionPositions returns all positions opened on a date, open or closed.

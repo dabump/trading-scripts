@@ -317,6 +317,19 @@ func TestSymbolsTradedOn(t *testing.T) {
 // exists, so a migration has to work as an upgrade and not only on a fresh file.
 // 003 drops a column, which SQLite refuses outright in some conditions — a fresh-DB
 // test would pass while every real deployment failed to start.
+// legacyOrdersTable is the orders table as 001 created it, for the tests that seed an
+// old schema by hand: later migrations alter it, so a seed without it cannot migrate.
+const legacyOrdersTable = `CREATE TABLE orders (
+	client_order_id TEXT PRIMARY KEY,
+	session_date    TEXT NOT NULL,
+	symbol          TEXT NOT NULL,
+	side            TEXT NOT NULL,
+	shares          INTEGER NOT NULL,
+	submitted_at    TEXT NOT NULL,
+	status          TEXT NOT NULL,
+	broker_order_id TEXT NOT NULL DEFAULT ''
+)`
+
 func TestMigrationUpgradesAnExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 
@@ -344,6 +357,7 @@ func TestMigrationUpgradesAnExistingDatabase(t *testing.T) {
 			last_price   REAL NOT NULL DEFAULT 0
 		)`,
 		`CREATE UNIQUE INDEX positions_one_open_per_symbol ON positions (symbol) WHERE is_open = 1`,
+		legacyOrdersTable,
 		`INSERT INTO positions
 			(session_date, symbol, shares, entry_price, entry_time, peak_price,
 			 trail_armed, is_open, last_price)
@@ -519,6 +533,7 @@ func TestMigration004BackfillsExistingPositions(t *testing.T) {
 			last_price   REAL NOT NULL DEFAULT 0
 		)`,
 		`CREATE UNIQUE INDEX positions_one_open_per_symbol ON positions (symbol) WHERE is_open = 1`,
+		legacyOrdersTable,
 		`INSERT INTO positions (session_date, symbol, shares, entry_price, entry_time,
 			peak_price, is_open, last_price)
 		 VALUES ('2026-09-28', 'HELD', 300, 4.00, '2026-09-28T10:35:00Z', 4.50, 1, 4.40)`,
@@ -583,5 +598,55 @@ func TestMigration004BackfillsExistingPositions(t *testing.T) {
 		if p.SharesOpen != 0 {
 			t.Errorf("closed position shares open = %d, want 0", p.SharesOpen)
 		}
+	}
+}
+
+func TestRecordFillStoresWhatExecuted(t *testing.T) {
+	s := newStore(t)
+	if err := s.RecordOrder(OrderRecord{
+		ClientOrderID: "cid-1", SessionDate: "2026-09-29", Symbol: "SANG",
+		Side: "buy", Shares: 488, SubmittedAt: time.Now().UTC(), Status: "submitted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordFill("cid-1", "filled", "broker-1", 5.00, 488); err != nil {
+		t.Fatal(err)
+	}
+	status, price, shares, err := s.OrderFill("cid-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "filled" || price != 5.00 || shares != 488 {
+		t.Errorf("got %s %v x %d, want filled 5.00 x 488", status, price, shares)
+	}
+	if pending, _ := s.UnresolvedOrders(); len(pending) != 0 {
+		t.Errorf("a filled order is still unresolved: %+v", pending)
+	}
+}
+
+// A partly filled exit banks what sold and leaves the rest held, without latching
+// the target the way a scale-out does.
+func TestReduceSharesBanksAPartialExit(t *testing.T) {
+	s := newStore(t)
+	id, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-09-29", Symbol: "ABCD", Shares: 200,
+		EntryPrice: 4.00, EntryTime: time.Now().UTC(), StopPrice: 3.90, InitialRisk: 0.10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReduceShares(id, 150, 3.90); err != nil {
+		t.Fatal(err)
+	}
+	open, _ := s.OpenPositions()
+	got := open[0]
+	if got.SharesOpen != 50 || got.Shares != 200 || got.TargetHit {
+		t.Errorf("got %+v, want 50 of 200 still open and no target latched", got)
+	}
+	if want := -15.0; got.BankedDollars < want-0.01 || got.BankedDollars > want+0.01 {
+		t.Errorf("banked = %v, want %v (150 x -$0.10)", got.BankedDollars, want)
+	}
+	if err := s.ReduceShares(id, 50, 3.90); err == nil {
+		t.Error("reducing by everything held must be refused: that is a close")
 	}
 }

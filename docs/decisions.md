@@ -987,6 +987,50 @@ the year `off` was the best of the three and `after_target` the least harmful wa
 keep the rule. This is consistent with the earlier finding that this strategy's return
 lives in a thin right tail that trailing exits cut into.
 
+## 2026-09-30 — The first paper day: the trail read the entry candle, and fills were never read
+
+The first session with real paper orders (2026-09-29) opened 15 positions and closed
+14 on `STOP_LOSS`, with the stop apparently about 1% under entry. Two causes, both
+found by comparing the audit trail and the database on the server against Alpaca's
+own order history.
+
+**The candle trail trailed the candle the buy landed in.** `CandleTrailStop` counted
+the entry candle as "the first one held through". The backtest fills at a bar's open,
+where that is true; the daemon buys whenever its scan decides, part-way through a
+candle whose low was mostly printed *before* the fill. The stop went there within the
+first minute. 10 of the 11 trailed positions were sold by it — SANG twice, YMT and
+TURB with the stop set exactly at the recorded entry. The initial stops were not
+tight: 4% for the manual opens, 0.9–2.9% from the chart. **Change:** a candle counts
+only if it opened at or after the fill. For the backtest's default fill nothing
+changes, which also means its earlier `candle_trail` figures describe the corrected
+rule rather than what ran live; its buy-stop mode, which fills mid-bar, now skips the
+entry bar too.
+
+**Positions were recorded at the quote, not the fill.** `submit` saved Alpaca's
+acknowledgement (`pending_new` on all 30 orders) and never asked again, so every
+entry and exit price was what the daemon *read* when it decided. Against Alpaca's
+fills:
+
+```
+recorded P&L  -$541.80
+actual P&L    -$632.15   (all 30 orders filled in full)
+```
+
+The quote was wrong on 11 of 15 trades. The four "breakeven" trail exits were real
+losses (−$52.59 together): each buy filled a cent above the quote the breakeven stop
+was set at. NAUT at 12:20 ET planned $91 of risk and lost $154, because the stop is
+polled rather than resting and a fast drop goes through it. **Change:** `submit`
+waits up to 10s for the broker to report the order done, cancels any remainder, and
+returns what executed. Positions are recorded at the fill price and filled share
+count; the initial risk (and so the target) is re-measured from the fill; the
+`orders` table keeps the final status and fill (migration 005). Short fills are
+handled rather than assumed away — see [`architecture.md`](./architecture.md).
+
+**Not changed, and worth knowing when reading that day.** 11 of the 15 trades were
+manual pre-market opens that overrode the setup gate (the recorded reasons include
+"below VWAP" and "no pullback"). Only the four NAUT trades were the strategy's own
+entries, so the day says little about the strategy either way.
+
 ## Open items (not yet decided)
 
 - **(Superseded 2026-09-29: the micro pullback trades ~150 times a year and still measured no edge; see above.)** **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
@@ -995,7 +1039,7 @@ lives in a thin right tail that trailing exits cut into.
 - **Still no demonstrated edge, and still not a candidate for live capital.** t = −0.53. The risk profile is now defensible where it was not; the expectancy is not.
 - **Measure realised slippage in paper trading.** At 55 trades a year the slippage sensitivity is mild in absolute terms, but `execution.order_type` supports limit orders and the entry is now a defined price rather than "whatever the scan read", which makes a limit order far more usable than before.
 
-- **Measure realised slippage in paper trading, then decide on limit orders.** It is now the single largest unknown: the strategy is profitable at 0.10% per side and unprofitable at 0.50%. `execution.order_type` supports `limit` with `limit_slip_pct` already.
+- **Measure realised slippage in paper trading, then decide on limit orders.** (2026-09-30: now measurable — every trade's audit event carries the fill next to `quoted_price`.) It is now the single largest unknown: the strategy is profitable at 0.10% per side and unprofitable at 0.50%. `execution.order_type` supports `limit` with `limit_slip_pct` already.
 - **Still no demonstrated edge, and still not a candidate for live capital.** t = 1.20 is not significance. The survivorship bias in the universe and the optimistic stop fills both push the true figure down, not up.
 
 - **Recommended, in order of measured value, none applied:** (1) remove `exit.profit_target_pct` and `exit.trailing_stop_pct` entirely, leaving the hard stop and the forced EOD exit — moves t from −9.76 to +0.28; (2) cut `risk.position_size_pct` to 2–5%, which changes max drawdown from 79% to 23% at the same per-trade mean; (3) widen `risk.stop_loss_pct` toward 15–20%, or at least do not tighten it, since 5% is measurably worse than 10%; (4) invert or drop the relative-volume tie-break; (5) add a ceiling on the intraday move at entry, because gaps over +50% are the worst bucket measured.

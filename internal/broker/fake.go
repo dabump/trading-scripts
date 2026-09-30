@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -30,6 +31,13 @@ type Fake struct {
 	sessionVolume map[string]float64
 	err           error
 
+	// fillPrice and fillLimit make an order execute unlike the quote: at another
+	// price, or for fewer shares (0 = none), leaving the rest working until it is
+	// cancelled. orders is every order placed, for Order and CancelOrder.
+	fillPrice map[string]float64
+	fillLimit map[string]int
+	orders    map[string]OrderResult
+
 	// Call counters, so tests can assert the scan's cost profile: a full-market
 	// scan is only affordable if the expensive per-symbol calls stay rare.
 	assetCalls         int
@@ -49,7 +57,28 @@ func NewFake(acct domain.Account) *Fake {
 
 		sessionVolume:  map[string]float64{},
 		avgVolumeCalls: map[string]int{},
+
+		fillPrice: map[string]float64{},
+		fillLimit: map[string]int{},
+		orders:    map[string]OrderResult{},
 	}
+}
+
+// SetFillPrice makes orders in symbol execute at price rather than at the quote or
+// the limit, the way a real fill lands a cent or two away from the price the daemon
+// read.
+func (f *Fake) SetFillPrice(symbol string, price float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fillPrice[symbol] = price
+}
+
+// SetFillLimit caps how many shares of an order in symbol execute; 0 means none do.
+// The remainder stays working until CancelOrder, as a thin book leaves a limit order.
+func (f *Fake) SetFillLimit(symbol string, shares int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fillLimit[symbol] = shares
 }
 
 // SetError makes every subsequent call fail, for exercising error handling.
@@ -345,20 +374,29 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 	if req.Type == "limit" && req.LimitPrice > 0 {
 		price = req.LimitPrice
 	}
+	if p, ok := f.fillPrice[req.Symbol]; ok {
+		price = p
+	}
+	shares := req.Shares
+	if n, ok := f.fillLimit[req.Symbol]; ok && n < shares {
+		shares = n
+	}
 
 	switch req.Side {
 	case "buy":
-		f.acct.Cash -= price * float64(req.Shares)
+		f.acct.Cash -= price * float64(shares)
 		pos := f.positions[req.Symbol]
 		pos.Symbol = req.Symbol
-		pos.Shares += req.Shares
+		pos.Shares += shares
 		pos.AvgEntry = price
 		pos.CurrentPrice = price
-		f.positions[req.Symbol] = pos
+		if pos.Shares > 0 {
+			f.positions[req.Symbol] = pos
+		}
 	case "sell":
-		f.acct.Cash += price * float64(req.Shares)
+		f.acct.Cash += price * float64(shares)
 		pos := f.positions[req.Symbol]
-		pos.Shares -= req.Shares
+		pos.Shares -= shares
 		if pos.Shares <= 0 {
 			delete(f.positions, req.Symbol)
 		} else {
@@ -366,12 +404,52 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 		}
 	}
 
-	return OrderResult{
+	res := OrderResult{
 		BrokerOrderID: "fake-" + req.ClientOrderID,
 		Status:        "filled",
-		FilledPrice:   price,
-		FilledShares:  req.Shares,
-	}, nil
+		FilledShares:  shares,
+	}
+	switch {
+	case shares == 0:
+		res.Status = "new"
+	case shares < req.Shares:
+		res.Status = "partially_filled"
+	}
+	if shares > 0 {
+		res.FilledPrice = price
+	}
+	f.orders[res.BrokerOrderID] = res
+	return res, nil
+}
+
+func (f *Fake) Order(_ context.Context, brokerOrderID string) (OrderResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return OrderResult{}, f.err
+	}
+	res, ok := f.orders[brokerOrderID]
+	if !ok {
+		return OrderResult{}, fmt.Errorf("order %s not found", brokerOrderID)
+	}
+	return res, nil
+}
+
+func (f *Fake) CancelOrder(_ context.Context, brokerOrderID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	res, ok := f.orders[brokerOrderID]
+	if !ok {
+		return fmt.Errorf("order %s not found", brokerOrderID)
+	}
+	if !res.Done() {
+		res.Status = "canceled"
+		f.orders[brokerOrderID] = res
+	}
+	return nil
 }
 
 func (f *Fake) Positions(context.Context) ([]BrokerPosition, error) {

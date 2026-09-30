@@ -190,6 +190,10 @@ func (e *Engine) ScreenNow(ctx context.Context) (domain.ScreenPreview, error) {
 // the trading loop exited it, or the button was pressed twice.
 var ErrPositionNotOpen = errors.New("that position is no longer open")
 
+// ErrNotFilled means the broker executed less of a manual order than was asked for
+// within the fill wait, and the remainder was cancelled.
+var ErrNotFilled = errors.New("the order did not fill")
+
 // ErrExchangeClosed means there is no session to sell into right now.
 var ErrExchangeClosed = errors.New(
 	"the exchange is closed, so a sell cannot be filled now — the order would sit until the next open " +
@@ -254,9 +258,19 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 		price = pos.EntryPrice
 	}
 
-	if err := e.submit(ctx, sess, pos.Symbol, "sell", pos.SharesOpen, price, extendedHours); err != nil {
+	quoted := price
+	f, err := e.submit(ctx, sess, pos.Symbol, "sell", pos.SharesOpen, quoted, extendedHours)
+	if err != nil {
 		return domain.Position{}, err
 	}
+	if short, err := e.shortExit(pos, f, quoted, domain.ExitManual); short || err != nil {
+		if err != nil {
+			return domain.Position{}, err
+		}
+		return domain.Position{}, fmt.Errorf("%w: sold %d of %d shares, and the rest is still held",
+			ErrNotFilled, f.Shares, pos.SharesOpen)
+	}
+	price = f.Price
 	if err := e.store.ClosePosition(pos.ID, price, now, domain.ExitManual); err != nil {
 		return domain.Position{}, err
 	}
@@ -266,7 +280,7 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 		"price", price, "pnl", fmt.Sprintf("%+.2f", pnl))
 	e.record(audit.PositionClosed, pos.Symbol,
 		fmt.Sprintf("closed by hand from the status page: sold %d shares at $%.2f", pos.SharesOpen, price),
-		map[string]any{
+		fillDetail(map[string]any{
 			"reason":         string(domain.ExitManual),
 			"shares_sold":    pos.SharesOpen,
 			"shares_bought":  pos.Shares,
@@ -278,7 +292,7 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 			"r_multiple":     pos.RMultiple(price),
 			"held_for":       now.Sub(pos.EntryTime).String(),
 			"pre_market":     extendedHours,
-		})
+		}, f, quoted, pos.SharesOpen))
 
 	// The closed row, for the confirmation the page shows.
 	closed, err := e.store.PositionByID(pos.ID)
@@ -406,39 +420,52 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 		res.Halted = rec.Halted
 	}
 
-	if err := e.submit(ctx, sess, symbol, "buy", sizing.Shares, res.Entry, extendedHours); err != nil {
+	quoted := res.Entry
+	f, err := e.submit(ctx, sess, symbol, "buy", sizing.Shares, quoted, extendedHours)
+	if err != nil {
 		return domain.ManualOpen{}, err
 	}
+	if f.Shares == 0 {
+		return domain.ManualOpen{}, fmt.Errorf("%w: nothing was bought, and the order was cancelled", ErrNotFilled)
+	}
+	// What was bought, at the price it was bought at; the stop stays where it was set,
+	// so the risk is re-measured from the fill as the automated entry does.
+	res.Entry, res.Shares = f.Price, f.Shares
+	riskPerShare := res.Entry - res.Stop
+	if riskPerShare <= 0 {
+		riskPerShare = quoted - res.Stop
+	}
+	res.RiskDollar = riskPerShare * float64(res.Shares)
 	id, err := e.store.InsertPosition(domain.Position{
-		SessionDate: sess.Date, Symbol: symbol, Shares: sizing.Shares,
+		SessionDate: sess.Date, Symbol: symbol, Shares: res.Shares,
 		EntryPrice: res.Entry, EntryTime: now, PeakPrice: res.Entry,
-		StopPrice: res.Stop, InitialRisk: res.Entry - res.Stop,
+		StopPrice: res.Stop, InitialRisk: riskPerShare,
 	})
 	if err != nil {
 		return domain.ManualOpen{}, err
 	}
 
-	e.log.Info("position opened by hand", "symbol", symbol, "shares", sizing.Shares,
-		"price", res.Entry, "stop", res.Stop, "from_setup", res.FromSetup,
-		"risk", sizing.RiskDollar, "halted", res.Halted)
+	e.log.Info("position opened by hand", "symbol", symbol, "shares", res.Shares,
+		"price", res.Entry, "quoted", quoted, "stop", res.Stop, "from_setup", res.FromSetup,
+		"risk", res.RiskDollar, "halted", res.Halted)
 	e.record(audit.PositionOpened, symbol,
 		fmt.Sprintf("opened by hand from the status page: bought %d shares at $%.2f",
-			sizing.Shares, res.Entry),
-		map[string]any{
+			res.Shares, res.Entry),
+		fillDetail(map[string]any{
 			"manual":             true,
-			"shares":             sizing.Shares,
+			"shares":             res.Shares,
 			"price":              res.Entry,
-			"dollars":            sizing.Dollars,
+			"dollars":            res.Entry * float64(res.Shares),
 			"stop_price":         res.Stop,
 			"stop_from_setup":    res.FromSetup,
 			"setup_reason":       res.SetupReason,
-			"risk_dollars":       sizing.RiskDollar,
+			"risk_dollars":       res.RiskDollar,
 			"risk_per_trade_pct": e.cfg.Risk.RiskPerTradePct,
 			"portfolio_value":    acct.PortfolioValue,
 			"cash_before":        acct.Cash,
 			"overrode_halt":      res.Halted,
 			"pre_market":         extendedHours,
-		})
+		}, f, quoted, sizing.Shares))
 
 	stored, err := e.store.PositionByID(id)
 	if err != nil {

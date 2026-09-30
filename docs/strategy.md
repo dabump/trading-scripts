@@ -242,9 +242,18 @@ below the previous candle's low. It raises the stop to the low of each
 `STOP_LOSS`; the close event's `initial_stop` shows how far the trail had raised it.
 It never lowers a stop.
 
-- `always` (the current setting, and the discretionary version) trails from the entry
-  candle on. A trade that makes a new low before it pays is abandoned rather than held
-  to the pause-low stop. After the target, it trails what is left.
+- `always` (the current setting, and the discretionary version) trails from the first
+  candle held whole. A trade that makes a new low before it pays is abandoned rather
+  than held to the pause-low stop. After the target, it trails what is left.
+
+**The candle the buy landed in does not count.** A live order fills part-way through
+a candle, so that candle's low is usually a price printed *before* the fill — a
+fraction under the entry, and on a thin pre-market book sometimes the fill price
+itself. Trailing to it moved the stop to within about 1% of entry inside the first
+minute: on 2026-09-29 it stopped out 10 of 11 trailed positions, four of them at a
+"breakeven" that lost money once the spread was paid. The chart stop covers the entry
+candle. The backtest already worked this way for its default fill at a bar's open,
+which holds the whole bar; its buy-stop variant now skips the entry bar too.
 - `after_target` trails only what is left after the first target.
 - `off` holds what is left to the breakeven stop or the bell.
 

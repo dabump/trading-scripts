@@ -119,8 +119,16 @@ func EvaluateExit(in ExitInput, cfg *config.Config) ExitDecision {
 // CandleTrailStop is the stop the candle trail (exit.candle_trail) puts under a
 // position once last has completed: that candle's low, so the next candle to trade
 // below it sells what is held. It returns 0 when the trail does not apply — switched
-// off, waiting for the first target, or a candle that closed before the position was
-// opened.
+// off, waiting for the first target, or a candle that opened before the position was
+// filled.
+//
+// That last case includes the candle the buy landed in. A live order fills part-way
+// through a candle, so its low is usually a price printed *before* the fill, a
+// fraction under the entry — and on a thin pre-market book it can be the fill price
+// itself. Trailing to it put the stop at or within a cent of entry within the first
+// minute, and on 2026-09-29 that stopped out 10 of 11 trailed positions, four at
+// "breakeven" that was a loss after the spread. A candle counts only if the whole of
+// it was held; the chart stop covers the entry candle.
 //
 // Callers only ever raise the stop to this, never lower it, which is what makes it a
 // trail: a lower low after a higher one does not give ground back.
@@ -134,8 +142,7 @@ func CandleTrailStop(p domain.Position, last domain.Bar, cfg *config.Config) flo
 	default:
 		return 0
 	}
-	// The candle the entry was made in counts: it is the first one held through.
-	if last.Time.Before(p.EntryTime.Truncate(cfg.Entry.PatternInterval)) || last.Low <= 0 {
+	if last.Time.Before(p.EntryTime) || last.Low <= 0 {
 		return 0
 	}
 	return last.Low

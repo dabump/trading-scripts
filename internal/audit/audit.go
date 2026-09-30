@@ -32,8 +32,12 @@ const (
 	PositionScaledOut Kind = "POSITION_SCALED_OUT"
 	PositionClosed    Kind = "POSITION_CLOSED"
 	EntrySkipped      Kind = "ENTRY_SKIPPED"
-	Reconciled        Kind = "RECONCILED"
-	Fault             Kind = "FAULT"
+	// OrderNotFilled is an exit order that sold nothing or only part of what it
+	// asked for within the fill wait. Whatever did not sell is still held, and the
+	// exit rule is tried again on the next tick.
+	OrderNotFilled Kind = "ORDER_NOT_FILLED"
+	Reconciled     Kind = "RECONCILED"
+	Fault          Kind = "FAULT"
 )
 
 // Event is one audited decision or action.

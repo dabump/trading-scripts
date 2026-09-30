@@ -611,22 +611,45 @@ func (a *Alpaca) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult,
 		return OrderResult{}, err
 	}
 
-	var resp struct {
-		ID          string `json:"id"`
-		Status      string `json:"status"`
-		FilledQty   string `json:"filled_qty"`
-		FilledPrice string `json:"filled_avg_price"`
-	}
+	var resp alpacaOrder
 	if err := a.do(ctx, http.MethodPost, a.baseURL+"/v2/orders",
 		strings.NewReader(string(body)), &resp); err != nil {
 		return OrderResult{}, err
 	}
+	return resp.result(), nil
+}
+
+func (a *Alpaca) Order(ctx context.Context, brokerOrderID string) (OrderResult, error) {
+	var resp alpacaOrder
+	if err := a.do(ctx, http.MethodGet,
+		a.baseURL+"/v2/orders/"+url.PathEscape(brokerOrderID), nil, &resp); err != nil {
+		return OrderResult{}, err
+	}
+	return resp.result(), nil
+}
+
+func (a *Alpaca) CancelOrder(ctx context.Context, brokerOrderID string) error {
+	return a.do(ctx, http.MethodDelete,
+		a.baseURL+"/v2/orders/"+url.PathEscape(brokerOrderID), nil, nil)
+}
+
+// alpacaOrder is the order object the trading API returns from both placing and
+// looking up an order. filled_avg_price is null until something fills, which leaves
+// the string empty and parses to 0.
+type alpacaOrder struct {
+	ID          string `json:"id"`
+	Status      string `json:"status"`
+	FilledQty   string `json:"filled_qty"`
+	FilledPrice string `json:"filled_avg_price"`
+}
+
+func (o alpacaOrder) result() OrderResult {
 	return OrderResult{
-		BrokerOrderID: resp.ID,
-		Status:        resp.Status,
-		FilledPrice:   parseFloat(resp.FilledPrice),
-		FilledShares:  int(parseFloat(resp.FilledQty)),
-	}, nil
+		BrokerOrderID: o.ID,
+		Status:        o.Status,
+		FilledPrice:   parseFloat(o.FilledPrice),
+		FilledShares:  int(parseFloat(o.FilledQty)),
+	}
 }
 
 func (a *Alpaca) Positions(ctx context.Context) ([]BrokerPosition, error) {

@@ -34,12 +34,24 @@ type OrderRequest struct {
 	ExtendedHours bool
 }
 
-// OrderResult is the broker's acknowledgement.
+// OrderResult is what the broker reports about an order: its acknowledgement when
+// placed, and its current state when looked up afterwards.
 type OrderResult struct {
 	BrokerOrderID string
 	Status        string
 	FilledPrice   float64
 	FilledShares  int
+}
+
+// Done reports whether the order can no longer fill. A placed order is usually not
+// done yet — Alpaca acknowledges with pending_new, even for a market order that fills
+// a second later — which is why the acknowledgement's price cannot be the fill.
+func (r OrderResult) Done() bool {
+	switch r.Status {
+	case "filled", "canceled", "expired", "rejected", "done_for_day":
+		return true
+	}
+	return false
 }
 
 // BrokerPosition is a holding as the broker sees it, used to reconcile against
@@ -99,5 +111,10 @@ type Trading interface {
 	// when trading resumes.
 	NextSession(ctx context.Context, afterDate string) (CalendarDay, error)
 	PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error)
+	// Order looks up a placed order's current state, which is where the fill is.
+	Order(ctx context.Context, brokerOrderID string) (OrderResult, error)
+	// CancelOrder withdraws whatever of an order has not filled. It does not report
+	// the outcome; look the order up afterwards for what executed before it landed.
+	CancelOrder(ctx context.Context, brokerOrderID string) error
 	Positions(ctx context.Context) ([]BrokerPosition, error)
 }

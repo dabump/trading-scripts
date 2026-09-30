@@ -530,7 +530,12 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 				rest := entryBar
 				rest.O = px
 				apply(q.Symbol, open[q.Symbol], checkExit(open[q.Symbol], rest, false, cfg), t)
-				trail(q.Symbol, entryBar)
+				// Only a fill at the open held the whole entry bar. A buy-stop filled
+				// part-way through it, so the bar's low may have printed before the
+				// fill — the same reason the daemon does not trail a live entry candle.
+				if px == entryBar.O {
+					trail(q.Symbol, entryBar)
+				}
 			}
 		}
 

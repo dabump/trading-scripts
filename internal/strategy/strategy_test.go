@@ -290,8 +290,11 @@ func TestCandleTrailStop(t *testing.T) {
 		bar  domain.Bar
 		want float64
 	}{
-		{"always trails from the entry candle", config.CandleTrailAlways, pos, candle(35, 4.97), 4.97},
+		{"always trails from the first whole candle held", config.CandleTrailAlways, pos, candle(36, 4.97), 4.97},
+		{"the candle the fill landed in is not held through", config.CandleTrailAlways, pos, candle(35, 4.99), 0},
 		{"a candle closed before entry is not held through", config.CandleTrailAlways, pos, candle(34, 4.90), 0},
+		{"a fill at a candle's open holds all of it", config.CandleTrailAlways,
+			domain.Position{EntryTime: time.Date(2026, 9, 28, 10, 35, 0, 0, time.UTC)}, candle(35, 4.97), 4.97},
 		{"after_target waits for the target", config.CandleTrailAfterTarget, pos, candle(36, 5.02), 0},
 		{"after_target trails the runner", config.CandleTrailAfterTarget, scaled, candle(36, 5.02), 5.02},
 		{"off never trails", config.CandleTrailOff, scaled, candle(36, 5.02), 0},

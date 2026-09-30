@@ -68,6 +68,21 @@ Pre-market occupies time that was previously `PhaseClosed`, and only that time: 
 
 On startup, before the loop begins, `engine.Reconcile` compares the broker's positions against the store: anything the broker holds that the store does not know about is adopted, anything the store thinks is open that the broker does not hold is closed as `RECONCILED`, and orders recorded as submitted but never confirmed are resolved. This is what closes the crash-between-submit-and-confirm hole.
 
+**Positions are recorded from fills, not quotes.** `engine.submit` places the order,
+then polls `broker.Order` until the broker reports it done, for up to ten seconds
+(paper fills took up to five). Whatever is still working then is cancelled, and the
+caller gets what actually executed: the entry, exit and scale-out prices are the
+broker's average fill, and the share counts are what filled. That can be less than
+was asked for, and every caller handles it — a buy that filled nothing is not a
+position, and an exit that sold short banks what sold and leaves the rest open for the
+still-breached rule to sell on the next tick (`store.ReduceShares`, audited as
+`ORDER_NOT_FILLED`). If the broker never says how an order ended, the old assumption
+applies — filled in full at the quote — and the order is stored as `unconfirmed` for
+`Reconcile`. The `orders` table keeps the final status, `filled_price` and
+`filled_shares`; before this it kept Alpaca's `pending_new` acknowledgement forever,
+and on 2026-09-29 the quoted prices put the day at −$541.80 when the fills said
+−$632.15.
+
 ## Why this shape
 
 - **One daemon, not cron-triggered scripts**: the gate's polling and continuous position monitoring need persistent in-process state (or at minimum a tight polling loop) rather than being cleanly split into independently-scheduled invocations.

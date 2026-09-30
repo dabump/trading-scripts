@@ -304,6 +304,27 @@ func (s *Store) ClosePosition(id int64, exitPrice float64, exitTime time.Time, r
 	return nil
 }
 
+// ReduceShares records an exit that only partly filled: the shares that sold leave
+// the position with their profit or loss banked, and the rest stays open for the
+// exit rule to sell on the next tick. Unlike ScaleOut it latches nothing, because no
+// target was reached.
+func (s *Store) ReduceShares(id int64, shares int, price float64) error {
+	res, err := s.db.Exec(
+		`UPDATE positions
+		 SET shares_open    = shares_open - ?,
+		     banked_dollars = banked_dollars + (? - entry_price) * ?,
+		     last_price     = ?
+		 WHERE id = ? AND is_open = 1 AND shares_open > ?`,
+		shares, price, shares, price, id, shares)
+	if err != nil {
+		return fmt.Errorf("reduce shares: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("reduce shares: position %d is not open with more than %d shares", id, shares)
+	}
+	return nil
+}
+
 // MoveStop raises a position's working stop. It never lowers one: a stop that could
 // move down would let a losing position keep giving ground.
 func (s *Store) MoveStop(id int64, stop float64) error {
@@ -463,12 +484,38 @@ func (s *Store) UpdateOrderStatus(clientOrderID, status, brokerOrderID string) e
 	return nil
 }
 
+// RecordFill stores the outcome the broker reported for an order: its final status
+// and what actually executed.
+func (s *Store) RecordFill(clientOrderID, status, brokerOrderID string, price float64, shares int) error {
+	_, err := s.db.Exec(
+		`UPDATE orders SET status = ?, broker_order_id = ?, filled_price = ?, filled_shares = ?
+		 WHERE client_order_id = ?`,
+		status, brokerOrderID, price, shares, clientOrderID)
+	if err != nil {
+		return fmt.Errorf("record fill: %w", err)
+	}
+	return nil
+}
+
+// OrderFill returns what RecordFill stored for an order.
+func (s *Store) OrderFill(clientOrderID string) (status string, price float64, shares int, err error) {
+	err = s.db.QueryRow(
+		`SELECT status, filled_price, filled_shares FROM orders WHERE client_order_id = ?`,
+		clientOrderID).Scan(&status, &price, &shares)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("order fill: %w", err)
+	}
+	return status, price, shares, nil
+}
+
 // UnresolvedOrders returns orders that were recorded but never confirmed, which
-// is what restart reconciliation has to investigate.
+// is what restart reconciliation has to investigate: 'submitted' never reached the
+// broker's acknowledgement, and 'unconfirmed' was acknowledged but its fill was never
+// learned.
 func (s *Store) UnresolvedOrders() ([]OrderRecord, error) {
 	rows, err := s.db.Query(
 		`SELECT client_order_id, session_date, symbol, side, shares, submitted_at, status, broker_order_id
-		 FROM orders WHERE status = 'submitted' ORDER BY submitted_at`)
+		 FROM orders WHERE status IN ('submitted', 'unconfirmed') ORDER BY submitted_at`)
 	if err != nil {
 		return nil, fmt.Errorf("query unresolved orders: %w", err)
 	}

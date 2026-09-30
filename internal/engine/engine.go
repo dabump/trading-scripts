@@ -79,7 +79,21 @@ type Engine struct {
 	// per position, so the bar request is made once per candle rather than on every
 	// position poll. Only managePositions touches it, and only from Tick.
 	trailedTo map[int64]time.Time
+
+	// fillWait bounds how long submit waits for an order to finish filling before
+	// cancelling what is left, and fillPoll is how often it asks in the meantime.
+	// Fields rather than config because they describe the broker, not the strategy;
+	// tests shorten them.
+	fillWait time.Duration
+	fillPoll time.Duration
 }
+
+// Paper fills on 2026-09-29 took up to five seconds from submission, market orders
+// included, so the wait is twice that.
+const (
+	defaultFillWait = 10 * time.Second
+	defaultFillPoll = 250 * time.Millisecond
+)
 
 func New(d Deps) *Engine {
 	now := d.Now
@@ -98,6 +112,7 @@ func New(d Deps) *Engine {
 		cfg: d.Config, store: d.Store, data: d.Data, trading: d.Trading,
 		log: logger, audit: recorder, now: now, state: domain.StateMarketClosed,
 		auditedSkips: map[string]string{},
+		fillWait:     defaultFillWait, fillPoll: defaultFillPoll,
 	}
 }
 
@@ -1022,7 +1037,8 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			continue
 		}
 
-		if err := e.submit(ctx, sess, cand.Symbol, "buy", sizing.Shares, price, p.extendedHours); err != nil {
+		f, err := e.submit(ctx, sess, cand.Symbol, "buy", sizing.Shares, price, p.extendedHours)
+		if err != nil {
 			e.log.Warn("skipping candidate: order rejected", "symbol", cand.Symbol, "err", err)
 			outcomes[cand.Symbol] = "order rejected"
 			e.recordSkip(cand.Symbol, "order rejected",
@@ -1030,10 +1046,28 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 					"price": price, "error": err.Error()})
 			continue
 		}
+		if f.Shares == 0 {
+			// Nothing bought, and the remainder is cancelled: not a position.
+			e.log.Warn("skipping candidate: order did not fill", "symbol", cand.Symbol,
+				"status", f.Status)
+			outcomes[cand.Symbol] = "order did not fill"
+			e.recordSkip(cand.Symbol, "order did not fill",
+				map[string]any{"reason": "order did not fill", "shares": sizing.Shares,
+					"price": price, "status": f.Status})
+			continue
+		}
+		// The risk is measured from the fill, not the quote: that is the risk actually
+		// taken on, and the target is a multiple of it. A fill at or under the stop has
+		// no risk to measure; the stop sells it on the next tick either way.
+		entry := f.Price
+		riskPerShare := entry - setup.Stop
+		if riskPerShare <= 0 {
+			riskPerShare = setup.RiskPerShare
+		}
 		if _, err := e.store.InsertPosition(domain.Position{
-			SessionDate: sess.Date, Symbol: cand.Symbol, Shares: sizing.Shares,
-			EntryPrice: price, EntryTime: e.now(), PeakPrice: price,
-			StopPrice: setup.Stop, InitialRisk: setup.RiskPerShare,
+			SessionDate: sess.Date, Symbol: cand.Symbol, Shares: f.Shares,
+			EntryPrice: entry, EntryTime: e.now(), PeakPrice: entry,
+			StopPrice: setup.Stop, InitialRisk: riskPerShare,
 		}); err != nil {
 			if errors.Is(err, store.ErrDuplicateOpenPosition) {
 				e.log.Warn("duplicate position rejected by store", "symbol", cand.Symbol)
@@ -1043,32 +1077,32 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			return outcomes, err
 		}
 
-		e.log.Info("entered position", "symbol", cand.Symbol, "shares", sizing.Shares,
-			"price", price, "stop", setup.Stop, "risk", sizing.RiskDollar,
-			"rel_volume", cand.VolumeMultiple)
+		e.log.Info("entered position", "symbol", cand.Symbol, "shares", f.Shares,
+			"price", entry, "quoted", price, "stop", setup.Stop,
+			"risk", riskPerShare*float64(f.Shares), "rel_volume", cand.VolumeMultiple)
 		outcomes[cand.Symbol] = fmt.Sprintf("bought %d @ $%.2f, stop $%.2f",
-			sizing.Shares, price, setup.Stop)
+			f.Shares, entry, setup.Stop)
 		// Everything needed to reconstruct the decision later: the criteria that were
 		// met, the size and why it was that size, and the account state behind it.
 		e.record(audit.PositionOpened, cand.Symbol,
-			fmt.Sprintf("bought %d shares at $%.2f", sizing.Shares, price),
-			map[string]any{
-				"shares":               sizing.Shares,
-				"price":                price,
-				"dollars":              sizing.Dollars,
+			fmt.Sprintf("bought %d shares at $%.2f", f.Shares, entry),
+			fillDetail(map[string]any{
+				"shares":               f.Shares,
+				"price":                entry,
+				"dollars":              entry * float64(f.Shares),
 				"relative_volume":      cand.VolumeMultiple,
 				"criteria":             criteriaDetail(cand),
 				"portfolio_value":      acct.PortfolioValue,
 				"cash_before":          acct.Cash,
 				"risk_per_trade_pct":   e.cfg.Risk.RiskPerTradePct,
-				"risk_dollars":         sizing.RiskDollar,
+				"risk_dollars":         riskPerShare * float64(f.Shares),
 				"stop_price":           setup.Stop,
-				"stop_distance_pct":    setup.StopDistancePct,
+				"stop_distance_pct":    riskPerShare / entry * 100,
 				"setup_pause_high":     setup.PauseHigh,
 				"setup_pause_bars":     setup.PauseBars,
 				"open_positions_after": openCount + 1,
 				"pre_market":           p.preMarket,
-			})
+			}, f, price, sizing.Shares))
 		openSymbols[cand.Symbol] = true
 		tradedToday[cand.Symbol] = true
 		openCount++
@@ -1138,13 +1172,21 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			continue
 		}
 
-		exitPrice := price
-		if exitPrice <= 0 {
-			exitPrice = p.EntryPrice
+		quoted := price
+		if quoted <= 0 {
+			quoted = p.EntryPrice
 		}
-		if err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, exitPrice, extendedHours); err != nil {
+		f, err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, quoted, extendedHours)
+		if err != nil {
 			return err
 		}
+		if short, err := e.shortExit(p, f, quoted, decision.Reason); short || err != nil {
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		exitPrice := f.Price
 		if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), decision.Reason); err != nil {
 			return err
 		}
@@ -1158,7 +1200,7 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			fmt.Sprintf("sold %d shares at $%.2f (%s), %+.2f%% on the trade",
 				p.SharesOpen, exitPrice, decision.Reason,
 				pnl/(p.EntryPrice*float64(p.Shares))*100),
-			map[string]any{
+			fillDetail(map[string]any{
 				"reason":         string(decision.Reason),
 				"shares_sold":    p.SharesOpen,
 				"shares_bought":  p.Shares,
@@ -1172,9 +1214,37 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 				"pnl_dollars":    pnl,
 				"r_multiple":     p.RMultiple(exitPrice),
 				"held_for":       e.now().Sub(p.EntryTime).String(),
-			})
+			}, f, quoted, p.SharesOpen))
 	}
 	return nil
+}
+
+// shortExit handles an exit order that sold less than the position held, and reports
+// whether it did. What sold is banked and the rest stays open, so the exit rule — still
+// true on the next tick — sells it then. Closing the whole row on a short fill is how
+// the store came to think a position was flat while the broker still held it.
+func (e *Engine) shortExit(p domain.Position, f fill, quoted float64, reason domain.ExitReason) (bool, error) {
+	if f.Shares >= p.SharesOpen {
+		return false, nil
+	}
+	if f.Shares > 0 {
+		if err := e.store.ReduceShares(p.ID, f.Shares, f.Price); err != nil {
+			return true, err
+		}
+	}
+	left := p.SharesOpen - f.Shares
+	e.log.Warn("exit order filled short; the rest stays held", "symbol", p.Symbol,
+		"reason", reason, "sold", f.Shares, "held", left, "status", f.Status)
+	e.record(audit.OrderNotFilled, p.Symbol,
+		fmt.Sprintf("%s exit sold %d of %d shares; %d still held", reason, f.Shares, p.SharesOpen, left),
+		fillDetail(map[string]any{
+			"reason":      string(reason),
+			"shares_sold": f.Shares,
+			"shares_left": left,
+			"fill_price":  f.Price,
+			"entry_price": p.EntryPrice,
+		}, f, quoted, p.SharesOpen))
+	return true, nil
 }
 
 // trailStop applies the candle trail (exit.candle_trail) to p and returns the stop to
@@ -1240,13 +1310,22 @@ func (e *Engine) trailStop(ctx context.Context, p domain.Position) float64 {
 func (e *Engine) scaleOut(ctx context.Context, sess scheduler.Session, p domain.Position,
 	price float64, decision strategy.ExitDecision, extendedHours bool) error {
 
-	if err := e.submit(ctx, sess, p.Symbol, "sell", decision.ScaleShares, price, extendedHours); err != nil {
+	quoted := price
+	f, err := e.submit(ctx, sess, p.Symbol, "sell", decision.ScaleShares, quoted, extendedHours)
+	if err != nil {
 		// One symbol failing to scale must not abort the pass over the others; the
 		// position simply stays whole and the target is re-tested next tick.
 		e.log.Warn("scale-out order rejected", "symbol", p.Symbol, "err", err)
 		return nil
 	}
-	if err := e.store.ScaleOut(p.ID, decision.ScaleShares, price, decision.NewStop); err != nil {
+	if f.Shares == 0 {
+		e.log.Warn("scale-out order did not fill", "symbol", p.Symbol, "status", f.Status)
+		return nil
+	}
+	// A short fill banks what sold and still latches the target: the runner is
+	// larger than planned, which is the side of the error this strategy prefers.
+	price = f.Price
+	if err := e.store.ScaleOut(p.ID, f.Shares, price, decision.NewStop); err != nil {
 		if errors.Is(err, store.ErrScaleOutNotApplicable) {
 			e.log.Warn("scale-out already recorded", "symbol", p.Symbol)
 			return nil
@@ -1254,17 +1333,17 @@ func (e *Engine) scaleOut(ctx context.Context, sess scheduler.Session, p domain.
 		return err
 	}
 
-	banked := (price - p.EntryPrice) * float64(decision.ScaleShares)
-	remaining := p.SharesOpen - decision.ScaleShares
-	e.log.Info("scaled out", "symbol", p.Symbol, "shares", decision.ScaleShares,
+	banked := (price - p.EntryPrice) * float64(f.Shares)
+	remaining := p.SharesOpen - f.Shares
+	e.log.Info("scaled out", "symbol", p.Symbol, "shares", f.Shares,
 		"price", price, "remaining", remaining, "banked", fmt.Sprintf("%+.2f", banked),
 		"r", fmt.Sprintf("%.2f", p.RMultiple(price)))
 	e.record(audit.PositionScaledOut, p.Symbol,
 		fmt.Sprintf("sold %d of %d shares at $%.2f (%.1fR), %d left running",
-			decision.ScaleShares, p.SharesOpen, price, p.RMultiple(price), remaining),
-		map[string]any{
+			f.Shares, p.SharesOpen, price, p.RMultiple(price), remaining),
+		fillDetail(map[string]any{
 			"reason":          string(domain.ExitScaleOut),
-			"shares_sold":     decision.ScaleShares,
+			"shares_sold":     f.Shares,
 			"shares_left":     remaining,
 			"price":           price,
 			"entry_price":     p.EntryPrice,
@@ -1272,13 +1351,35 @@ func (e *Engine) scaleOut(ctx context.Context, sess scheduler.Session, p domain.
 			"r_multiple":      p.RMultiple(price),
 			"stop_moved_to":   decision.NewStop,
 			"initial_risk_ps": p.InitialRisk,
-		})
+		}, f, quoted, decision.ScaleShares))
 	return nil
 }
 
+// fill is what an order actually executed, as the broker reported it after the fact.
+// Positions are recorded from this, not from the price the daemon read when it decided
+// to trade: on 2026-09-29 those differed on 11 of 15 trades, and the quoted prices put
+// the day $90 better than it was.
+type fill struct {
+	Price  float64
+	Shares int
+	Status string
+	// Confirmed is false when the broker never said how the order ended — lookups
+	// failing, or shutdown interrupting the wait. Price and Shares are then the
+	// quote and the full order, which is what the daemon assumed before it read
+	// fills at all; the order is left for Reconcile, and the audit says so.
+	Confirmed bool
+}
+
 // submit records an order's intent before sending it, so a crash between the two
-// leaves something for Reconcile to find.
-func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, side string, shares int, price float64, extendedHours bool) error {
+// leaves something for Reconcile to find, then waits for the broker to report what
+// executed.
+//
+// An order still working after fillWait has its remainder cancelled rather than left
+// on the book: a pre-market limit that has not filled in ten seconds has been passed
+// by, and a remainder filling later would hold shares the store does not know about.
+// The result can therefore be a partial fill or none at all, and every caller has to
+// handle both.
+func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, side string, shares int, price float64, extendedHours bool) (fill, error) {
 	clientOrderID := fmt.Sprintf("%s-%s-%s-%d", sess.Date, symbol, side, e.now().UnixNano())
 
 	rec := store.OrderRecord{
@@ -1286,7 +1387,7 @@ func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, sid
 		Side: side, Shares: shares, SubmittedAt: e.now(), Status: "submitted",
 	}
 	if err := e.store.RecordOrder(rec); err != nil {
-		return err
+		return fill{}, err
 	}
 
 	orderType, slipPct := e.cfg.Execution.OrderType, e.cfg.Execution.LimitSlipPct
@@ -1320,7 +1421,88 @@ func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, sid
 		if updateErr := e.store.UpdateOrderStatus(clientOrderID, "failed", ""); updateErr != nil {
 			e.log.Error("failed to record order failure", "err", updateErr)
 		}
-		return fmt.Errorf("place %s order for %s: %w", side, symbol, err)
+		return fill{}, fmt.Errorf("place %s order for %s: %w", side, symbol, err)
 	}
-	return e.store.UpdateOrderStatus(clientOrderID, res.Status, res.BrokerOrderID)
+	if err := e.store.UpdateOrderStatus(clientOrderID, res.Status, res.BrokerOrderID); err != nil {
+		return fill{}, err
+	}
+
+	res, confirmed := e.awaitFill(ctx, res)
+	status := res.Status
+	f := fill{Price: res.FilledPrice, Shares: res.FilledShares, Status: res.Status, Confirmed: confirmed}
+	if !confirmed {
+		e.log.Warn("order outcome unknown; assuming it filled as sent", "symbol", symbol,
+			"side", side, "shares", shares, "last_status", res.Status)
+		f.Price, f.Shares = price, shares
+		// Not 'submitted': the broker did acknowledge it. Reconcile picks both up.
+		status = "unconfirmed"
+	}
+	if f.Shares > 0 && f.Price <= 0 {
+		f.Price = price
+	}
+	if err := e.store.RecordFill(clientOrderID, status, res.BrokerOrderID,
+		res.FilledPrice, res.FilledShares); err != nil {
+		return fill{}, err
+	}
+	return f, nil
+}
+
+// awaitFill polls a placed order until it can no longer fill, cancelling whatever is
+// still working once fillWait has passed. It reports false only when the broker never
+// gave a final answer.
+//
+// The wait runs on real timers, not e.now: it is waiting on the broker, not deciding
+// anything about the session.
+func (e *Engine) awaitFill(ctx context.Context, res broker.OrderResult) (broker.OrderResult, bool) {
+	if res.Done() {
+		return res, true
+	}
+	res = e.pollOrder(ctx, res)
+	if res.Done() {
+		return res, true
+	}
+	if err := e.trading.CancelOrder(ctx, res.BrokerOrderID); err != nil {
+		// Commonly because it filled between the last poll and the cancel; the
+		// lookups below find out either way.
+		e.log.Warn("cancel of unfilled remainder failed", "order", res.BrokerOrderID, "err", err)
+	}
+	res = e.pollOrder(ctx, res)
+	return res, res.Done()
+}
+
+// pollOrder asks the broker for an order's state every fillPoll until it is done or
+// fillWait has passed, and returns the last state it was told.
+func (e *Engine) pollOrder(ctx context.Context, res broker.OrderResult) broker.OrderResult {
+	wait := time.NewTimer(e.fillWait)
+	defer wait.Stop()
+	poll := time.NewTicker(e.fillPoll)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return res
+		case <-wait.C:
+			return res
+		case <-poll.C:
+			got, err := e.trading.Order(ctx, res.BrokerOrderID)
+			if err != nil {
+				e.log.Warn("order lookup failed", "order", res.BrokerOrderID, "err", err)
+				continue
+			}
+			res = got
+			if res.Done() {
+				return res
+			}
+		}
+	}
+}
+
+// fillDetail adds what the broker executed to an audit event, next to what was
+// asked for, so slippage and short fills can be read straight off the trail.
+func fillDetail(d map[string]any, f fill, quoted float64, ordered int) map[string]any {
+	d["quoted_price"] = quoted
+	d["shares_ordered"] = ordered
+	d["order_status"] = f.Status
+	d["fill_confirmed"] = f.Confirmed
+	return d
 }

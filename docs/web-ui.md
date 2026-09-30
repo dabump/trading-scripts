@@ -99,7 +99,7 @@ It sells whatever is still held in that position, immediately, at the market's c
 What it does *not* do matters as much:
 
 - **It cannot open anything.** The page has no path to `enterPositions`. 
-- **It confirms first**, in the browser, naming the symbol.
+- **It does not ask first.** The click sends the sell; there is no browser confirmation (removed 2026-09-30, on request). The result modal reports what filled.
 - **It goes through the same path as a strategy exit** — `engine.submit` then `store.ClosePosition` — so the order record, the audit trail and the realised P&L are built exactly the way a rule-driven exit builds them. It is not a shortcut with its own accounting.
 - **It can take up to ten seconds, and it can fail after sending.** Like every order it waits for the broker to report the fill, and cancels whatever is still working after that. A sell that filled nothing, or only part, is refused with the count that sold: the position stays open with whatever is still held, rather than the page reporting a close the broker did not make. The Open button behaves the same way — a buy that filled nothing opens nothing, and a partial fill opens the shares that filled.
 - **It records the exit reason as `MANUAL`**, kept distinct for the same reason `RECONCILED` is: nothing reading the trail or the closed-positions table later should attribute an operator's decision to a strategy rule.
@@ -114,7 +114,7 @@ The selected tab is remembered per browser, because the page swaps its whole con
 
 ## Screening section (visible while `SCREENING`)
 
-Every row not already held carries an **Open** button — on a qualifying row it overrides the setup gate; on a row that failed the screen (drawn dashed) it overrides the screen as well, and both the browser confirmation and the result modal say the symbol did not qualify and why. The audit event records `screen_qualified` and `screen_reason` either way. Offered on failing rows on request (2026-09-30); before that only qualifying rows had it.
+Every row not already held carries an **Open** button — on a qualifying row it overrides the setup gate; on a row that failed the screen (drawn dashed) it overrides the screen as well, and the result modal says the symbol did not qualify and why. The audit event records `screen_qualified` and `screen_reason` either way. Offered on failing rows on request (2026-09-30); before that only qualifying rows had it.
 
 ### The Open button
 

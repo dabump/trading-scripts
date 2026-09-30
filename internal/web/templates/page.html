@@ -304,19 +304,13 @@ document.addEventListener('click', async (e) => {
   }
 });
 
-// Opening a position by hand. This overrides the setup gate — the rule the whole
-// strategy turns on — so the confirmation says so rather than asking a bland
-// "are you sure".
+// Opening a position by hand. It buys on the click, with no browser confirmation
+// (on request, 2026-09-30): the result modal says what was overridden, the size
+// and the stop. The server still refuses what the risk rules refuse.
 document.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-open]');
   if (!btn) return;
   const symbol = btn.dataset.open;
-  const overrides = btn.dataset.qualifies === 'true'
-    ? 'This overrides the setup gate.'
-    : symbol + ' did NOT qualify on the screen. This overrides the screen and the setup gate.';
-  if (!confirm('Buy ' + symbol + ' now?\n\n' + overrides + ' Size comes from the ' +
-               'risk budget and the stop, which may be the configured maximum rather than one ' +
-               'read off the chart. Once open, nothing sells it but its Close button.')) return;
 
   btn.disabled = true;
   modalContent.innerHTML = '<div class="mhead"><h3>Opening…</h3></div>' +
@@ -339,13 +333,12 @@ document.addEventListener('click', async (e) => {
   }
 });
 
-// Closing a position. It asks first, and the server asks again in its own way,
-// refusing when the exchange is shut or the position has already gone.
+// Closing a position. It sells on the click, with no browser confirmation (on
+// request, 2026-09-30); the server refuses when the exchange is shut or the
+// position has already gone.
 document.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-close]');
   if (!btn) return;
-  const symbol = btn.dataset.symbol || 'this position';
-  if (!confirm('Sell the remaining shares of ' + symbol + ' now?')) return;
 
   btn.disabled = true;
   modalContent.innerHTML = '<div class="mhead"><h3>Closing…</h3></div>' +

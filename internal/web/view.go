@@ -4,6 +4,7 @@ package web
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -195,6 +196,18 @@ type View struct {
 	// ShowTotals keeps the net-P&L footer off an empty table.
 	ShowTotals bool
 
+	// The closed list shows one ET day, and the arrows step back and forward
+	// through it — so the net P&L under the table is always that day's, never a
+	// running total across sessions. ClosedPrevDate/ClosedNextDate are the days
+	// the arrows lead to, empty when there is nothing in that direction, which is
+	// what disables the button. They step to days that actually have closes, so
+	// there is no weekend to click past.
+	ClosedDate      string
+	ClosedDateLabel string
+	ClosedIsToday   bool
+	ClosedPrevDate  string
+	ClosedNextDate  string
+
 	// Strategy is the active configuration, rendered for display. Every value is read
 	// from config rather than written into the template, so tuning a threshold and
 	// restarting is reflected here — a hardcoded panel would quietly start lying the
@@ -304,6 +317,7 @@ func BuildView(
 	acct domain.AccountSnapshot,
 	now time.Time,
 	paperMode bool,
+	closedOn string,
 ) (*View, error) {
 	date := scheduler.SessionDate(now)
 	v := &View{
@@ -495,15 +509,41 @@ func BuildView(
 		v.PositionsNote = "No open positions."
 	}
 
-	// Positions closed today, built whenever there are any rather than only after the
-	// bell. A position closed by hand at 11:00 has to show up at 11:00 — an operator
-	// who has just sold something needs to see the result, not wait four hours for an
-	// end-of-day card to appear. Selected by when they closed, not when they opened:
-	// a manual position can be held overnight and closed in a later session.
-	dayStart, err := time.ParseInLocation("2006-01-02", date, scheduler.ET)
+	// Positions closed on the shown day, built whenever there are any rather than
+	// only after the bell. A position closed by hand at 11:00 has to show up at
+	// 11:00 — an operator who has just sold something needs to see the result, not
+	// wait four hours for an end-of-day card to appear. Selected by when they
+	// closed, not when they opened: a manual position can be held overnight and
+	// closed in a later session.
+	//
+	// The day defaults to today and the arrows move it. Everything else on the page
+	// describes the live session, so a past day is scoped to this one block.
+	shown := date
+	if closedOn != "" && closedOn < date {
+		// A day the operator cannot have traded is not an error worth a 500 — a
+		// mistyped or stale date just shows today. Future days are clamped for the
+		// same reason: there is nothing after the current session to look at.
+		if _, err := time.ParseInLocation("2006-01-02", closedOn, scheduler.ET); err == nil {
+			shown = closedOn
+		}
+	}
+	dayStart, err := time.ParseInLocation("2006-01-02", shown, scheduler.ET)
 	if err != nil {
 		return nil, err
 	}
+	v.ClosedDate = shown
+	v.ClosedIsToday = shown == date
+	v.ClosedDateLabel = dayStart.Format("Mon 2 Jan")
+	if v.ClosedIsToday {
+		v.ClosedDateLabel += " · today"
+	}
+
+	exits, err := st.ClosedPositionExits()
+	if err != nil {
+		return nil, err
+	}
+	v.ClosedPrevDate, v.ClosedNextDate = adjacentClosedDays(closedDays(exits), shown, date)
+
 	positions, err := st.PositionsClosedBetween(dayStart, dayStart.AddDate(0, 0, 1))
 	if err != nil {
 		return nil, err
@@ -533,15 +573,62 @@ func BuildView(
 	v.EODNetTone = toneForPnL(net)
 	v.EODWinLoss = fmt.Sprintf("%d up · %d down", wins, losses)
 	if len(v.ClosedRows) == 0 {
-		v.ClosedNote = "Nothing has been closed in this session yet."
-		if !tradingDay || !now.Before(bounds.EODExit) {
+		switch {
+		case !v.ClosedIsToday:
+			v.ClosedNote = "No positions were closed on " + v.ClosedDateLabel + "."
+		case !tradingDay || !now.Before(bounds.EODExit):
 			v.ClosedNote = "No positions were closed in this session."
+		default:
+			v.ClosedNote = "Nothing has been closed in this session yet."
 		}
 	}
 
 	v.Strategy = strategySections(cfg)
 
 	return v, nil
+}
+
+// closedDays groups exit instants into the distinct ET session dates they fall on,
+// newest first. The store hands back instants rather than dates because the day a
+// trade belongs to is an exchange-calendar fact: a 20:00 ET manual close is the next
+// day in UTC, and grouping on that would file it under a date nobody traded.
+func closedDays(exits []time.Time) []string {
+	seen := make(map[string]struct{}, len(exits))
+	days := make([]string, 0, len(exits))
+	for _, t := range exits {
+		day := scheduler.SessionDate(t)
+		if _, ok := seen[day]; ok {
+			continue
+		}
+		seen[day] = struct{}{}
+		days = append(days, day)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(days)))
+	return days
+}
+
+// adjacentClosedDays picks where the back and forward arrows lead from the day being
+// shown: the nearest earlier and later day that has closed positions. An empty string
+// means the arrow is disabled.
+//
+// Forward always reaches today even when today has no closes, so stepping back is
+// never a one-way trip out of the live session. days is ISO dates, newest first.
+func adjacentClosedDays(days []string, shown, today string) (prev, next string) {
+	for _, day := range days {
+		switch {
+		case day < shown:
+			// Newest first, so the first earlier day is the nearest one.
+			if prev == "" {
+				prev = day
+			}
+		case day > shown && (next == "" || day < next):
+			next = day
+		}
+	}
+	if next == "" && shown < today {
+		next = today
+	}
+	return prev, next
 }
 
 // strategySections describes the running strategy from the loaded configuration.

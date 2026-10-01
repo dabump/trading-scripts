@@ -683,3 +683,42 @@ func TestManualPositionClosedInALaterSession(t *testing.T) {
 		t.Errorf("closed on 2026-09-29 = %+v, want nothing", got)
 	}
 }
+
+// ClosedPositionExits is what the page's date arrows are built from: it lists the
+// exit instants of closed positions, newest first, and ignores open ones.
+func TestClosedPositionExits(t *testing.T) {
+	s := newStore(t)
+	insert := func(symbol string, at time.Time, close bool) {
+		id, err := s.InsertPosition(domain.Position{
+			SessionDate: at.Format("2006-01-02"), Symbol: symbol, Shares: 10,
+			EntryPrice: 5, EntryTime: at,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if close {
+			if err := s.ClosePosition(id, 6, at.Add(time.Hour), domain.ExitStopLoss); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	first := time.Date(2026, 9, 24, 18, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC)
+	insert("AAAA", first, true)
+	insert("BBBB", second, true)
+	insert("OPEN", second, false)
+
+	exits, err := s.ClosedPositionExits()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Time{second.Add(time.Hour), first.Add(time.Hour)}
+	if len(exits) != len(want) {
+		t.Fatalf("exits = %v, want the two closed positions newest first", exits)
+	}
+	for i, w := range want {
+		if !exits[i].Equal(w) {
+			t.Errorf("exits[%d] = %s, want %s", i, exits[i], w)
+		}
+	}
+}

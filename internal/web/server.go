@@ -428,12 +428,22 @@ func (s *Server) renderActionError(w http.ResponseWriter, msg string, status int
 	buf.WriteTo(w)
 }
 
-func (s *Server) view() (*View, error) {
+// view renders the page for a request. closedOn is the day the closed-positions
+// list should show (empty for today): it rides on the query string rather than in
+// server state because it is one browser's navigation, not the agent's, and the
+// fragment poll has to carry it back or the list would snap to today every twelve
+// seconds. An unusable value is ignored by BuildView rather than refused.
+func (s *Server) view(closedOn string) (*View, error) {
 	state, errMsg := s.engine.State()
 	sess, tradingDay := s.engine.Session()
 	next, nextKnown := s.engine.NextSession()
 	return BuildView(s.cfg, s.store, state, errMsg, sess, tradingDay, next, nextKnown,
-		s.engine.Account(), s.now(), s.paper)
+		s.engine.Account(), s.now(), s.paper, closedOn)
+}
+
+// closedParam reads the requested closed-positions day off the query string.
+func closedParam(r *http.Request) string {
+	return r.URL.Query().Get("closed")
 }
 
 // render writes to a buffer first so a template error produces a clean 500
@@ -455,7 +465,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	v, err := s.view()
+	v, err := s.view(closedParam(r))
 	if err != nil {
 		s.log.Error("build view", "err", err)
 		http.Error(w, "failed to read state", http.StatusInternalServerError)
@@ -465,7 +475,7 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFragment(w http.ResponseWriter, r *http.Request) {
-	v, err := s.view()
+	v, err := s.view(closedParam(r))
 	if err != nil {
 		s.log.Error("build view", "err", err)
 		http.Error(w, "failed to read state", http.StatusInternalServerError)
@@ -504,7 +514,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleJSON exposes the same state as machine-readable output, which is what
 // makes the running daemon verifiable without scraping HTML.
 func (s *Server) handleJSON(w http.ResponseWriter, r *http.Request) {
-	v, err := s.view()
+	v, err := s.view(closedParam(r))
 	if err != nil {
 		http.Error(w, "failed to read state", http.StatusInternalServerError)
 		return

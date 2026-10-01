@@ -106,9 +106,19 @@ What it does *not* do matters as much:
 - **It is refused when the exchange is shut.** A sell submitted then would be queued to the next open while the store had already marked the position closed, and the two would disagree until a restart reconciled them. A page reporting a flat book the broker does not have is worse than a refusal. Pre-market it is allowed, routed to the extended-hours book like any other pre-market order.
 - **A second press cannot send a second order.** The engine holds a per-position guard while one is in flight, and re-reads the row before acting — the id came from a page that may be a poll interval old and may describe a position the trading loop has since exited.
 
-**Closed** lists everything closed today — selected by when it closed, not when it opened, since a manual position may have been opened in an earlier session — symbol, shares, opened, closed, P&L in dollars and percent, and which rule (or `MANUAL`) closed it — with net P&L and a win/loss count underneath.
+**Closed** lists everything closed on one day — selected by when it closed, not when it opened, since a manual position may have been opened in an earlier session — symbol, shares, opened, closed, P&L in dollars and percent, and which rule (or `MANUAL`) closed it — with that day's net P&L and win/loss count underneath.
 
 It is visible from the moment something closes, not only after the bell. It used to be an "End of day" card hidden until the forced-exit mark, which was reasonable while a strategy rule was the only thing that could close a position; once the page can close one by hand, an operator who has just sold something cannot be made to wait four hours to see what it made. After the close it reads the same way the end-of-day summary did.
+
+### Stepping back through earlier days
+
+The list is headed by **‹ date ›** arrows, so the whole trade history is reachable from the page rather than only the current session. A few things about them:
+
+- **The totals stay one day's.** Net P&L and the win/loss count always describe the day shown above them, never a running total — the daily figure is the one an operator compares against the day before.
+- **The arrows step to days that have closes**, not to the next calendar day, so there is no weekend or quiet Tuesday to click past. An arrow with nothing in its direction renders disabled. Forward always reaches **today**, even when nothing has closed today, so stepping back is never a one-way trip out of the live session.
+- **Which day is showing is scoped to that one block.** Everything else on the page — state, positions, screening, the account — describes the live session regardless of where the closed list is parked.
+- **It travels on the fragment poll's query string** (`?closed=YYYY-MM-DD`), because the rows are rendered by the server and the poll replaces the whole content block; without it the list would snap back to today every twelve seconds. The arrows carry the date they lead to, so the calendar arithmetic — and the question of which days have anything to show — stays in Go rather than being re-derived in JavaScript. An unusable or future date shows today rather than erroring: it is one browser's navigation, not an instruction the agent has to honour.
+- **It is deliberately not remembered** across a reload, unlike the tab choice. Reopening the page should land on the live session, not where someone was browsing yesterday.
 
 The selected tab is remembered per browser, because the page swaps its whole content block on every poll and would otherwise snap back to **Open** every twelve seconds.
 

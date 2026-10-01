@@ -430,6 +430,37 @@ func (s *Store) PositionsClosedBetween(from, to time.Time) ([]domain.Position, e
 	return out, nil
 }
 
+// ClosedPositionExits returns the exit instant of every closed position, newest
+// first. The page's date arrows need to know which days have something to show,
+// and that is a calendar question: the dates are grouped by ET session day in the
+// web layer, which owns the exchange timezone. Doing it in SQL would group by the
+// stored UTC day, and an after-hours or manual close at 20:00 ET falls on the next
+// UTC day — filed under a date the operator never traded.
+func (s *Store) ClosedPositionExits() ([]time.Time, error) {
+	rows, err := s.db.Query(
+		`SELECT exit_time FROM positions WHERE is_open = 0 AND exit_time != ''`)
+	if err != nil {
+		return nil, fmt.Errorf("query closed position exits: %w", err)
+	}
+	defer rows.Close()
+
+	var out []time.Time
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("scan closed position exit: %w", err)
+		}
+		if t := parseTime(raw); !t.IsZero() {
+			out = append(out, t)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate closed position exits: %w", err)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].After(out[j]) })
+	return out, nil
+}
+
 // SessionPositions returns all positions opened on a date, open or closed.
 func (s *Store) SessionPositions(date string) ([]domain.Position, error) {
 	rows, err := s.db.Query(`SELECT `+positionColumns+

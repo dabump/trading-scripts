@@ -105,8 +105,9 @@ later to answer "why did it buy that, and what did it know at the time?".
 
 Recorded events: `AGENT_STARTED`, `SENTIMENT_READING`, `GATE_RESOLVED`,
 `TRADING_HALTED`, `POSITION_OPENED`, `POSITION_SCALED_OUT`, `POSITION_CLOSED`,
-`POSITION_HELD` (a manual position left open through the forced exit, once per session),
-`ENTRY_SKIPPED`, `ORDER_NOT_FILLED`, `RECONCILED`, `FAULT`. Every event that traded
+`ENTRY_SKIPPED`, `ORDER_NOT_FILLED`, `RECONCILED`, `FAULT`. (`POSITION_HELD` was
+removed on 2026-10-02: manual positions are force-closed at the bell like any other,
+so nothing is left open through the forced exit.) Every event that traded
 carries the broker's fill as `price` alongside `quoted_price` (what the daemon read
 when it decided), `shares_ordered`, `order_status` and `fill_confirmed`, so slippage
 and short fills can be read straight off the trail. Only state changes and actions appear — the screen runs every

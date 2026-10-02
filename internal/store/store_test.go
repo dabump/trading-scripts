@@ -722,3 +722,45 @@ func TestClosedPositionExits(t *testing.T) {
 		}
 	}
 }
+
+// The protective stop's order id survives a round trip, and can be cleared. It is in
+// the row rather than in memory because the order outlives the process: a restart
+// that forgot the id would leave a live sell order nothing would ever cancel.
+func TestStopOrderIDRoundTrips(t *testing.T) {
+	s := newStore(t)
+
+	id, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-10-02", Symbol: "HAND", Shares: 100,
+		EntryPrice: 4.20, EntryTime: time.Now(), StopPrice: 3.78,
+		InitialRisk: 0.42, Manual: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p, err := s.PositionByID(id); err != nil {
+		t.Fatal(err)
+	} else if p.StopOrderID != "" {
+		t.Errorf("stop order id = %q on a fresh row, want empty", p.StopOrderID)
+	}
+
+	if err := s.SetStopOrderID(id, "o-1"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := s.OpenPositions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].StopOrderID != "o-1" {
+		t.Fatalf("open = %+v, want the stop order id read back", open)
+	}
+
+	if err := s.SetStopOrderID(id, ""); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := s.PositionByID(id); err != nil {
+		t.Fatal(err)
+	} else if p.StopOrderID != "" {
+		t.Errorf("stop order id = %q after clearing, want empty", p.StopOrderID)
+	}
+}

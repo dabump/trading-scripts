@@ -235,7 +235,9 @@ func TestPlaceOrderPayloadAndDecoding(t *testing.T) {
 	if body["qty"] != "200" || body["side"] != "buy" || body["type"] != "market" {
 		t.Errorf("order payload = %v", body)
 	}
-	// Day-only trading: an order must never survive the session.
+	// Day by default: an entry or exit the agent sends must never survive the session,
+	// because the reason it sent it will not. The one order that does outlive the day
+	// is a protective stop, which asks for gtc explicitly — see the test below.
 	if body["time_in_force"] != "day" {
 		t.Errorf("time_in_force = %v, want day", body["time_in_force"])
 	}
@@ -266,6 +268,47 @@ func TestPlaceLimitOrderIncludesPrice(t *testing.T) {
 	}
 	if body["limit_price"] != "4.50" {
 		t.Errorf("limit_price = %v, want \"4.50\"", body["limit_price"])
+	}
+}
+
+// A protective stop carries its trigger, asks for gtc, and carries no limit price.
+// The gtc is the point: it is the one order meant to outlive the session, because
+// the position it protects does.
+func TestPlaceStopOrderCarriesTriggerAndSurvivesTheDay(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		io.WriteString(w, `{"id":"o-3","status":"new","filled_qty":"0","filled_avg_price":""}`)
+	}))
+	defer srv.Close()
+
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
+	res, err := a.PlaceOrder(context.Background(), OrderRequest{
+		Symbol: "ABCD", Shares: 10, Side: "sell", Type: "stop",
+		StopPrice: 3.78, TimeInForce: "gtc", ClientOrderID: "cid-stop",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body["type"] != "stop" || body["side"] != "sell" {
+		t.Errorf("order payload = %v", body)
+	}
+	if body["stop_price"] != "3.78" {
+		t.Errorf("stop_price = %v, want \"3.78\"", body["stop_price"])
+	}
+	if body["time_in_force"] != "gtc" {
+		t.Errorf("time_in_force = %v, want gtc: a day stop expires at the close and leaves "+
+			"the position bare overnight", body["time_in_force"])
+	}
+	if _, hasLimit := body["limit_price"]; hasLimit {
+		t.Error("a stop order must not carry a limit price")
+	}
+	if _, extended := body["extended_hours"]; extended {
+		t.Error("extended_hours is accepted only on a day limit order")
+	}
+	// Acknowledged and working, not filled — which is what every caller depends on.
+	if res.BrokerOrderID != "o-3" || res.FilledShares != 0 || res.Done() {
+		t.Errorf("result = %+v, want a working order with an id", res)
 	}
 }
 

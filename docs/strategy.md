@@ -67,7 +67,7 @@ With it on, three things change and all three are requirements rather than prefe
 2. **Entry is gated on a live sentiment read** (see §1), because the post-open gate has not run.
 3. **The setup is read on pre-market candles.** The chart handed to `strategy.FindSetup` starts at `premarket.start` rather than the open, so the pullback, the EMA and the VWAP are all computed from the session actually trading.
 
-Everything else is unchanged: the same position cap, the same sizing from the stop, the same exit rules. A position opened pre-market is managed from the moment it exists — its stop can fire at 08:00 rather than waiting for the bell — and is flattened at the regular forced end-of-day exit like any other — unless it was opened by hand, which no exit rule touches (§4).
+Everything else is unchanged: the same position cap, the same sizing from the stop, the same exit rules. A position opened pre-market is managed from the moment it exists — its stop can fire at 08:00 rather than waiting for the bell — and is flattened at the regular forced end-of-day exit like any other, a manual position included (§4). A manual pre-market open is the one case where the stop is enforced on the tick rather than by the resting order: Alpaca accepts a stop order before the bell but will not trigger it, so the order is placed and the engine holds the floor until 09:30.
 
 **Post-market is deliberately not covered.** The forced end-of-day exit flattens the strategy's book before the close, so after 16:00 there is nothing it manages (a manual position may still be held, but no rule acts on it); and opening a position into the 16:00–20:00 session would mean holding it overnight, which this strategy never does.
 
@@ -225,15 +225,22 @@ Everything downstream of the signal still applies to a hand-placed trade — the
 Three things can close or reduce a position, checked in this order. The candle trail
 described below works through the second, raising the stop:
 
-1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, with one exception: nothing in this section applies to a position opened by hand (see below).
+1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, and it applies to a position opened by hand as well (see below).
 2. **The stop.** The working stop is the chart stop the setup defined, moved up to the entry price once the first target is banked. Behind it sits `risk.stop_loss_pct` as a **gap backstop**, reachable only when price jumps straight through the chart stop. Config validation requires the backstop to be the wider of the two, or it would fire first and silently turn this back into a fixed-percentage stop.
 3. **The first profit target**, at `exit.first_target_r` multiples of *this trade's own initial risk*. `exit.first_target_fraction` of the position is sold there and the rest keeps running, with its stop at breakeven.
 
-**Positions opened by hand are exempt from all of it** — the stop, the backstop, the
-candle trail, the target and the forced exit. `engine.managePositions` keeps their
-mark current for the page and does nothing else, and records `POSITION_HELD` once
-per session when one is left open through the forced exit. They are closed only by
-the page's Close button, and can be held overnight. See [`risk.md`](./risk.md).
+**Positions opened by hand have a shorter rule: the forced exit, then their own
+stop.** The signal rules — the `risk.stop_loss_pct` backstop, the candle trail and the
+scale-out at the target — do not apply, because they are tuned to the pattern the
+setup gate looks for and a manual open overrode that gate. The stop does apply: it is
+what sized the position, so letting price through it means losing more than the trade
+was opened under. `strategy.EvaluateManualExit` is that rule.
+
+In the ordinary case the engine does not evaluate it at all. The stop is left with the
+broker as a resting good-till-cancelled order, so it is enforced between ticks and
+while the daemon is not running; the engine covers only what the order cannot — the
+close, and the windows where the order is missing or cannot yet trigger. Every path
+that sells cancels the resting order first. See [`risk.md`](./risk.md).
 
 Risk before reward: on a bar that traded through both the stop and the target, the
 stop is what is recorded. `strategy.EvaluateExit` returns the first action due, and

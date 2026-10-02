@@ -37,6 +37,16 @@ type Fake struct {
 	fillPrice map[string]float64
 	fillLimit map[string]int
 	orders    map[string]OrderResult
+	// resting holds the stop orders that have been placed and not yet triggered,
+	// keyed by broker order id. A stop is the one order type that is not supposed
+	// to fill when it is sent, so the fake has to model it waiting — otherwise a
+	// protective stop would read as an instant exit and no test could tell the
+	// difference between a stop that worked and one that sold the position at once.
+	resting map[string]restingStop
+	// stopOrderErr rejects stop orders only, leaving entries and exits working. It
+	// is how a test reaches the case that matters most: a position bought with no
+	// resting stop behind it.
+	stopOrderErr error
 
 	// Call counters, so tests can assert the scan's cost profile: a full-market
 	// scan is only affordable if the expensive per-symbol calls stay rare.
@@ -61,7 +71,16 @@ func NewFake(acct domain.Account) *Fake {
 		fillPrice: map[string]float64{},
 		fillLimit: map[string]int{},
 		orders:    map[string]OrderResult{},
+		resting:   map[string]restingStop{},
 	}
+}
+
+// restingStop is a placed-but-untriggered stop order.
+type restingStop struct {
+	symbol string
+	side   string
+	shares int
+	stop   float64
 }
 
 // SetFillPrice makes orders in symbol execute at price rather than at the quote or
@@ -176,6 +195,7 @@ func (f *Fake) SetSnapshot(symbol string, price, prevClose, volume float64) {
 		p.CurrentPrice = price
 		f.positions[symbol] = p
 	}
+	f.triggerStops(symbol, price)
 }
 
 // SetPrice updates only the traded price, keeping the previous close and volume.
@@ -370,6 +390,21 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 	}
 	f.placed = append(f.placed, req)
 
+	id := "fake-" + req.ClientOrderID
+	if req.Type == "stop" && f.stopOrderErr != nil {
+		return OrderResult{}, f.stopOrderErr
+	}
+	// A stop order is acknowledged and then waits: it fills when the price reaches
+	// its trigger, which here is whenever a caller moves the price.
+	if req.Type == "stop" {
+		res := OrderResult{BrokerOrderID: id, Status: "new"}
+		f.orders[id] = res
+		f.resting[id] = restingStop{
+			symbol: req.Symbol, side: req.Side, shares: req.Shares, stop: req.StopPrice,
+		}
+		return res, nil
+	}
+
 	price := f.snaps[req.Symbol].Price
 	if req.Type == "limit" && req.LimitPrice > 0 {
 		price = req.LimitPrice
@@ -381,31 +416,10 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 	if n, ok := f.fillLimit[req.Symbol]; ok && n < shares {
 		shares = n
 	}
-
-	switch req.Side {
-	case "buy":
-		f.acct.Cash -= price * float64(shares)
-		pos := f.positions[req.Symbol]
-		pos.Symbol = req.Symbol
-		pos.Shares += shares
-		pos.AvgEntry = price
-		pos.CurrentPrice = price
-		if pos.Shares > 0 {
-			f.positions[req.Symbol] = pos
-		}
-	case "sell":
-		f.acct.Cash += price * float64(shares)
-		pos := f.positions[req.Symbol]
-		pos.Shares -= shares
-		if pos.Shares <= 0 {
-			delete(f.positions, req.Symbol)
-		} else {
-			f.positions[req.Symbol] = pos
-		}
-	}
+	f.settle(req.Symbol, req.Side, shares, price)
 
 	res := OrderResult{
-		BrokerOrderID: "fake-" + req.ClientOrderID,
+		BrokerOrderID: id,
 		Status:        "filled",
 		FilledShares:  shares,
 	}
@@ -420,6 +434,84 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 	}
 	f.orders[res.BrokerOrderID] = res
 	return res, nil
+}
+
+// settle moves cash and the holding for a fill. Called with f.mu held.
+func (f *Fake) settle(symbol, side string, shares int, price float64) {
+	switch side {
+	case "buy":
+		f.acct.Cash -= price * float64(shares)
+		pos := f.positions[symbol]
+		pos.Symbol = symbol
+		pos.Shares += shares
+		pos.AvgEntry = price
+		pos.CurrentPrice = price
+		if pos.Shares > 0 {
+			f.positions[symbol] = pos
+		}
+	case "sell":
+		f.acct.Cash += price * float64(shares)
+		pos := f.positions[symbol]
+		pos.Shares -= shares
+		if pos.Shares <= 0 {
+			delete(f.positions, symbol)
+		} else {
+			f.positions[symbol] = pos
+		}
+	}
+}
+
+// triggerStops fills any resting stop the given price has reached. Called with f.mu
+// held, from the price setters, so moving a symbol through its stop exercises the
+// same path a real trigger takes: the daemon learns about it by looking the order
+// up, not by being told.
+//
+// It fills at the trigger price rather than the price that crossed it, unless
+// SetFillPrice says otherwise. That is the optimistic case on purpose — the point of
+// the resting order is that the gap between trigger and fill is the broker's to
+// manage, and a test that wants to see slippage should ask for it explicitly.
+func (f *Fake) triggerStops(symbol string, price float64) {
+	if price <= 0 {
+		return
+	}
+	for id, r := range f.resting {
+		if r.symbol != symbol {
+			continue
+		}
+		if r.side == "sell" && price > r.stop {
+			continue
+		}
+		if r.side == "buy" && price < r.stop {
+			continue
+		}
+		fillAt := r.stop
+		if p, ok := f.fillPrice[symbol]; ok {
+			fillAt = p
+		}
+		f.settle(r.symbol, r.side, r.shares, fillAt)
+		f.orders[id] = OrderResult{
+			BrokerOrderID: id, Status: "filled",
+			FilledPrice: fillAt, FilledShares: r.shares,
+		}
+		delete(f.resting, id)
+	}
+}
+
+// SetStopOrderError makes stop orders fail while everything else keeps working, so
+// a test can see what a position does when its protective stop was refused.
+func (f *Fake) SetStopOrderError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopOrderErr = err
+}
+
+// RestingStops reports how many stop orders are placed and not yet triggered, so a
+// test can assert that an exit took its protective stop off the book rather than
+// leaving one behind to sell a position the daemon no longer holds.
+func (f *Fake) RestingStops() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.resting)
 }
 
 func (f *Fake) Order(_ context.Context, brokerOrderID string) (OrderResult, error) {
@@ -449,6 +541,7 @@ func (f *Fake) CancelOrder(_ context.Context, brokerOrderID string) error {
 		res.Status = "canceled"
 		f.orders[brokerOrderID] = res
 	}
+	delete(f.resting, brokerOrderID)
 	return nil
 }
 

@@ -259,6 +259,22 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 	}
 
 	quoted := price
+
+	// The resting stop comes off the book before anything is sold. Leaving it there
+	// would leave a live sell order against a holding that no longer exists, and the
+	// next time price touched it the account would go short — so a cancel that cannot
+	// be confirmed refuses the close rather than racing it. If the stop filled while
+	// this was happening, that fill is the exit and there is nothing left to sell.
+	if res, err := e.releaseProtectiveStop(ctx, &pos); err != nil {
+		return domain.Position{}, err
+	} else if res.FilledShares > 0 {
+		if err := e.closeOnProtectiveStop(pos, res); err != nil {
+			return domain.Position{}, err
+		}
+		return domain.Position{}, fmt.Errorf("%w: its stop filled at $%.2f first, so there was "+
+			"nothing left to sell", ErrPositionNotOpen, res.FilledPrice)
+	}
+
 	f, err := e.submit(ctx, sess, pos.Symbol, "sell", pos.SharesOpen, quoted, extendedHours)
 	if err != nil {
 		return domain.Position{}, err
@@ -292,6 +308,7 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 			"r_multiple":     pos.RMultiple(price),
 			"held_for":       now.Sub(pos.EntryTime).String(),
 			"pre_market":     extendedHours,
+			"stop_order":     "cancelled before selling",
 		}, f, quoted, pos.SharesOpen))
 
 	// The closed row, for the confirmation the page shows.
@@ -330,6 +347,11 @@ var (
 // below the entry — the widest risk this strategy will accept — which keeps
 // risk.SizeForRisk in charge of the share count and makes the position the smallest
 // the risk budget allows rather than an arbitrary fraction of the account.
+//
+// That stop is then left with the broker as a resting order, so it is one R and is
+// enforced whether or not this process is watching — see placeProtectiveStop. A
+// manual position is subject to that stop and to the forced end-of-day exit, and to
+// nothing else: no gap backstop, no candle trail, no scale-out.
 func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.ManualOpen, error) {
 	if !e.manual.claimOpen(symbol) {
 		return domain.ManualOpen{}, ErrBusy
@@ -454,9 +476,47 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 		return domain.ManualOpen{}, err
 	}
 
+	// The stop goes to the broker as a resting order, not just into the row. A stop
+	// that only exists inside this process is no stop at all for a position an
+	// operator means to hold — through the close, through a restart — and the
+	// difference between a stop order and a stop checked once a minute is the whole
+	// of the slippage on a mover that halves in that minute.
+	//
+	// A failure here does not unwind the buy: selling straight back across the spread
+	// is a certain loss to avoid an uncertain one, and the position still has its stop
+	// — managePositions evaluates it on the tick when no order is working. It is
+	// reported rather than swallowed, because an operator who thinks they have a
+	// resting stop and does not would size the next decision wrongly.
+	stopOrderID, stopErr := e.placeProtectiveStop(ctx, sess,
+		domain.Position{ID: id, Symbol: symbol, SharesOpen: res.Shares, StopPrice: res.Stop})
+	switch {
+	case stopErr != nil:
+		res.StopOrderNote = "it could not be placed: " + stopErr.Error()
+		e.log.Error("protective stop could not be placed; the engine holds this stop on the tick",
+			"symbol", symbol, "stop", res.Stop, "err", stopErr)
+		e.record(audit.Fault, symbol,
+			fmt.Sprintf("the resting stop order for %s was rejected; its stop is evaluated on the "+
+				"scan tick instead, which cannot protect it between ticks", symbol),
+			map[string]any{
+				"protective_stop": "not placed",
+				"stop_price":      res.Stop,
+				"shares":          res.Shares,
+				"err":             stopErr.Error(),
+			})
+	case extendedHours:
+		// Accepted, but a stop cannot trigger in the extended session, so it is inert
+		// until the bell. The engine covers that window; the operator should still
+		// know the order is not live yet.
+		res.StopOrderPlaced = true
+		res.StopOrderNote = "resting at the broker, but a stop cannot trigger before 09:30 — " +
+			"until the open the agent holds this stop on the scan tick"
+	default:
+		res.StopOrderPlaced = true
+	}
+
 	e.log.Info("position opened by hand", "symbol", symbol, "shares", res.Shares,
 		"price", res.Entry, "quoted", quoted, "stop", res.Stop, "from_setup", res.FromSetup,
-		"risk", res.RiskDollar, "halted", res.Halted)
+		"risk", res.RiskDollar, "halted", res.Halted, "stop_order", res.StopOrderPlaced)
 	e.record(audit.PositionOpened, symbol,
 		fmt.Sprintf("opened by hand from the status page: bought %d shares at $%.2f",
 			res.Shares, res.Entry),
@@ -474,7 +534,10 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 			"cash_before":        acct.Cash,
 			"overrode_halt":      res.Halted,
 			"pre_market":         extendedHours,
-			"exit_rules":         "none: closed only by hand",
+			"exit_rules":         "its own stop and the forced end-of-day exit; no backstop, trail or scale-out",
+			"stop_order_placed":  res.StopOrderPlaced,
+			"stop_order_id":      stopOrderID,
+			"stop_order_note":    res.StopOrderNote,
 			"screen_qualified":   res.Qualified,
 			"screen_reason":      res.ScreenReason,
 		}, f, quoted, sizing.Shares))

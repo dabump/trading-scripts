@@ -574,7 +574,7 @@ setInterval(refresh, POLL_MS);
         {{template "symbolCell" .Symbol}}
         <td class="num">{{.Shares}}{{if .SharesNote}}<span class="meta"> {{.SharesNote}}</span>{{end}}</td>
         <td class="num muted">{{.Entry}}</td>
-        <td class="num muted"{{if .Manual}} title="Opened by hand: no stop, target or end-of-day exit applies. Only Close sells it."{{end}}>{{.Stop}}</td>
+        <td class="num muted"{{if .Manual}} title="Opened by hand: this stop and the forced end-of-day exit apply, nothing else — no backstop, trail or scale-out.{{if .StopResting}} The stop is resting at the broker as a live order.{{else}} The stop is not resting at the broker; the agent checks it on each scan.{{end}}"{{end}}>{{.Stop}}{{if and .Manual (not .StopResting)}}<span class="meta"> on tick</span>{{end}}</td>
         <td class="num">{{.Current}}</td>
         <td class="num muted">{{.Peak}}</td>
         <td class="num muted">{{.RMultiple}}</td>
@@ -766,10 +766,23 @@ setInterval(refresh, POLL_MS);
   <p class="note" style="margin-top:12px">
     Sized from a stop {{.StopSource}}.{{if .SetupReason}} The detector said: {{.SetupReason}}.{{end}}
   </p>
+  {{if .StopOrderPlaced}}
   <p class="note">
-    <strong>Nothing sells this position but you.</strong> No stop, no scale-out at a target,
-    and no forced exit before the close — it is held overnight if you leave it. The stop
-    above only decided the size; a loss beyond it is not capped.
+    <strong>The stop is resting at the broker</strong> as a good-till-cancelled sell order at
+    {{.Stop}} — one R. It is enforced between scans and while the agent is not running, and
+    every way of selling this position cancels it first.{{if .StopOrderNote}} {{.StopOrderNote}}.{{end}}
+  </p>
+  {{else}}
+  <div class="alert">
+    <strong>The stop is not resting at the broker:</strong> {{.StopOrderNote}}. The agent
+    evaluates this stop on the scan tick instead, which cannot protect the position between
+    ticks — on a fast mover that is the slippage a resting order exists to avoid. Consider
+    closing it by hand, or placing the stop in the broker's own UI.
+  </div>
+  {{end}}
+  <p class="note">
+    Beyond that stop and the forced exit before the close, nothing sells this position but
+    you: no gap backstop, no candle trail and no scale-out at a target.
   </p>
 </div>
 {{end}}

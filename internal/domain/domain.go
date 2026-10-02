@@ -152,11 +152,17 @@ type Position struct {
 	ExitPrice  float64
 	ExitTime   time.Time
 	ExitReason ExitReason
-	// Manual marks a position opened from the status page. No exit rule applies to
-	// it — not the stop, the backstop, the candle trail, the target or the forced
-	// end-of-day exit — so it is held, across sessions if need be, until it is closed
-	// by hand. StopPrice and InitialRisk still describe the stop it was sized from.
+	// Manual marks a position opened from the status page. The signal rules do not
+	// apply to it — no backstop, no candle trail, no scale-out — but its stop does,
+	// and so does the forced end-of-day exit. What protects it is a resting stop
+	// order at the broker rather than a tick-by-tick evaluation (see StopOrderID).
 	Manual bool
+	// StopOrderID is the broker's id for the protective stop order resting against
+	// this position, empty when there is none. A manual position's 1R stop is left
+	// with the broker so it is enforced between ticks and while the daemon is not
+	// running; every path that sells the position has to cancel it first, or the
+	// order outlives the holding and sells shares that are no longer there.
+	StopOrderID string
 }
 
 // RMultiple expresses a price as a multiple of the position's initial risk, which
@@ -272,6 +278,14 @@ type ManualOpen struct {
 	// on a failing row it overrides the screen as well as the setup gate.
 	Qualified    bool
 	ScreenReason string
+	// StopOrderPlaced says the 1R stop is resting at the broker as a real order, so
+	// it is enforced between ticks and while the daemon is not running. When it is
+	// false the stop still exists and still sized the position — the engine evaluates
+	// it on the tick instead — and StopOrderNote says why, which is the part the
+	// operator needs: a tick-latency stop on a fast mover is the slippage the resting
+	// order exists to avoid.
+	StopOrderPlaced bool
+	StopOrderNote   string
 }
 
 // SentimentReading is one 10-minute poll during the first hour.

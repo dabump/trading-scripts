@@ -1075,7 +1075,75 @@ rate-limit headroom, so this is the value to look at first if requests start to 
 — `premarket.scan_interval` is the cheap place to buy the headroom back. The scan
 cadence itself is unchanged: `claimScan` gates it independently of the tick.
 
+## 2026-10-02 — A manual position's 1R stop rests at the broker, and the bell applies again
+
+**On request**, to stop the slippage a tick-checked stop implies. The instruction was
+to "ensure the stop loss set at 1R to avoid massive slippage". The number was already
+1R and could not be otherwise — `OpenPosition` sizes from `entry − stop`, so the stop
+distance *is* the R — so the gap was not the price. It was that nothing acted on it:
+the 2026-09-30 decision above had exempted manual positions from every exit rule, and
+`broker.OrderRequest` supported only market and limit orders, so there was no resting
+stop at the broker either. A manual position had a stop in the row and no stop in the
+world.
+
+**What changed.** `engine.placeProtectiveStop` sends a good-till-cancelled sell stop
+immediately after the entry fill, at the price that sized the position, and stores the
+broker's order id on the row (`stop_order_id`, migration 007). The forced end-of-day
+exit applies to manual positions again, so the book is flat after the close. The
+signal rules stay off: no gap backstop, no candle trail, no scale-out —
+`strategy.EvaluateManualExit` is the whole rule, and in the ordinary case the engine
+does not even reach it.
+
+**Why an order and not a tighter loop.** Of the two ways to do it, dropping the
+exemption in `managePositions` was the smaller change and was rejected: it acts once
+per tick, covers nothing while the daemon is down, and a manual position is precisely
+the one an operator means to hold through a restart. `gtc` rather than `day` for the
+same reason — a day stop expires at the close and leaves the position bare through the
+overnight gap, which is the window that costs the most and the one nobody is watching.
+This is the one order the agent sends that is meant to outlive the session; everything
+else is still `day`, because the reason for sending it does not outlive the session.
+
+**The ordering is the load-bearing part.** A resting sell order that outlives its
+holding sells shares that are not there, which is a *short* position, not a flat one.
+So every path that sells cancels first, and `releaseProtectiveStop` confirms the cancel
+by **looking the order up** rather than trusting the cancel's return: Alpaca refuses to
+cancel an order that already filled, and that refusal is exactly the case that must not
+read as a failure. If the lookup shows a fill, that fill is the exit. If it shows the
+order still working, the exit is held off and faulted — being late out of a position is
+recoverable, being short is not.
+
+**Two windows the order cannot cover, and the engine covers both.** There may be no
+order (placement refused, or the broker ended it without a fill), or the clock may be
+before the bell, where Alpaca accepts a stop order and will not trigger it. In both,
+the engine evaluates the same stop on the tick. This is not the "both" option — the two
+are mutually exclusive by construction, so they can never sell the same shares — it is
+the chosen option made fail-safe. The alternative was a manual position with no stop at
+all, which is the one outcome the instruction rules out.
+
+**A refused stop order does not unwind the buy.** Selling straight back across the
+spread is a certain loss taken to avoid an uncertain one. The position keeps its
+tick-checked stop, a `FAULT` goes in the trail, and the page says so in an alert rather
+than a footnote.
+
+**What this restores and what it gives up.** The page's original invariant — "a manual
+action overrides the signal, never the risk rules" — holds on both sides again, which
+it had not since 2026-09-30: the loss on a manual position is bounded by
+`risk.risk_per_trade_pct` once more, and overnight gap risk is gone with the forced
+exit back. What is given up is the ability to hold a manual position across sessions,
+which was the point of the 2026-09-30 request; that is now only possible by not using
+this agent for it. `POSITION_HELD` is removed, since nothing is left open through the
+forced exit.
+
+**Unmeasured, and not measurable here.** `cmd/backtest` never opens a position by hand,
+so none of this is in any backtest number, and the automated path is untouched — its
+stop is still evaluated on the tick, deliberately, because that position is one the
+strategy sized, entered and watches.
+
 ## Open items (not yet decided)
+
+- **The automated path still has no resting stop.** Only manual positions got one, which is what was asked for, and the asymmetry is now the obvious question: an automated position's stop is evaluated once per `timing.position_poll_interval` and is not enforced at all if the daemon stops. The reason for leaving it is that the automated path also *moves* its stop — the candle trail and the breakeven move after the target — and each move means cancel-and-replace, so the cost is a second order per position per trail step rather than one per position. Worth measuring against realised slippage on the automated exits before changing.
+- **The resting stop costs one order lookup per manual position per tick.** The broker does not call back, so `pollProtectiveStop` asks. At the position cap that is a small number against Alpaca's 200/min, but it is on the same budget as the ~130-request scan and nothing measures tick duration — the same blind spot recorded above.
+- **A manual position can no longer be carried overnight**, which the 2026-09-30 request wanted. If that need returns, it conflicts directly with the forced exit and needs a deliberate choice rather than both.
 
 - **(Superseded 2026-09-29: the micro pullback trades ~150 times a year and still measured no edge; see above.)** **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.
 - **Float is still absent and still matters.** Low float is the mechanism that makes these moves extend, and it is the one part of the approach that could not be aligned. It needs a fundamentals provider Alpaca does not offer; no provider has been chosen.

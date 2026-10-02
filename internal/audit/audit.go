@@ -31,10 +31,7 @@ const (
 	// summary that counted it as a close would double-count the trade.
 	PositionScaledOut Kind = "POSITION_SCALED_OUT"
 	PositionClosed    Kind = "POSITION_CLOSED"
-	// PositionHeld is a manual position left open through the forced end-of-day
-	// exit, which does not apply to it. Recorded once per position per session.
-	PositionHeld Kind = "POSITION_HELD"
-	EntrySkipped Kind = "ENTRY_SKIPPED"
+	EntrySkipped      Kind = "ENTRY_SKIPPED"
 	// OrderNotFilled is an exit order that sold nothing or only part of what it
 	// asked for within the fill wait. Whatever did not sell is still held, and the
 	// exit rule is tried again on the next tick.

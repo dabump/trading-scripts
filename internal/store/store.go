@@ -344,6 +344,21 @@ func (s *Store) MoveStop(id int64, stop float64) error {
 	return nil
 }
 
+// SetStopOrderID records the broker order id of the protective stop resting against
+// a position, or clears it with an empty string once that order is cancelled or
+// filled.
+//
+// It is stored rather than held in memory because the order outlives the process: a
+// restart that forgot the id would leave a live sell order at the broker that
+// nothing would ever cancel, and the next exit would sell the position twice.
+func (s *Store) SetStopOrderID(id int64, orderID string) error {
+	_, err := s.db.Exec(`UPDATE positions SET stop_order_id = ? WHERE id = ?`, orderID, id)
+	if err != nil {
+		return fmt.Errorf("set stop order id: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 	defer rows.Close()
 	var out []domain.Position
@@ -354,7 +369,7 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 		if err := rows.Scan(&p.ID, &p.SessionDate, &p.Symbol, &p.Shares, &p.SharesOpen,
 			&p.EntryPrice, &entryTime, &p.PeakPrice, &p.LastPrice, &p.StopPrice,
 			&p.InitialRisk, &targetHit, &p.BankedDollars, &isOpen, &p.ExitPrice,
-			&exitTime, &p.ExitReason, &manual); err != nil {
+			&exitTime, &p.ExitReason, &manual, &p.StopOrderID); err != nil {
 			return nil, err
 		}
 		p.EntryTime = parseTime(entryTime)
@@ -369,7 +384,7 @@ func (s *Store) scanPositions(rows *sql.Rows) ([]domain.Position, error) {
 
 const positionColumns = `id, session_date, symbol, shares, shares_open, entry_price,
 	entry_time, peak_price, last_price, stop_price, initial_risk, target_hit,
-	banked_dollars, is_open, exit_price, exit_time, exit_reason, manual`
+	banked_dollars, is_open, exit_price, exit_time, exit_reason, manual, stop_order_id`
 
 // OpenPositions returns every currently-held position, regardless of session.
 func (s *Store) OpenPositions() ([]domain.Position, error) {

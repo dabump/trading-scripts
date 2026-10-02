@@ -321,6 +321,12 @@ type OpenModal struct {
 	// NotQualified is the screen's reason when the symbol failed it, so the modal
 	// can say the open overrode the screen too.
 	NotQualified string
+	// StopOrderPlaced and StopOrderNote report whether the 1R stop is resting at the
+	// broker as a real order. The distinction is the operator's to know: a stop that
+	// only the scan loop checks is a stop with a tick of latency, which on the kind
+	// of mover this screen finds is most of the loss it was supposed to cap.
+	StopOrderPlaced bool
+	StopOrderNote   string
 }
 
 // handleOpenPosition buys a screened candidate on the operator's instruction.
@@ -360,6 +366,9 @@ func (s *Server) handleOpenPosition(w http.ResponseWriter, r *http.Request) {
 		Risk:     money(res.RiskDollar),
 		Notional: accountMoney(float64(res.Shares) * res.Entry),
 		Halted:   res.Halted,
+
+		StopOrderPlaced: res.StopOrderPlaced,
+		StopOrderNote:   res.StopOrderNote,
 	}
 	if !res.Qualified {
 		m.NotQualified = res.ScreenReason

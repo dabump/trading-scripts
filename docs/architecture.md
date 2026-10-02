@@ -7,7 +7,7 @@
 A single Go binary runs as one continuously-running daemon process (not a cron job) with two concurrent responsibilities:
 
 1. **The trading loop** — sentiment gating, screening, entry/exit decisions, order placement.
-2. **A status web server** — a page showing current state (open and closed positions, today's sentiment reading, recent decisions), backed directly by the same store the trading loop writes to. Mostly read-only: two manual checks that cannot trade, plus **Open** and **Close** controls that can. Open overrides the entry signal but not the entry-side risk rules; a position it opens is then exempt from every exit rule and closes only by hand.
+2. **A status web server** — a page showing current state (open and closed positions, today's sentiment reading, recent decisions), backed directly by the same store the trading loop writes to. Mostly read-only: two manual checks that cannot trade, plus **Open** and **Close** controls that can. Open overrides the entry signal but not the risk rules; a position it opens keeps its 1R stop — left resting at the broker as a real order — and is force-closed at the bell, but no other exit rule touches it.
 
 There is one Alpaca account/API key set used for both market data and order execution, so there's a single `broker` client rather than separate data and execution integrations. `broker` also ships a `Fake` implementation, which is what the tests and `-offline` mode run against; the daemon can therefore be exercised end to end with no credentials and no network.
 
@@ -63,12 +63,16 @@ buttons and are the two controls that trade. Both go through the same `submit` p
 the strategy uses. A manual open overrides the setup gate and nothing else on the way
 in — sizing from a stop, the position cap and the same-day rules are all applied
 exactly as they are for an automatic entry. Once open, the position is flagged
-`manual` and **no exit rule applies to it**, the forced end-of-day exit included:
-`managePositions` only keeps its mark current, and only Close sells it. See [`web-ui.md`](./web-ui.md) for the reasoning.
+`manual` and **only two exit rules apply to it**: its own 1R stop, left resting at the
+broker as a good-till-cancelled stop order (`engine.placeProtectiveStop`, id stored as
+`stop_order_id`), and the forced end-of-day exit. The signal rules — gap backstop,
+candle trail, scale-out — do not. Every path that sells it cancels the resting order
+first, confirmed by looking the order up, because an order outliving its holding goes
+short. See [`web-ui.md`](./web-ui.md) and [`risk.md`](./risk.md) for the reasoning.
 
-Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the strategy's positions, and the strategy holds nothing overnight. A manual position can be held overnight; no phase acts on it.
+Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the book, manual positions included, and nothing is held overnight. A manual position opened pre-market is the one case where its stop is enforced on the tick rather than by the resting order: Alpaca accepts a stop order before the bell but will not trigger one until 09:30.
 
-On startup, before the loop begins, `engine.Reconcile` compares the broker's positions against the store: anything the broker holds that the store does not know about is adopted, anything the store thinks is open that the broker does not hold is closed as `RECONCILED`, and orders recorded as submitted but never confirmed are resolved. This is what closes the crash-between-submit-and-confirm hole.
+On startup, before the loop begins, `engine.Reconcile` compares the broker's positions against the store: anything the broker holds that the store does not know about is adopted, anything the store thinks is open that the broker does not hold is closed as `RECONCILED` — unless it carried a resting stop order that filled, in which case that order's own fill price and `STOP_LOSS` are recorded instead of this morning's mark, which on a gap is a different number entirely — and orders recorded as submitted but never confirmed are resolved. This is what closes the crash-between-submit-and-confirm hole.
 
 **Positions are recorded from fills, not quotes.** `engine.submit` places the order,
 then polls `broker.Order` until the broker reports it done, for up to ten seconds

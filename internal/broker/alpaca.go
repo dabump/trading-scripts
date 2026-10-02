@@ -589,16 +589,26 @@ func (a *Alpaca) NextSession(ctx context.Context, afterDate string) (CalendarDay
 }
 
 func (a *Alpaca) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error) {
+	tif := req.TimeInForce
+	if tif == "" {
+		tif = "day"
+	}
 	payload := map[string]any{
 		"symbol":          req.Symbol,
 		"qty":             strconv.Itoa(req.Shares),
 		"side":            req.Side,
 		"type":            req.Type,
-		"time_in_force":   "day",
+		"time_in_force":   tif,
 		"client_order_id": req.ClientOrderID,
 	}
 	if req.Type == "limit" {
 		payload["limit_price"] = strconv.FormatFloat(req.LimitPrice, 'f', 2, 64)
+	}
+	// A stop order carries its trigger instead of a limit. Alpaca accepts one outside
+	// market hours but will not trigger it there, so a stop placed pre-market rests
+	// until the opening bell — see placeProtectiveStop.
+	if req.Type == "stop" {
+		payload["stop_price"] = strconv.FormatFloat(req.StopPrice, 'f', 2, 64)
 	}
 	// Sent only when asked for. Alpaca accepts extended_hours on a day limit order
 	// and rejects it on anything else, so setting it unconditionally would break

@@ -21,11 +21,19 @@ type CalendarDay struct {
 
 // OrderRequest is an order to submit.
 type OrderRequest struct {
-	Symbol        string
-	Shares        int
-	Side          string // "buy" or "sell"
-	Type          string // "market" or "limit"
-	LimitPrice    float64
+	Symbol     string
+	Shares     int
+	Side       string // "buy", "sell"
+	Type       string // "market", "limit" or "stop"
+	LimitPrice float64
+	// StopPrice is the trigger on a "stop" order, which is how a protective stop is
+	// left resting at the broker rather than evaluated on a tick. It is the only
+	// order type here that is not expected to fill when it is placed.
+	StopPrice float64
+	// TimeInForce defaults to "day" when empty. A resting protective stop sets
+	// "gtc": a day order would expire at the close and leave the position bare the
+	// moment the daemon was not watching, which is the case it exists for.
+	TimeInForce   string
 	ClientOrderID string
 	// ExtendedHours routes the order to the pre- or post-market session. Alpaca
 	// only accepts it on a day limit order — a market order outside 09:30-16:00 is

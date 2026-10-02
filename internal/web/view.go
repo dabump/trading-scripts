@@ -111,8 +111,13 @@ type PositionRow struct {
 	PnLDollars string
 	PnLPct     string
 	Tone       string
-	// Manual marks a position opened from the page, which no exit rule touches.
+	// Manual marks a position opened from the page: subject to its own stop and the
+	// forced exit, and to no other exit rule.
 	Manual bool
+	// StopResting says a manual position's stop is a live order at the broker rather
+	// than one the scan tick evaluates. Both are stops; only one survives the daemon
+	// not running.
+	StopResting bool
 }
 
 type EODRow struct {
@@ -506,9 +511,12 @@ func BuildView(
 			Tone: toneForPnL(pnl), Manual: p.Manual,
 		}
 		if p.Manual {
-			// The stored stop only sized it; showing it as a price would suggest it
-			// protects the position.
-			row.Stop = "manual"
+			// The stop is shown as a price, because it is a real one: a resting order
+			// at the broker when StopOrderID is set, and evaluated on the tick when it
+			// is not. The distinction is the part worth marking — a tick-checked stop
+			// on a fast mover is most of the loss it was meant to cap — so the cell
+			// says which, and StopResting carries it to the title text.
+			row.StopResting = p.StopOrderID != ""
 			if p.SessionDate != date {
 				row.SharesNote = "held since " + p.SessionDate
 			}

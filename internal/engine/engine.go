@@ -79,11 +79,12 @@ type Engine struct {
 	// per position, so the bar request is made once per candle rather than on every
 	// position poll. Only managePositions touches it, and only from Tick.
 	trailedTo map[int64]time.Time
-	// heldThroughClose latches the session in which each manual position's hold
-	// through the forced exit was audited, so it is recorded once rather than on
-	// every EOD-window tick.
-	heldThroughClose map[int64]string
-
+	// faultedStops latches the positions whose exit is being held off because their
+	// resting stop could not be cancelled, so that fault is audited once rather than
+	// on every tick — and timing.position_poll_interval is 2s, so "every tick" is
+	// over a thousand identical rows an hour. Cleared when the stop does come off,
+	// so a condition that recurs later is recorded again.
+	faultedStops map[int64]bool
 	// fillWait bounds how long submit waits for an order to finish filling before
 	// cancelling what is left, and fillPoll is how often it asks in the meantime.
 	// Fields rather than config because they describe the broker, not the strategy;
@@ -342,6 +343,32 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		if _, held := byBroker[sym]; held {
 			continue
 		}
+		// A manual position with a resting stop has an obvious suspect, and it carries
+		// the real exit: the broker's own fill price and time. Asking it first is what
+		// keeps a stop that fired overnight from being recorded as a reconciliation at
+		// whatever the symbol happens to be worth this morning, which on a gap is a
+		// different number entirely.
+		if lp.StopOrderID != "" {
+			res, err := e.trading.Order(ctx, lp.StopOrderID)
+			if err != nil {
+				e.log.Warn("could not read the protective stop while reconciling",
+					"symbol", sym, "err", err)
+			} else if res.FilledShares > 0 {
+				e.log.Info("protective stop had fired while the agent was not running",
+					"symbol", sym, "shares", res.FilledShares, "fill", res.FilledPrice)
+				e.record(audit.Reconciled, sym,
+					fmt.Sprintf("the resting stop order sold %d shares at $%.2f while the agent was "+
+						"not running", res.FilledShares, res.FilledPrice),
+					map[string]any{"action": "stop_filled", "shares": res.FilledShares,
+						"entry_price": lp.EntryPrice, "exit_price": res.FilledPrice,
+						"stop_price": lp.StopPrice})
+				if err := e.closeOnProtectiveStop(lp, res); err != nil {
+					return fmt.Errorf("reconcile-close %s: %w", sym, err)
+				}
+				continue
+			}
+		}
+
 		e.log.Warn("closing local position the broker no longer holds", "symbol", sym)
 		e.record(audit.Reconciled, sym,
 			"closed a local position the broker no longer holds",
@@ -1143,15 +1170,16 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 	for _, p := range open {
 		price := snaps[p.Symbol].Price
 		if p.Manual {
-			// Opened by hand, closed by hand: no stop, trail, target or forced exit.
-			// Only the mark is kept current, for the page.
+			// Opened by hand, and governed by two rules rather than none: its own 1R
+			// stop, which is what sized it, and the forced exit. The signal rules —
+			// backstop, candle trail, scale-out — still do not apply.
 			if price > 0 {
 				if err := e.store.UpdateMark(p.ID, price, max(p.PeakPrice, price)); err != nil {
 					return err
 				}
 			}
-			if forceEOD {
-				e.noteHeldThroughClose(sess, p, price)
+			if err := e.manageManual(ctx, sess, bounds, p, price, forceEOD); err != nil {
+				return err
 			}
 			continue
 		}
@@ -1236,32 +1264,183 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 	return nil
 }
 
-// noteHeldThroughClose records, once per position per session, that a manual position
-// was left open through the forced exit. The EOD window re-runs managePositions on
-// every tick, so without the latch this would be written dozens of times.
-func (e *Engine) noteHeldThroughClose(sess scheduler.Session, p domain.Position, price float64) {
-	if e.heldThroughClose == nil {
-		e.heldThroughClose = map[int64]string{}
+// manageManual applies the two rules a manual position has, and does it around a
+// stop that lives at the broker rather than here.
+//
+// The order of business is fixed. First ask whether the resting stop has already sold
+// the position, because everything else is wrong if it has. Then act only where that
+// order cannot: the end of the day, which an order has no concept of, and the windows
+// where the stop is not actually being enforced. In the ordinary case — regular
+// session, order resting, price above the stop — this does nothing but the lookup,
+// which is the point: the floor is the broker's to hold.
+func (e *Engine) manageManual(ctx context.Context, sess scheduler.Session,
+	bounds scheduler.Boundaries, p domain.Position, price float64, forceEOD bool) error {
+	if res, err := e.pollProtectiveStop(ctx, &p); err != nil {
+		// A lookup that failed says nothing about the order, which is still the
+		// broker's floor under the position. Selling on a failed read would be acting
+		// on no information at all, so leave it and ask again next tick.
+		e.log.Warn("could not read the protective stop; leaving the position alone",
+			"symbol", p.Symbol, "err", err)
+		return nil
+	} else if res.FilledShares > 0 {
+		return e.closeOnProtectiveStop(p, res)
 	}
-	if e.heldThroughClose[p.ID] == sess.Date {
-		return
-	}
-	e.heldThroughClose[p.ID] = sess.Date
-	if price <= 0 {
-		price = p.LastPrice
-	}
-	e.log.Info("manual position held through the forced exit", "symbol", p.Symbol,
-		"shares", p.SharesOpen, "price", price)
-	e.record(audit.PositionHeld, p.Symbol,
-		fmt.Sprintf("held %d shares through the forced exit: opened by hand, so only a manual close sells it",
-			p.SharesOpen),
-		map[string]any{
-			"shares_held":    p.SharesOpen,
-			"entry_price":    p.EntryPrice,
-			"price":          price,
-			"unrealized_pnl": p.UnrealizedDollars(price),
-			"opened_session": p.SessionDate,
+
+	decision := strategy.ExitDecision{}
+	switch {
+	case forceEOD:
+		decision = strategy.EvaluateManualExit(strategy.ExitInput{
+			Position: p, Price: price, EODReached: true,
 		})
+	case e.stopIsUnenforced(p, bounds):
+		// No working order, or before the bell where a stop order cannot trigger.
+		// The stop is the engine's to hold until that changes.
+		decision = strategy.EvaluateManualExit(strategy.ExitInput{Position: p, Price: price})
+	}
+	if !decision.Exit {
+		return nil
+	}
+
+	quoted := price
+	if quoted <= 0 {
+		quoted = p.EntryPrice
+	}
+
+	// Off the book before anything is sold. A resting sell order that outlives its
+	// holding is a short position, so a failure here stops the exit rather than
+	// racing it — and if the stop filled in the meantime, that fill is the exit.
+	res, err := e.releaseProtectiveStop(ctx, &p)
+	if err != nil {
+		e.log.Error("not selling: the protective stop could not be taken off the book",
+			"symbol", p.Symbol, "reason", decision.Reason, "err", err)
+		if !e.faultedStops[p.ID] {
+			if e.faultedStops == nil {
+				e.faultedStops = map[int64]bool{}
+			}
+			e.faultedStops[p.ID] = true
+			e.record(audit.Fault, p.Symbol,
+				fmt.Sprintf("held off a %s exit for %s: its resting stop order could not be cancelled, "+
+					"and selling with that order still working could go short", decision.Reason, p.Symbol),
+				map[string]any{
+					"reason":          string(decision.Reason),
+					"protective_stop": "still working",
+					"stop_order_id":   p.StopOrderID,
+					"err":             err.Error(),
+				})
+		}
+		return nil
+	}
+	delete(e.faultedStops, p.ID)
+	if res.FilledShares > 0 {
+		return e.closeOnProtectiveStop(p, res)
+	}
+
+	extendedHours := scheduler.PhaseAt(e.now(), bounds) == domain.PhasePreMarket
+	f, err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, quoted, extendedHours)
+	if err != nil {
+		return err
+	}
+	if short, err := e.shortExit(p, f, quoted, decision.Reason); short || err != nil {
+		// Whatever is still held now has no resting stop, so the engine keeps its
+		// floor — stopIsUnenforced is true with the id cleared — and the exit is
+		// tried again next tick.
+		return err
+	}
+	exitPrice := f.Price
+	if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), decision.Reason); err != nil {
+		return err
+	}
+
+	pnl := p.UnrealizedDollars(exitPrice)
+	e.log.Info("exited manual position", "symbol", p.Symbol, "reason", decision.Reason,
+		"entry", p.EntryPrice, "exit", exitPrice, "shares", p.SharesOpen,
+		"pnl", fmt.Sprintf("%+.2f", pnl))
+	e.record(audit.PositionClosed, p.Symbol,
+		fmt.Sprintf("sold %d shares of a position opened by hand at $%.2f (%s), %+.2f%% on the trade",
+			p.SharesOpen, exitPrice, decision.Reason, pnl/(p.EntryPrice*float64(p.Shares))*100),
+		fillDetail(map[string]any{
+			"manual":          true,
+			"reason":          string(decision.Reason),
+			"shares_sold":     p.SharesOpen,
+			"shares_bought":   p.Shares,
+			"entry_price":     p.EntryPrice,
+			"exit_price":      exitPrice,
+			"stop_price":      p.StopPrice,
+			"initial_stop":    p.EntryPrice - p.InitialRisk,
+			"protective_stop": "cancelled before selling",
+			"peak_price":      p.PeakPrice,
+			"pnl_dollars":     pnl,
+			"r_multiple":      p.RMultiple(exitPrice),
+			"held_for":        e.now().Sub(p.EntryTime).String(),
+		}, f, quoted, p.SharesOpen))
+	return nil
+}
+
+// closeOnProtectiveStop records an exit the broker executed on its own, from the
+// resting stop order rather than from anything the daemon did.
+//
+// The fill price is the broker's, not a mark the daemon read: the whole reason the
+// order rests there is that it can fire between ticks, or while this process is not
+// running, so the only honest exit price is the one that executed. The reason is
+// ExitStopLoss, because that is what happened — the position was stopped out, and
+// nothing about it being enforced off-process makes it a different exit.
+func (e *Engine) closeOnProtectiveStop(p domain.Position, res broker.OrderResult) error {
+	if err := e.store.SetStopOrderID(p.ID, ""); err != nil {
+		return err
+	}
+	price := res.FilledPrice
+	if price <= 0 {
+		price = p.StopPrice
+	}
+
+	// A stop that filled short left shares behind. Bank what sold and leave the rest
+	// held with no working order, so the engine's own stop picks it up next tick.
+	if res.FilledShares < p.SharesOpen {
+		if err := e.store.ReduceShares(p.ID, res.FilledShares, price); err != nil {
+			return err
+		}
+		left := p.SharesOpen - res.FilledShares
+		e.log.Warn("protective stop filled short; the rest is still held",
+			"symbol", p.Symbol, "sold", res.FilledShares, "held", left)
+		e.record(audit.OrderNotFilled, p.Symbol,
+			fmt.Sprintf("the resting stop order sold %d of %d shares; %d is still held",
+				res.FilledShares, p.SharesOpen, left),
+			map[string]any{
+				"protective_stop": "filled short",
+				"shares_sold":     res.FilledShares,
+				"shares_left":     left,
+				"fill_price":      price,
+				"stop_price":      p.StopPrice,
+			})
+		return nil
+	}
+
+	if err := e.store.ClosePosition(p.ID, price, e.now(), domain.ExitStopLoss); err != nil {
+		return err
+	}
+	pnl := p.UnrealizedDollars(price)
+	e.log.Info("protective stop filled at the broker", "symbol", p.Symbol,
+		"shares", res.FilledShares, "stop", p.StopPrice, "fill", price,
+		"pnl", fmt.Sprintf("%+.2f", pnl))
+	e.record(audit.PositionClosed, p.Symbol,
+		fmt.Sprintf("the resting stop order sold %d shares at $%.2f, %+.2f%% on the trade",
+			res.FilledShares, price, pnl/(p.EntryPrice*float64(p.Shares))*100),
+		map[string]any{
+			"manual":          true,
+			"reason":          string(domain.ExitStopLoss),
+			"protective_stop": "filled",
+			"shares_sold":     res.FilledShares,
+			"shares_bought":   p.Shares,
+			"entry_price":     p.EntryPrice,
+			"exit_price":      price,
+			"stop_price":      p.StopPrice,
+			"slippage":        price - p.StopPrice,
+			"pnl_dollars":     pnl,
+			"r_multiple":      p.RMultiple(price),
+			"held_for":        e.now().Sub(p.EntryTime).String(),
+			"order_status":    res.Status,
+		})
+	return nil
 }
 
 // shortExit handles an exit order that sold less than the position held, and reports

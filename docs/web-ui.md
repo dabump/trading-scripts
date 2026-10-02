@@ -147,7 +147,13 @@ What it overrides is the **signal**, and only the signal:
 - **The kill switch does not block it**, because an instruction about one named symbol is not the thing it exists to stop — but the confirmation warns, and the audit event carries `overrode_halt`.
 - **Refused inside the end-of-day window**, where anything bought is about to be force-sold, and refused with the exchange shut.
 
-**Once open, nothing sells it but its Close button.** A position opened here has no stop, no gap backstop, no candle trail, no scale-out and no forced exit before the close; it is held overnight and into later sessions until it is closed by hand (changed 2026-09-30, on request — before that it was managed like any other position). The stop above still sizes it, but a loss past that stop is not capped. In the positions table its Stop cell reads `manual`, and a position carried from an earlier session says `held since <date>` under its share count. The confirmation says all of this.
+**Once open, its stop and the bell sell it — nothing else does.** A position opened here has no gap backstop, no candle trail and no scale-out at a target, but it does have the stop that sized it, and it is force-closed before the close like any other position (changed 2026-10-02, on request; between 2026-09-30 and that date it had no exit rules at all and was held overnight).
+
+**The stop is a real order at the broker**, placed right after the entry fill: a good-till-cancelled sell stop at the 1R price, so it is enforced between scans and while the agent is not running. That is the point of it — a stop checked once per scan is a stop with a tick of latency, and on the kind of mover this screen finds that latency is most of the loss it was supposed to cap. The confirmation says it is resting. Every way of selling the position — Close, the forced exit — cancels that order first.
+
+If the order could not be placed, the confirmation says so in an **alert**, not a footnote: the agent then checks that stop on each scan instead, which is a weaker guarantee, and an operator who believes they have a resting stop and does not will size the next decision wrongly. The same is true before the bell, where a stop order is accepted but cannot trigger until 09:30.
+
+In the positions table a manual row shows its stop as a price, with `on tick` beside it when no order is resting, and the cell's tooltip says which rules apply. A position carried from an earlier session says `held since <date>` under its share count.
 
 A table of tickers currently being evaluated, with a per-criterion breakdown rather than a single pass/fail — this is what lets you see *why* a candidate did or didn't qualify:
 

@@ -116,6 +116,38 @@ func EvaluateExit(in ExitInput, cfg *config.Config) ExitDecision {
 	return ExitDecision{}
 }
 
+// EvaluateManualExit is the exit rule for a position opened from the status page,
+// which is a much shorter rule than the one above: the forced end-of-day deadline,
+// then the position's own stop. Nothing else.
+//
+// A manual position has no signal to read. The operator overrode the setup gate to
+// open it, so the backstop, the candle trail and the scale-out — all of which are
+// tuned to the pattern the gate looks for — have nothing to say about it, and the
+// measured evidence behind them was gathered on trades the gate allowed. What does
+// apply is the stop, because it is the stop that sized the position: the share count
+// came from entry − stop, so letting price through it means losing more than the
+// risk budget the trade was opened under.
+//
+// It lives here rather than in the engine so the rule has one home, the way
+// EvaluateExit does. In the normal case the engine does not call it at all — a
+// manual position's stop rests at the broker as a real order (see
+// engine.placeProtectiveStop), and this is what covers the gaps that order cannot:
+// the end of the day, which an order has no concept of, and the windows where the
+// order does not exist or cannot yet trigger.
+func EvaluateManualExit(in ExitInput) ExitDecision {
+	if in.EODReached {
+		return ExitDecision{Exit: true, Reason: domain.ExitForcedEOD}
+	}
+	p := in.Position
+	if p.EntryPrice <= 0 || in.Price <= 0 || p.SharesOpen <= 0 {
+		return ExitDecision{}
+	}
+	if p.StopPrice > 0 && atOrBelow(in.Price, p.StopPrice) {
+		return ExitDecision{Exit: true, Reason: domain.ExitStopLoss}
+	}
+	return ExitDecision{}
+}
+
 // CandleTrailStop is the stop the candle trail (exit.candle_trail) puts under a
 // position once last has completed: that candle's low, so the next candle to trade
 // below it sells what is held. It returns 0 when the trail does not apply — switched

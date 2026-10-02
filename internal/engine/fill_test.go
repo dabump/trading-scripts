@@ -102,10 +102,14 @@ func TestPartialEntryHoldsWhatFilled(t *testing.T) {
 // An exit that sells short banks what sold and keeps the rest, which the stop — still
 // breached — sells on the next tick. Closing the whole row would leave the store flat
 // while the broker still held shares.
+//
+// Only reachable when the tick sells, which with a resting stop it does not do for a
+// stop-loss — so the broker refuses stop orders here, and the engine holds the stop.
 func TestShortExitKeepsTheRemainderOpen(t *testing.T) {
 	h := newHarness(t)
 	mem := withAudit(t, h)
 	h.fastFills()
+	h.fake.SetStopOrderError(errors.New("stop orders refused"))
 	pos := h.buyOne(t, "ABCD", 5.00)
 
 	h.fake.SetFillLimit("ABCD", 1000)

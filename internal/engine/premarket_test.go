@@ -54,6 +54,18 @@ func (h *harness) lastScreenAt() string {
 	return at.In(scheduler.ET).Format("15:04")
 }
 
+// tradeOrders is every order placed except the protective stops, which follow every
+// entry and are tested on their own.
+func (h *harness) tradeOrders() []broker.OrderRequest {
+	var out []broker.OrderRequest
+	for _, o := range h.fake.Placed() {
+		if o.Type != "stop" {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // addPreMarketCandidate registers a symbol whose numbers are a pre-market mover:
 // a big move on volume that is a real fraction of a normal day, but nowhere near the
 // regular session's 5x or its $1,000,000 floor.
@@ -66,7 +78,10 @@ func (h *harness) addPreMarketCandidate(symbol string, price float64) {
 	h.fake.SetSessionVolume(symbol, 800_000)         // 0.8x the daily average
 	h.fake.SetAverageVolume(symbol, 1_000_000)
 	h.fake.SetNews(symbol, 2)
-	h.fake.SetSetupBars(symbol, price, h.open.Add(-2*time.Hour), h.cfg.Entry.PatternInterval)
+	// Sixteen candles ending at 07:30, so the setup has closed by the tests' 07:30 tick:
+	// a candle still forming is never read as a trigger.
+	h.fake.SetSetupBars(symbol, price, h.open.Add(-2*time.Hour-16*h.cfg.Entry.PatternInterval),
+		h.cfg.Entry.PatternInterval)
 }
 
 // With the section off, the hours before the bell are exactly what they always were:
@@ -84,7 +99,7 @@ func TestPreMarketDisabledLeavesTheMorningIdle(t *testing.T) {
 	if got := len(h.latestScreen()); got != 0 {
 		t.Errorf("screened %d symbols before the open with pre-market off, want 0", got)
 	}
-	if got := len(h.fake.Placed()); got != 0 {
+	if got := len(h.tradeOrders()); got != 0 {
 		t.Errorf("placed %d orders, want 0", got)
 	}
 }
@@ -109,7 +124,7 @@ func TestPreMarketScreensWithoutBuying(t *testing.T) {
 	if evals[0].Outcome != "pre-market entry is disabled" {
 		t.Errorf("Outcome = %q, want the page to say why it was not bought", evals[0].Outcome)
 	}
-	if got := len(h.fake.Placed()); got != 0 {
+	if got := len(h.tradeOrders()); got != 0 {
 		t.Fatalf("placed %d orders with premarket.allow_entry off, want 0", got)
 	}
 	if len(h.openPositions()) != 0 {
@@ -166,7 +181,7 @@ func TestPreMarketEntryUsesExtendedHoursOrders(t *testing.T) {
 	h.tick()
 	h.wantState(domain.StatePreMarket)
 
-	placed := h.fake.Placed()
+	placed := h.tradeOrders()
 	if len(placed) != 1 {
 		t.Fatalf("placed %d orders, want 1: %+v", len(placed), placed)
 	}
@@ -201,7 +216,7 @@ func TestPreMarketEntryIsGatedOnLiveSentiment(t *testing.T) {
 	h.tick()
 	h.wantState(domain.StatePreMarket)
 
-	if got := len(h.fake.Placed()); got != 0 {
+	if got := len(h.tradeOrders()); got != 0 {
 		t.Fatalf("placed %d orders on a bearish pre-market tape, want 0", got)
 	}
 	evals := h.latestScreen()
@@ -263,6 +278,9 @@ func TestPreMarketPositionCanStopOutBeforeTheBell(t *testing.T) {
 	h.allowPreMarketEntry()
 	h.setBullish()
 	h.addPreMarketCandidate("EARLY", 5.00)
+	// Alpaca accepts the protective stop before the bell but will not fire it, so
+	// the engine is what has to sell here.
+	h.fake.SetStopsInert(true)
 
 	h.at(7, 30)
 	h.tick()
@@ -279,7 +297,7 @@ func TestPreMarketPositionCanStopOutBeforeTheBell(t *testing.T) {
 	if len(h.openPositions()) != 0 {
 		t.Fatal("the stop must fire during pre-market, not wait for the open")
 	}
-	placed := h.fake.Placed()
+	placed := h.tradeOrders()
 	last := placed[len(placed)-1]
 	if last.Side != "sell" || !last.ExtendedHours {
 		t.Errorf("exit order = %+v, want a sell routed to the extended-hours book", last)
@@ -387,7 +405,7 @@ func TestPreMarketLimitOrdersDoNotChangeTheRegularSession(t *testing.T) {
 
 	h.at(7, 30)
 	h.tick()
-	pre := h.fake.Placed()
+	pre := h.tradeOrders()
 	if len(pre) != 1 || pre[0].Type != "limit" || !pre[0].ExtendedHours {
 		t.Fatalf("pre-market order = %+v, want an extended-hours limit order", pre)
 	}
@@ -399,9 +417,9 @@ func TestPreMarketLimitOrdersDoNotChangeTheRegularSession(t *testing.T) {
 	h.tick()
 
 	var regular *broker.OrderRequest
-	for i, o := range h.fake.Placed() {
+	for i, o := range h.tradeOrders() {
 		if o.Symbol == "LATER" {
-			regular = &h.fake.Placed()[i]
+			regular = &h.tradeOrders()[i]
 		}
 	}
 	if regular == nil {
@@ -430,7 +448,7 @@ func TestPreMarketLimitSlipFallsBackToTheRegularAllowance(t *testing.T) {
 	h.at(7, 30)
 	h.tick()
 
-	placed := h.fake.Placed()
+	placed := h.tradeOrders()
 	if len(placed) != 1 {
 		t.Fatalf("placed %d orders, want 1", len(placed))
 	}
@@ -449,6 +467,9 @@ func TestPreMarketExitPricesBelowTheMark(t *testing.T) {
 	h.allowPreMarketEntry()
 	h.setBullish()
 	h.addPreMarketCandidate("EARLY", 5.00)
+	// Alpaca accepts the protective stop before the bell but will not fire it, so
+	// the engine is what has to sell here.
+	h.fake.SetStopsInert(true)
 
 	h.at(7, 30)
 	h.tick()
@@ -462,7 +483,7 @@ func TestPreMarketExitPricesBelowTheMark(t *testing.T) {
 	h.at(8, 0)
 	h.tick()
 
-	placed := h.fake.Placed()
+	placed := h.tradeOrders()
 	sell := placed[len(placed)-1]
 	if sell.Side != "sell" || sell.Type != "limit" || !sell.ExtendedHours {
 		t.Fatalf("exit order = %+v, want an extended-hours limit sell", sell)

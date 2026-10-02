@@ -108,12 +108,16 @@ func run() error {
 
 		// Pre-market cannot be compressed the way the rest is: its start is a wall
 		// clock time in exchange hours, not an offset from the open. So it is moved to
-		// now instead, and seedFake pushes the simulated open a little into the future
-		// — which is what makes the demo start in PRE_MARKET and walk through the new
-		// state rather than skipping straight past it. Left alone when the config has
-		// pre-market off, so the switch still means something offline.
+		// just before now instead, and seedFake pushes the simulated open a little into
+		// the future — which is what makes the demo start in PRE_MARKET and walk
+		// through the new state rather than skipping straight past it. "Just before"
+		// is the length of DEMO's seeded chart: the setup is read on closed candles
+		// only, so the chart has to have finished by the time the demo starts. Left
+		// alone when the config has pre-market off, so the switch still means
+		// something offline.
 		if cfg.PreMarket.Enabled {
-			cfg.PreMarket.Start = time.Now().In(scheduler.ET).Format("15:04")
+			cfg.PreMarket.Start = time.Now().Add(-offlineChartLen * cfg.Entry.PatternInterval).
+				In(scheduler.ET).Format("15:04")
 			cfg.PreMarket.ScanInterval = 5 * time.Second
 			logger.Warn("offline mode: pre-market opened at the current clock time",
 				"start", cfg.PreMarket.Start, "scan_interval", cfg.PreMarket.ScanInterval)
@@ -318,6 +322,9 @@ func isCleanShutdown(err error) bool {
 		errors.Is(err, http.ErrServerClosed)
 }
 
+// offlineChartLen is how many candles broker.Fake.SetSetupBars seeds.
+const offlineChartLen = 16
+
 // seedFake builds an offline broker with a plausible session and one candidate
 // that clears every screening criterion, so the daemon and its page can be
 // exercised end to end without credentials.
@@ -371,8 +378,15 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	fake.SetAverageVolume("DEMO", 1_000_000)
 	fake.SetNews("DEMO", 2)
 	// Clearing the screen is no longer enough to be bought: the chart has to print a
-	// pullback and resumption. DEMO gets one, so the demo reaches an actual entry.
-	fake.SetSetupBars("DEMO", 4.56, open, cfg.Entry.PatternInterval)
+	// pullback and resumption. DEMO gets one, so the demo reaches an actual entry. It
+	// has closed by now: pre-market was opened one chart's length ago for it. With
+	// pre-market off it starts at the open and is only complete once that many
+	// candles have passed.
+	chartStart := open
+	if cfg.PreMarket.Enabled {
+		chartStart = now.Add(-offlineChartLen * cfg.Entry.PatternInterval).Truncate(cfg.Entry.PatternInterval)
+	}
+	fake.SetSetupBars("DEMO", 4.56, chartStart, cfg.Entry.PatternInterval)
 
 	// SETUPLESS clears every screening criterion but never sets up, which is the
 	// common real-world case and the one the page's Action column exists to explain.

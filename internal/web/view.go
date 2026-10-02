@@ -114,9 +114,9 @@ type PositionRow struct {
 	// Manual marks a position opened from the page: subject to its own stop and the
 	// forced exit, and to no other exit rule.
 	Manual bool
-	// StopResting says a manual position's stop is a live order at the broker rather
-	// than one the scan tick evaluates. Both are stops; only one survives the daemon
-	// not running.
+	// StopResting says the position's stop is a live order at the broker rather than
+	// one only the tick evaluates. Both are stops; only one survives the daemon not
+	// running.
 	StopResting bool
 }
 
@@ -418,9 +418,10 @@ func BuildView(
 			Classification: string(r.Classification),
 			Tone:           "idle",
 		}
-		if r.Classification == domain.VerdictBearish {
+		switch r.Classification {
+		case domain.VerdictBearish:
 			row.Tone = "bad"
-		} else if r.Classification == domain.VerdictProceed {
+		case domain.VerdictProceed:
 			row.Tone = "good"
 		}
 		for _, sym := range cfg.Sentiment.Symbols {
@@ -509,14 +510,13 @@ func BuildView(
 			Current: money(current), Peak: money(p.PeakPrice),
 			PnLDollars: signedMoney(pnl), PnLPct: pct(p.UnrealizedPct(current)),
 			Tone: toneForPnL(pnl), Manual: p.Manual,
+			// The stop is a resting order at the broker when StopOrderID is set, and
+			// evaluated only on the tick when it is not. The distinction is the part
+			// worth marking — a tick-checked stop on a fast mover is most of the loss
+			// it was meant to cap — so the cell says which.
+			StopResting: p.StopOrderID != "",
 		}
 		if p.Manual {
-			// The stop is shown as a price, because it is a real one: a resting order
-			// at the broker when StopOrderID is set, and evaluated on the tick when it
-			// is not. The distinction is the part worth marking — a tick-checked stop
-			// on a fast mover is most of the loss it was meant to cap — so the cell
-			// says which, and StopResting carries it to the title text.
-			row.StopResting = p.StopOrderID != ""
 			if p.SessionDate != date {
 				row.SharesNote = "held since " + p.SessionDate
 			}
@@ -835,6 +835,12 @@ func strategySections(cfg *config.Config) []StrategySection {
 					pctOf(cfg.Entry.StopBufferPct), pctOf(cfg.Entry.MaxStopDistancePct)),
 			},
 			{
+				Label: "Price re-check",
+				Value: fmt.Sprintf("refused if more than %s past the trigger close", pctOf(cfg.Entry.MaxEntryDriftPct)),
+				Note: "the live price is read just before buying; also refused under the pause high or " +
+					"the stop, and the size comes from it",
+			},
+			{
 				Label: "Setup warm-up",
 				Value: durationText(strategy.WarmupDuration(cfg)),
 				Note:  "after the open, before enough candles exist to read a setup",
@@ -888,20 +894,23 @@ func strategySections(cfg *config.Config) []StrategySection {
 		Note: "no fixed profit target on it: a +15% target with a 5% trailing stop " +
 			"was measured capping gains at +9% while losses ran to −10%",
 	}
+	trailLow := "the stop rises to each completed " + durationText(strategy.TrailInterval(cfg)) + " candle's low"
+	if n := strategy.TrailBars(cfg); n > 1 {
+		trailLow = fmt.Sprintf("the stop rises to the lowest low of the last %d completed %s candles", n,
+			durationText(strategy.TrailInterval(cfg)))
+	}
 	switch cfg.Exit.CandleTrail {
 	case config.CandleTrailAlways:
 		trailRow = StrategyRow{
 			Label: "Candle trail",
 			Value: "sold on the first candle below the previous candle's low",
-			Note: "from the entry candle on: the stop rises to each completed " +
-				durationText(cfg.Entry.PatternInterval) + " candle's low",
+			Note:  "from the entry candle on: " + trailLow,
 		}
 	case config.CandleTrailAfterTarget:
 		trailRow = StrategyRow{
 			Label: "Candle trail",
 			Value: "runner sold on the first candle below the previous candle's low",
-			Note: "once the first target is banked, the stop rises to each completed " +
-				durationText(cfg.Entry.PatternInterval) + " candle's low",
+			Note:  "once the first target is banked, " + trailLow,
 		}
 	}
 

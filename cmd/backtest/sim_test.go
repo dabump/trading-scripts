@@ -26,6 +26,7 @@ func testCfg() *config.Config {
 	c.Entry.MaxRetracePct = 50
 	c.Entry.StopBufferPct = 0.1
 	c.Entry.MinStopDistancePct = 0.5
+	c.Entry.MaxEntryDriftPct = 1
 	c.Entry.MaxStopDistancePct = 4
 	c.Screening.MinPrice = 1
 	c.Screening.MaxPrice = 1e6
@@ -351,11 +352,21 @@ func TestSimulateEntryFills(t *testing.T) {
 		}
 	})
 
+	// The daemon's live-price check, applied to the next open: the same rule, so the
+	// measurement refuses what the daemon refuses.
+	t.Run("an open that has run past the trigger is not bought", func(t *testing.T) {
+		day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.8, PauseHigh: 9.95, SetupClose: 10.0},
+			Bar{O: 10.3, H: 10.5, L: 10.2, C: 10.4})
+		if s := simulate(cfg, []*preparedDay{day}, 0); len(s.Trades) != 0 {
+			t.Fatalf("got %+v, want no entry 3%% past the trigger", s.Trades)
+		}
+	})
+
 	// The entry bar is the only bar the exit loop would otherwise never look at.
 	t.Run("the entry bar can stop the position out", func(t *testing.T) {
 		for _, q := range []qualifier{
-			{Symbol: "X", Stop: 9.8},                // buys the open
-			{Symbol: "X", Stop: 9.8, BuyStop: 9.95}, // buy-stop inside the bar
+			{Symbol: "X", Stop: 9.8, SetupClose: 9.9}, // buys the open
+			{Symbol: "X", Stop: 9.8, BuyStop: 9.95},   // buy-stop inside the bar
 		} {
 			day := oneSymbolDay(q,
 				Bar{O: 9.9, H: 10.0, L: 9.7, C: 9.75},
@@ -378,7 +389,7 @@ func TestSimulateCandleTrail(t *testing.T) {
 	cfg.Risk.MaxConcurrentPositions = 3
 	cfg.Exit.CandleTrail = config.CandleTrailAlways
 
-	day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.6},
+	day := oneSymbolDay(qualifier{Symbol: "X", Stop: 9.6, SetupClose: 10.0},
 		Bar{O: 10.0, H: 10.2, L: 9.95, C: 10.1},  // entry bar: trail to 9.95
 		Bar{O: 10.1, H: 10.3, L: 10.05, C: 10.2}, // trail to 10.05
 		Bar{O: 10.2, H: 10.25, L: 10.0, C: 10.1}) // trades under 10.05: sold

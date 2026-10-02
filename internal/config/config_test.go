@@ -114,7 +114,7 @@ func valid() *Config {
 		MinPrice: 1, MaxPrice: 20, MinDollarVolume: 1_000_000}
 	c.Entry = Entry{PatternInterval: time.Minute, EMAPeriod: 9, RequireAboveVWAP: true,
 		MaxPullbackBars: 2, SurgeBars: 3, MinSurgePct: 3, MaxRetracePct: 50, StopBufferPct: 0.1,
-		MinStopDistancePct: 0.5, MaxStopDistancePct: 4}
+		MinStopDistancePct: 0.5, MaxStopDistancePct: 4, MaxEntryDriftPct: 1}
 	c.Risk = Risk{RiskPerTradePct: 1, MaxPositionPct: 33, MaxConcurrentPositions: 3,
 		StopLossPct: 10}
 	c.Exit = Exit{FirstTargetR: 2, FirstTargetFraction: 0.5, BreakevenAfterTarget: true,

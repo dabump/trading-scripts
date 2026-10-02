@@ -23,6 +23,7 @@ func setupCfg() *config.Config {
 		StopBufferPct:      0.1,
 		MinStopDistancePct: 0.5,
 		MaxStopDistancePct: 4,
+		MaxEntryDriftPct:   1,
 	}
 	return c
 }
@@ -306,5 +307,71 @@ func TestVWAPWeightsByVolume(t *testing.T) {
 	}
 	if got := VWAP([]domain.Bar{{High: 5, Low: 5, Close: 5}}); got != 0 {
 		t.Errorf("VWAP with no volume = %v, want 0 so callers can treat it as no opinion", got)
+	}
+}
+
+// The three automated entries of 2026-10-02, replayed: the setup as read on the closed
+// candle, against the price the order actually got. Each would have been refused.
+func TestCheckEntryPriceRefusesTheTradesOf20261002(t *testing.T) {
+	cfg := setupCfg()
+	cases := []struct {
+		name  string
+		setup Setup
+		price float64
+		want  string
+	}{
+		{"QTEX ran 5.7% past its trigger", Setup{Entry: 1.135, Stop: 1.0989, PauseHigh: 1.11}, 1.20, "past the"},
+		{"QTEX fell back into its pause", Setup{Entry: 1.295, Stop: 1.26873, PauseHigh: 1.29}, 1.27, "back under"},
+		{"SDEV fell through its stop", Setup{Entry: 7.4501, Stop: 7.18281, PauseHigh: 7.37}, 6.85, "at or below"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := CheckEntryPrice(c.setup, c.price, cfg)
+			if !strings.Contains(got, c.want) {
+				t.Errorf("CheckEntryPrice = %q, want a refusal containing %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestCheckEntryPrice(t *testing.T) {
+	cfg := setupCfg()
+	s := Setup{Entry: 10, Stop: 9.7, PauseHigh: 9.9} // 3% stop at the trigger close
+	cases := []struct {
+		name  string
+		price float64
+		want  string // "" = allowed
+	}{
+		{"at the trigger close", 10, ""},
+		{"a little above, inside the drift limit", 10.08, ""},
+		{"exactly at the drift limit", 10.1, ""},
+		{"between the pause high and the trigger", 9.95, ""},
+		{"exactly at the pause high", 9.9, ""},
+		{"past the drift limit", 10.11, "past the"},
+		{"no price", 0, "no live price"},
+		{"under the pause high", 9.85, "back under"},
+		{"exactly at the stop", 9.7, "at or below"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := CheckEntryPrice(s, c.price, cfg)
+			if c.want == "" && got != "" {
+				t.Errorf("CheckEntryPrice(%v) refused: %q", c.price, got)
+			}
+			if c.want != "" && !strings.Contains(got, c.want) {
+				t.Errorf("CheckEntryPrice(%v) = %q, want a refusal containing %q", c.price, got, c.want)
+			}
+		})
+	}
+
+	// The distance limits are re-measured at the live price. A wide drift allowance
+	// isolates them from the drift rule.
+	wide := setupCfg()
+	wide.Entry.MaxEntryDriftPct = 50
+	if got := CheckEntryPrice(Setup{Entry: 10, Stop: 9.7}, 10.5, wide); !strings.Contains(got, "beyond the 4.00% limit") {
+		t.Errorf("a stop 7.6%% away at the live price must be refused, got %q", got)
+	}
+	if got := CheckEntryPrice(Setup{Entry: 10, Stop: 9.97}, 10, wide); !strings.Contains(got, "inside the") {
+		t.Errorf("a stop 0.3%% away at the live price must be refused, got %q", got)
 	}
 }

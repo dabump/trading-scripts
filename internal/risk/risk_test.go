@@ -23,15 +23,9 @@ func TestConcurrencyCap(t *testing.T) {
 		if !CanOpen(open, c) {
 			t.Errorf("CanOpen(%d) = false, want true", open)
 		}
-		if got, want := FreeSlots(open, c), 5-open; got != want {
-			t.Errorf("FreeSlots(%d) = %d, want %d", open, got, want)
-		}
 	}
 	if CanOpen(5, c) {
 		t.Error("CanOpen(5) = true, want false at the cap")
-	}
-	if got := FreeSlots(7, c); got != 0 {
-		t.Errorf("FreeSlots(7) = %d, want 0 (never negative)", got)
 	}
 }
 

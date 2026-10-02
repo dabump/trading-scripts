@@ -312,6 +312,48 @@ func TestPlaceStopOrderCarriesTriggerAndSurvivesTheDay(t *testing.T) {
 	}
 }
 
+// A buy carrying its stop goes as an "oto" order, and the stop leg's id comes back so
+// the position can be tied to the order that protects it.
+func TestPlaceOrderWithAttachedStop(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		io.WriteString(w, `{"id":"o-4","type":"market","status":"accepted","filled_qty":"0",
+			"filled_avg_price":null,"order_class":"oto",
+			"legs":[{"id":"o-4-leg","type":"stop","status":"held","filled_qty":"0"}]}`)
+	}))
+	defer srv.Close()
+
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
+	res, err := a.PlaceOrder(context.Background(), OrderRequest{
+		Symbol: "ABCD", Shares: 10, Side: "buy", Type: "market", StopLoss: 4.85, ClientOrderID: "cid-oto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body["order_class"] != "oto" {
+		t.Errorf("order_class = %v, want oto", body["order_class"])
+	}
+	leg, _ := body["stop_loss"].(map[string]any)
+	if leg["stop_price"] != "4.85" {
+		t.Errorf("stop_loss = %v, want a stop_price of \"4.85\"", body["stop_loss"])
+	}
+	if res.BrokerOrderID != "o-4" || res.StopLegID != "o-4-leg" {
+		t.Errorf("result = %+v, want the parent's id and the stop leg's", res)
+	}
+
+	// A plain order carries neither.
+	body = nil
+	if _, err := a.PlaceOrder(context.Background(), OrderRequest{
+		Symbol: "ABCD", Shares: 10, Side: "sell", Type: "market", ClientOrderID: "cid-plain",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["order_class"]; ok {
+		t.Error("a plain order must not set order_class")
+	}
+}
+
 func TestPositionsDecoding(t *testing.T) {
 	a := stubAlpaca(t, map[string]string{
 		"/v2/positions": `[{"symbol":"ABCD","qty":"200","avg_entry_price":"4.20","current_price":"4.65"}]`,

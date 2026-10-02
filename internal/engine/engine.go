@@ -57,9 +57,20 @@ type Engine struct {
 	nextSession      scheduler.Session
 	nextSessionKnown bool
 	lastScan         time.Time
+	// screening is true while a screen runs in the background, so a slow pass is
+	// never overlapped by the next one.
+	screening bool
+	// watch is the latest screen's result, published by the screen and read by the
+	// tick's setup check. watchSeq counts publications, so the tick can tell a new
+	// screen from the one it already acted on.
+	watch    *watchlist
+	watchSeq int
 	// account is the last balance read from the broker, for the status page. The web
 	// layer cannot ask the broker itself, so the tick publishes it here.
 	account domain.AccountSnapshot
+	// accountTried is when refreshAccount last asked, successful or not. Only Tick
+	// touches it.
+	accountTried time.Time
 
 	// The tradable universe barely changes within a day, so it is fetched once per
 	// session rather than on every one-minute scan.
@@ -85,6 +96,20 @@ type Engine struct {
 	// over a thousand identical rows an hour. Cleared when the stop does come off,
 	// so a condition that recurs later is recorded again.
 	faultedStops map[int64]bool
+	// stopPolled is when each position's resting stop was last looked up, so a stop
+	// well under the price is asked about every protectiveStopPoll rather than on
+	// every tick. Only Tick touches it.
+	stopPolled map[int64]time.Time
+
+	// background is set by Run: the screen then runs on its own goroutine so the
+	// position checks and the setup check keep their cadence while it does. A test
+	// calling Tick directly gets the screen inline, which keeps a simulated day
+	// deterministic. screens tracks the goroutine so Run can wait for it on shutdown.
+	background bool
+	screens    sync.WaitGroup
+	// setups is the setup check's per-session memory. Only Tick touches it.
+	setups setupState
+
 	// fillWait bounds how long submit waits for an order to finish filling before
 	// cancelling what is left, and fillPoll is how often it asks in the meantime.
 	// Fields rather than config because they describe the broker, not the strategy;
@@ -162,11 +187,17 @@ func (e *Engine) publishAccount(acct domain.Account) {
 	e.account = domain.AccountSnapshot{Account: acct, At: e.now(), Known: true}
 }
 
-// refreshAccount updates the balance the page shows.
+// accountRefresh is how often the page's balance is re-read. The page polls about
+// every 12s, so reading on every 2-second tick bought nothing and cost 30 requests a
+// minute against Alpaca's 200/min.
+const accountRefresh = 10 * time.Second
+
+// refreshAccount updates the balance the page shows, at most every accountRefresh.
 //
-// It runs on every tick, including outside market hours: one request per tick is
-// negligible beside the scan's ~130, and it is what keeps the figure current when
-// the market is closed and nothing else talks to the broker.
+// It runs on every tick, including outside market hours, because it is what keeps
+// the figure current when the market is closed and nothing else talks to the broker.
+// Sizing never uses this reading: the trading path reads the account for itself
+// before every entry.
 //
 // A failure is display-only and never faults the agent — the trading path reads the
 // account for itself before it sizes anything, and faults there. The previous
@@ -174,6 +205,11 @@ func (e *Engine) publishAccount(acct domain.Account) {
 // rather than losing it. Logged at debug because it would otherwise repeat on every
 // tick for as long as the endpoint is unhappy.
 func (e *Engine) refreshAccount(ctx context.Context) {
+	now := e.now()
+	if !e.accountTried.IsZero() && now.Sub(e.accountTried) < accountRefresh {
+		return
+	}
+	e.accountTried = now
 	acct, err := e.trading.Account(ctx)
 	if err != nil {
 		e.log.Debug("account balance unavailable", "err", err)
@@ -281,6 +317,15 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	// The screen takes most of a minute of serial requests. Run inline it held up every
+	// tick behind it, so stops were checked about once a minute rather than at
+	// position_poll_interval, and a setup was acted on almost a minute after its candle
+	// closed — see docs/decisions.md, 2026-10-03.
+	e.background = true
+	// A screen in flight is cancelled with ctx; waiting for it keeps it from outliving
+	// the store and audit that main closes once Run returns.
+	defer e.screens.Wait()
 
 	e.Tick(ctx)
 	for {
@@ -480,11 +525,13 @@ func (e *Engine) Tick(ctx context.Context) {
 			e.fail("manage positions", err)
 			return
 		}
-		if !e.claimScan(now, e.cfg.PreMarket.ScanInterval) {
-			return
+		if e.claimScan(now, e.cfg.PreMarket.ScanInterval) {
+			e.startScreen(ctx, sess, "pre-market screen", func(ctx context.Context) scanPass {
+				return e.preMarketPass(ctx, bounds)
+			})
 		}
-		if err := e.runScan(ctx, sess, e.preMarketPass(ctx, bounds)); err != nil {
-			e.fail("pre-market screen", err)
+		if err := e.checkSetups(ctx, sess, bounds, true); err != nil {
+			e.fail("pre-market entry", err)
 		}
 
 	case domain.PhaseFirstHour:
@@ -494,7 +541,7 @@ func (e *Engine) Tick(ctx context.Context) {
 		}
 
 	case domain.PhaseTrading:
-		halted, err := e.resolveGate(ctx, sess)
+		halted, err := e.resolveGate(sess)
 		if err != nil {
 			e.fail("resolve sentiment gate", err)
 			return
@@ -510,11 +557,13 @@ func (e *Engine) Tick(ctx context.Context) {
 			return
 		}
 		e.setState(domain.StateScreening)
-		if !e.claimScan(e.now(), e.cfg.Timing.ScreenerScanInterval) {
-			return
+		if e.claimScan(e.now(), e.cfg.Timing.ScreenerScanInterval) {
+			e.startScreen(ctx, sess, "screen", func(context.Context) scanPass {
+				return e.regularPass(e.now(), sess, bounds)
+			})
 		}
-		if err := e.runScan(ctx, sess, e.regularPass(e.now(), sess, bounds)); err != nil {
-			e.fail("screen", err)
+		if err := e.checkSetups(ctx, sess, bounds, false); err != nil {
+			e.fail("enter positions", err)
 		}
 
 	case domain.PhaseEODWindow:
@@ -565,7 +614,7 @@ func (e *Engine) pollSentiment(ctx context.Context, sess scheduler.Session) erro
 
 // resolveGate decides the session once the first hour is over, and reports
 // whether trading is halted.
-func (e *Engine) resolveGate(ctx context.Context, sess scheduler.Session) (bool, error) {
+func (e *Engine) resolveGate(sess scheduler.Session) (bool, error) {
 	rec, err := e.store.Session(sess.Date)
 	if err != nil {
 		return false, err
@@ -645,8 +694,8 @@ type scanPass struct {
 	blocked string
 }
 
-// claimScan reports whether the scan interval has elapsed, claiming the slot when it
-// has.
+// claimScan reports whether the scan interval has elapsed and no screen is still
+// running, claiming the slot when both hold.
 //
 // The interval check lives here, called from Tick, rather than inside the pass:
 // pre-market runs on its own cadence (premarket.scan_interval) and a single scan
@@ -658,6 +707,9 @@ func (e *Engine) claimScan(now time.Time, interval time.Duration) bool {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.screening {
+		return false
+	}
 	if !e.lastScan.IsZero() && now.Sub(e.lastScan) < interval {
 		return false
 	}
@@ -716,44 +768,6 @@ func (e *Engine) preMarketPass(ctx context.Context, bounds scheduler.Boundaries)
 		p.blocked = "pre-market sentiment is overwhelmingly bearish"
 	}
 	return p
-}
-
-// runScan performs one screening pass and, unless the pass is blocked, acts on it.
-func (e *Engine) runScan(ctx context.Context, sess scheduler.Session, p scanPass) error {
-	now := e.now()
-
-	evals, err := e.screen(ctx, p.thresholds, p.barsSince)
-	if err != nil {
-		return err
-	}
-
-	// Entry runs before the snapshot is stored so the page can show what actually
-	// happened to each qualifying candidate, not just that it qualified.
-	var outcomes map[string]string
-	var entryErr error
-	if p.blocked != "" {
-		outcomes = make(map[string]string, len(evals))
-		for _, ev := range evals {
-			if ev.Qualifies {
-				outcomes[ev.Symbol] = p.blocked
-			}
-		}
-		e.recordSkip("", p.blocked,
-			map[string]any{"reason": p.blocked, "pre_market": p.preMarket})
-	} else {
-		outcomes, entryErr = e.enterPositions(ctx, sess, evals, p)
-	}
-	for i := range evals {
-		if outcome, ok := outcomes[evals[i].Symbol]; ok {
-			evals[i].Outcome = outcome
-		}
-	}
-	// Saved even when entry failed: a pass that went wrong is exactly when seeing
-	// the candidate table matters.
-	if err := e.store.SaveScreenSnapshot(sess.Date, now, evals); err != nil {
-		return err
-	}
-	return entryErr
 }
 
 // screen evaluates the candidate universe against the four entry criteria.
@@ -958,7 +972,11 @@ func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time, th s
 }
 
 // enterPositions buys the strongest qualifying candidates that fit under the
-// exposure cap, and reports what happened to each one.
+// exposure cap, and reports what happened to each one it looked at.
+//
+// It runs on every tick, but reads each candidate's chart only once per completed
+// candle (setupState.due): a candidate whose newest candle has already been read keeps
+// the outcome it was given then, and is left out of the result.
 //
 // A failure affecting a single candidate — an unavailable price, say — skips that
 // candidate rather than abandoning the pass. Aborting would discard the remaining
@@ -1020,15 +1038,29 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 		// The setup gate. Screening said this name is interesting; the chart has to
 		// say that now is the moment and where the risk sits. This is the only place
 		// a per-symbol bar request is made, and it is made only for candidates that
-		// already passed all three criteria.
+		// already passed all three criteria, once per completed candle.
 		// The chart starts where the pass's session does, so a pre-market setup is read
 		// on pre-market candles rather than on an empty regular session.
-		bars, err := e.data.IntradayBars(ctx, cand.Symbol, e.cfg.Entry.PatternInterval, p.barsSince)
+		interval := e.cfg.Entry.PatternInterval
+		now := e.now()
+		if !e.setups.due(cand.Symbol, now, interval) {
+			continue
+		}
+		e.setups.fetched(cand.Symbol, now, interval)
+		bars, err := e.data.IntradayBars(ctx, cand.Symbol, interval, p.barsSince)
 		if err != nil {
 			e.log.Warn("skipping candidate: bars unavailable", "symbol", cand.Symbol, "err", err)
 			outcomes[cand.Symbol] = "bars unavailable"
 			e.recordSkip(cand.Symbol, "bars unavailable",
 				map[string]any{"reason": "bars unavailable", "error": err.Error()})
+			continue
+		}
+		// Only candles that have closed: the feed includes the one still forming, and
+		// a "close" that can still move is not a close above anything.
+		bars = completedBars(bars, now, interval)
+		if len(bars) > 0 && !e.setups.read(cand.Symbol, bars[len(bars)-1].Time) {
+			// Nothing new since the last read: the candle that just closed has not been
+			// published yet, and is picked up on a later tick.
 			continue
 		}
 		setup := strategy.FindSetup(bars, e.cfg)
@@ -1042,7 +1074,27 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 				map[string]any{"reason": setup.Reason})
 			continue
 		}
-		price := setup.Entry
+
+		// The setup was read on a closed candle; the order fills at whatever trades
+		// now. Re-read the price and re-judge the trade at it, and size from it.
+		snaps, err := e.data.Snapshots(ctx, []string{cand.Symbol})
+		if err != nil {
+			e.log.Warn("skipping candidate: price unavailable", "symbol", cand.Symbol, "err", err)
+			outcomes[cand.Symbol] = "price unavailable"
+			e.recordSkip(cand.Symbol, "price unavailable",
+				map[string]any{"reason": "price unavailable", "error": err.Error()})
+			continue
+		}
+		price := snaps[cand.Symbol].Price
+		if reason := strategy.CheckEntryPrice(setup, price, e.cfg); reason != "" {
+			e.log.Info("skipping candidate: price moved off the setup", "symbol", cand.Symbol,
+				"reason", reason, "setup_price", setup.Entry, "live_price", price, "stop", setup.Stop)
+			outcomes[cand.Symbol] = "price moved: " + reason
+			e.recordSkip(cand.Symbol, "price moved off the setup",
+				map[string]any{"reason": reason, "setup_price": setup.Entry, "live_price": price,
+					"stop_price": setup.Stop, "setup_pause_high": setup.PauseHigh})
+			continue
+		}
 
 		// Re-read per candidate rather than once per pass: each fill consumes cash,
 		// so sizing the next position from a stale balance would over-commit.
@@ -1068,7 +1120,7 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			continue
 		}
 
-		f, err := e.submit(ctx, sess, cand.Symbol, "buy", sizing.Shares, price, p.extendedHours)
+		f, err := e.submit(ctx, sess, cand.Symbol, "buy", sizing.Shares, price, setup.Stop, p.extendedHours)
 		if err != nil {
 			e.log.Warn("skipping candidate: order rejected", "symbol", cand.Symbol, "err", err)
 			outcomes[cand.Symbol] = "order rejected"
@@ -1095,11 +1147,12 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 		if riskPerShare <= 0 {
 			riskPerShare = setup.RiskPerShare
 		}
-		if _, err := e.store.InsertPosition(domain.Position{
+		posID, err := e.store.InsertPosition(domain.Position{
 			SessionDate: sess.Date, Symbol: cand.Symbol, Shares: f.Shares,
 			EntryPrice: entry, EntryTime: e.now(), PeakPrice: entry,
 			StopPrice: setup.Stop, InitialRisk: riskPerShare,
-		}); err != nil {
+		})
+		if err != nil {
 			if errors.Is(err, store.ErrDuplicateOpenPosition) {
 				e.log.Warn("duplicate position rejected by store", "symbol", cand.Symbol)
 				outcomes[cand.Symbol] = "already holding this symbol"
@@ -1108,8 +1161,14 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			return outcomes, err
 		}
 
+		// The stop rests at the broker from the fill — attached to the buy where the
+		// broker allows it — so it is enforced between ticks and if this process stops.
+		stopPlaced, stopNote := e.protectEntry(ctx, sess,
+			domain.Position{ID: posID, Symbol: cand.Symbol, SharesOpen: f.Shares, StopPrice: setup.Stop},
+			f, sizing.Shares, p.extendedHours)
+
 		e.log.Info("entered position", "symbol", cand.Symbol, "shares", f.Shares,
-			"price", entry, "quoted", price, "stop", setup.Stop,
+			"price", entry, "quoted", price, "stop", setup.Stop, "stop_order", stopPlaced,
 			"risk", riskPerShare*float64(f.Shares), "rel_volume", cand.VolumeMultiple)
 		outcomes[cand.Symbol] = fmt.Sprintf("bought %d @ $%.2f, stop $%.2f",
 			f.Shares, entry, setup.Stop)
@@ -1129,10 +1188,15 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 				"risk_dollars":         riskPerShare * float64(f.Shares),
 				"stop_price":           setup.Stop,
 				"stop_distance_pct":    riskPerShare / entry * 100,
+				"setup_price":          setup.Entry,
+				"live_price":           price,
 				"setup_pause_high":     setup.PauseHigh,
 				"setup_pause_bars":     setup.PauseBars,
 				"open_positions_after": openCount + 1,
 				"pre_market":           p.preMarket,
+				"stop_order_placed":    stopPlaced,
+				"stop_order_attached":  f.StopLegID != "",
+				"stop_order_note":      stopNote,
 			}, f, price, sizing.Shares))
 		openSymbols[cand.Symbol] = true
 		tradedToday[cand.Symbol] = true
@@ -1169,6 +1233,19 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 
 	for _, p := range open {
 		price := snaps[p.Symbol].Price
+
+		// First, whether the broker's resting stop has already sold it: everything
+		// else is wrong if it has. A lookup that fails says nothing about the order,
+		// which is still the floor under the position, so the tick carries on.
+		if res, err := e.checkProtectiveStop(ctx, &p, price); err != nil {
+			e.log.Warn("could not read the protective stop", "symbol", p.Symbol, "err", err)
+		} else if res.FilledShares > 0 {
+			if err := e.closeOnProtectiveStop(p, res); err != nil {
+				return err
+			}
+			continue
+		}
+
 		if p.Manual {
 			// Opened by hand, and governed by two rules rather than none: its own 1R
 			// stop, which is what sized it, and the forced exit. The signal rules —
@@ -1197,6 +1274,10 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			return err
 		}
 
+		// The automated stop is evaluated here on every tick as well as resting at the
+		// broker. The two cannot both sell: every sell takes the resting order off the
+		// book first, and if it has filled, that fill is the exit.
+		restingAt := p.StopPrice
 		if !forceEOD {
 			p.StopPrice = e.trailStop(ctx, p)
 		}
@@ -1213,79 +1294,28 @@ func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bo
 			}
 			continue
 		}
-		if !decision.Exit {
-			continue
-		}
-
-		quoted := price
-		if quoted <= 0 {
-			quoted = p.EntryPrice
-		}
-		f, err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, quoted, extendedHours)
-		if err != nil {
-			return err
-		}
-		if short, err := e.shortExit(p, f, quoted, decision.Reason); short || err != nil {
-			if err != nil {
+		if decision.Exit {
+			if err := e.exitPosition(ctx, sess, p, decision.Reason, price, extendedHours); err != nil {
 				return err
 			}
 			continue
 		}
-		exitPrice := f.Price
-		if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), decision.Reason); err != nil {
-			return err
+		if p.StopPrice > restingAt {
+			if err := e.moveProtectiveStop(ctx, sess, &p, price); err != nil {
+				return err
+			}
 		}
-		// Total P&L, which for a scaled position is the banked profit plus the final
-		// leg — not the price move from entry to this exit.
-		pnl := p.UnrealizedDollars(exitPrice)
-		e.log.Info("exited position", "symbol", p.Symbol, "reason", decision.Reason,
-			"entry", p.EntryPrice, "exit", exitPrice, "shares", p.SharesOpen,
-			"banked", p.BankedDollars, "pnl", fmt.Sprintf("%+.2f", pnl))
-		e.record(audit.PositionClosed, p.Symbol,
-			fmt.Sprintf("sold %d shares at $%.2f (%s), %+.2f%% on the trade",
-				p.SharesOpen, exitPrice, decision.Reason,
-				pnl/(p.EntryPrice*float64(p.Shares))*100),
-			fillDetail(map[string]any{
-				"reason":         string(decision.Reason),
-				"shares_sold":    p.SharesOpen,
-				"shares_bought":  p.Shares,
-				"entry_price":    p.EntryPrice,
-				"exit_price":     exitPrice,
-				"stop_price":     p.StopPrice,
-				"initial_stop":   p.EntryPrice - p.InitialRisk,
-				"candle_trail":   e.cfg.Exit.CandleTrail,
-				"peak_price":     p.PeakPrice,
-				"banked_earlier": p.BankedDollars,
-				"pnl_dollars":    pnl,
-				"r_multiple":     p.RMultiple(exitPrice),
-				"held_for":       e.now().Sub(p.EntryTime).String(),
-			}, f, quoted, p.SharesOpen))
 	}
 	return nil
 }
 
-// manageManual applies the two rules a manual position has, and does it around a
-// stop that lives at the broker rather than here.
-//
-// The order of business is fixed. First ask whether the resting stop has already sold
-// the position, because everything else is wrong if it has. Then act only where that
-// order cannot: the end of the day, which an order has no concept of, and the windows
-// where the stop is not actually being enforced. In the ordinary case — regular
-// session, order resting, price above the stop — this does nothing but the lookup,
+// manageManual applies the two rules a manual position has, around a stop that lives
+// at the broker rather than here: the end of the day, which an order has no concept
+// of, and the windows where the stop is not actually being enforced. In the ordinary
+// case — regular session, order resting, price above the stop — it does nothing,
 // which is the point: the floor is the broker's to hold.
 func (e *Engine) manageManual(ctx context.Context, sess scheduler.Session,
 	bounds scheduler.Boundaries, p domain.Position, price float64, forceEOD bool) error {
-	if res, err := e.pollProtectiveStop(ctx, &p); err != nil {
-		// A lookup that failed says nothing about the order, which is still the
-		// broker's floor under the position. Selling on a failed read would be acting
-		// on no information at all, so leave it and ask again next tick.
-		e.log.Warn("could not read the protective stop; leaving the position alone",
-			"symbol", p.Symbol, "err", err)
-		return nil
-	} else if res.FilledShares > 0 {
-		return e.closeOnProtectiveStop(p, res)
-	}
-
 	decision := strategy.ExitDecision{}
 	switch {
 	case forceEOD:
@@ -1300,80 +1330,111 @@ func (e *Engine) manageManual(ctx context.Context, sess scheduler.Session,
 	if !decision.Exit {
 		return nil
 	}
+	extendedHours := scheduler.PhaseAt(e.now(), bounds) == domain.PhasePreMarket
+	return e.exitPosition(ctx, sess, p, decision.Reason, price, extendedHours)
+}
 
+// exitPosition sells everything still held of p, for reason, and records it.
+func (e *Engine) exitPosition(ctx context.Context, sess scheduler.Session, p domain.Position,
+	reason domain.ExitReason, price float64, extendedHours bool) error {
 	quoted := price
 	if quoted <= 0 {
 		quoted = p.EntryPrice
 	}
 
-	// Off the book before anything is sold. A resting sell order that outlives its
-	// holding is a short position, so a failure here stops the exit rather than
-	// racing it — and if the stop filled in the meantime, that fill is the exit.
-	res, err := e.releaseProtectiveStop(ctx, &p)
+	hadStop := p.StopOrderID != ""
+	if proceed, err := e.clearStopForSale(ctx, &p, reason); !proceed {
+		return err
+	}
+
+	f, err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, quoted, 0, extendedHours)
+	if err != nil {
+		return err
+	}
+	if short, err := e.shortExit(p, f, quoted, reason); short || err != nil {
+		// Whatever is still held now has no resting stop: the engine keeps its floor
+		// (stopIsUnenforced is true with the id cleared) and the exit is tried again
+		// next tick.
+		return err
+	}
+	exitPrice := f.Price
+	if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), reason); err != nil {
+		return err
+	}
+
+	// Total P&L, which for a scaled position is the banked profit plus the final leg —
+	// not the price move from entry to this exit.
+	pnl := p.UnrealizedDollars(exitPrice)
+	e.log.Info("exited position", "symbol", p.Symbol, "reason", reason, "manual", p.Manual,
+		"entry", p.EntryPrice, "exit", exitPrice, "shares", p.SharesOpen,
+		"banked", p.BankedDollars, "pnl", fmt.Sprintf("%+.2f", pnl))
+	what := fmt.Sprintf("sold %d shares at $%.2f", p.SharesOpen, exitPrice)
+	if p.Manual {
+		what = fmt.Sprintf("sold %d shares of a position opened by hand at $%.2f", p.SharesOpen, exitPrice)
+	}
+	detail := map[string]any{
+		"reason":         string(reason),
+		"shares_sold":    p.SharesOpen,
+		"shares_bought":  p.Shares,
+		"entry_price":    p.EntryPrice,
+		"exit_price":     exitPrice,
+		"stop_price":     p.StopPrice,
+		"initial_stop":   p.EntryPrice - p.InitialRisk,
+		"peak_price":     p.PeakPrice,
+		"banked_earlier": p.BankedDollars,
+		"pnl_dollars":    pnl,
+		"r_multiple":     p.RMultiple(exitPrice),
+		"held_for":       e.now().Sub(p.EntryTime).String(),
+	}
+	if p.Manual {
+		detail["manual"] = true
+	} else {
+		detail["candle_trail"] = e.cfg.Exit.CandleTrail
+	}
+	if hadStop {
+		detail["protective_stop"] = "cancelled before selling"
+	}
+	e.record(audit.PositionClosed, p.Symbol,
+		fmt.Sprintf("%s (%s), %+.2f%% on the trade", what, reason,
+			pnl/(p.EntryPrice*float64(p.Shares))*100),
+		fillDetail(detail, f, quoted, p.SharesOpen))
+	return nil
+}
+
+// clearStopForSale takes p's resting stop off the book before a sell, and reports
+// whether the sell may go ahead.
+//
+// A resting sell order that outlives its holding is a short position, so a stop that
+// cannot be confirmed off the book stops the sale rather than racing it — faulted
+// once, not on every tick. If the stop filled in the meantime, that fill is the exit
+// and is recorded here.
+func (e *Engine) clearStopForSale(ctx context.Context, p *domain.Position, reason domain.ExitReason) (bool, error) {
+	res, err := e.releaseProtectiveStop(ctx, p)
 	if err != nil {
 		e.log.Error("not selling: the protective stop could not be taken off the book",
-			"symbol", p.Symbol, "reason", decision.Reason, "err", err)
+			"symbol", p.Symbol, "reason", reason, "err", err)
 		if !e.faultedStops[p.ID] {
 			if e.faultedStops == nil {
 				e.faultedStops = map[int64]bool{}
 			}
 			e.faultedStops[p.ID] = true
 			e.record(audit.Fault, p.Symbol,
-				fmt.Sprintf("held off a %s exit for %s: its resting stop order could not be cancelled, "+
-					"and selling with that order still working could go short", decision.Reason, p.Symbol),
+				fmt.Sprintf("held off a %s sale of %s: its resting stop order could not be cancelled, "+
+					"and selling with that order still working could go short", reason, p.Symbol),
 				map[string]any{
-					"reason":          string(decision.Reason),
+					"reason":          string(reason),
 					"protective_stop": "still working",
 					"stop_order_id":   p.StopOrderID,
 					"err":             err.Error(),
 				})
 		}
-		return nil
+		return false, nil
 	}
 	delete(e.faultedStops, p.ID)
 	if res.FilledShares > 0 {
-		return e.closeOnProtectiveStop(p, res)
+		return false, e.closeOnProtectiveStop(*p, res)
 	}
-
-	extendedHours := scheduler.PhaseAt(e.now(), bounds) == domain.PhasePreMarket
-	f, err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, quoted, extendedHours)
-	if err != nil {
-		return err
-	}
-	if short, err := e.shortExit(p, f, quoted, decision.Reason); short || err != nil {
-		// Whatever is still held now has no resting stop, so the engine keeps its
-		// floor — stopIsUnenforced is true with the id cleared — and the exit is
-		// tried again next tick.
-		return err
-	}
-	exitPrice := f.Price
-	if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), decision.Reason); err != nil {
-		return err
-	}
-
-	pnl := p.UnrealizedDollars(exitPrice)
-	e.log.Info("exited manual position", "symbol", p.Symbol, "reason", decision.Reason,
-		"entry", p.EntryPrice, "exit", exitPrice, "shares", p.SharesOpen,
-		"pnl", fmt.Sprintf("%+.2f", pnl))
-	e.record(audit.PositionClosed, p.Symbol,
-		fmt.Sprintf("sold %d shares of a position opened by hand at $%.2f (%s), %+.2f%% on the trade",
-			p.SharesOpen, exitPrice, decision.Reason, pnl/(p.EntryPrice*float64(p.Shares))*100),
-		fillDetail(map[string]any{
-			"manual":          true,
-			"reason":          string(decision.Reason),
-			"shares_sold":     p.SharesOpen,
-			"shares_bought":   p.Shares,
-			"entry_price":     p.EntryPrice,
-			"exit_price":      exitPrice,
-			"stop_price":      p.StopPrice,
-			"initial_stop":    p.EntryPrice - p.InitialRisk,
-			"protective_stop": "cancelled before selling",
-			"peak_price":      p.PeakPrice,
-			"pnl_dollars":     pnl,
-			"r_multiple":      p.RMultiple(exitPrice),
-			"held_for":        e.now().Sub(p.EntryTime).String(),
-		}, f, quoted, p.SharesOpen))
-	return nil
+	return true, nil
 }
 
 // closeOnProtectiveStop records an exit the broker executed on its own, from the
@@ -1426,7 +1487,7 @@ func (e *Engine) closeOnProtectiveStop(p domain.Position, res broker.OrderResult
 		fmt.Sprintf("the resting stop order sold %d shares at $%.2f, %+.2f%% on the trade",
 			res.FilledShares, price, pnl/(p.EntryPrice*float64(p.Shares))*100),
 		map[string]any{
-			"manual":          true,
+			"manual":          p.Manual,
 			"reason":          string(domain.ExitStopLoss),
 			"protective_stop": "filled",
 			"shares_sold":     res.FilledShares,
@@ -1472,7 +1533,7 @@ func (e *Engine) shortExit(p domain.Position, f fill, quoted float64, reason dom
 }
 
 // trailStop applies the candle trail (exit.candle_trail) to p and returns the stop to
-// evaluate it against: raised to the low of the last completed candle when the trail
+// evaluate it against: raised to strategy.CandleTrailStop's level when the trail
 // applies and that is higher, otherwise unchanged.
 //
 // A failure to read bars leaves the stop where it was. The trail only ever tightens a
@@ -1489,28 +1550,33 @@ func (e *Engine) trailStop(ctx context.Context, p domain.Position) float64 {
 		return p.StopPrice
 	}
 
-	interval := e.cfg.Entry.PatternInterval
+	interval, trail := e.cfg.Entry.PatternInterval, strategy.TrailInterval(e.cfg)
 	now := e.now()
-	// Already read the candle that closed most recently: nothing new until the next
-	// one does. A bar published late is simply picked up on a later poll.
-	if e.trailedTo[p.ID].Equal(now.Truncate(interval).Add(-interval)) {
+	// Already read the trail candle that closed most recently: nothing new until the
+	// next one does. A bar published late is simply picked up on a later poll.
+	closed := now.Truncate(trail).Add(-trail)
+	if e.trailedTo[p.ID].Equal(closed) {
 		return p.StopPrice
 	}
-	bars, err := e.data.IntradayBars(ctx, p.Symbol, interval, p.EntryTime.Truncate(interval))
+	bars, err := e.data.IntradayBars(ctx, p.Symbol, interval, p.EntryTime.Truncate(trail))
 	if err != nil {
 		e.log.Warn("candle trail: bars unavailable", "symbol", p.Symbol, "err", err)
 		return p.StopPrice
 	}
-	last, ok := strategy.LastCompletedBar(bars, now, interval)
-	if !ok {
+	bars = completedBars(bars, now, interval)
+	unpublished := len(bars) == 0 || bars[len(bars)-1].Time.Add(interval).Before(closed.Add(trail))
+	if unpublished && now.Sub(closed.Add(trail)) < setupBarGrace {
+		// The last base candle of the trail candle that just closed is not published
+		// yet, and reading now would build that candle from part of it. Past the
+		// grace, the name simply did not trade then.
 		return p.StopPrice
 	}
 	if e.trailedTo == nil {
 		e.trailedTo = map[int64]time.Time{}
 	}
-	e.trailedTo[p.ID] = last.Time
+	e.trailedTo[p.ID] = closed
 
-	lvl := strategy.CandleTrailStop(p, last, e.cfg)
+	lvl := strategy.CandleTrailStop(p, bars, now, e.cfg)
 	if lvl <= p.StopPrice {
 		return p.StopPrice
 	}
@@ -1521,7 +1587,7 @@ func (e *Engine) trailStop(ctx context.Context, p domain.Position) float64 {
 	// Logged, not audited: it moves once a minute per position. The close event
 	// records the stop it sold at alongside the initial one.
 	e.log.Debug("candle trail raised stop", "symbol", p.Symbol,
-		"from", p.StopPrice, "to", lvl, "candle", last.Time)
+		"from", p.StopPrice, "to", lvl, "candle", closed)
 	return lvl
 }
 
@@ -1534,8 +1600,24 @@ func (e *Engine) trailStop(ctx context.Context, p domain.Position) float64 {
 func (e *Engine) scaleOut(ctx context.Context, sess scheduler.Session, p domain.Position,
 	price float64, decision strategy.ExitDecision, extendedHours bool) error {
 
+	// The resting stop covers every share, so it comes off before part of them is
+	// sold — the broker holds shares against an open sell order, and a stop left for
+	// the full count would sell more than is held once it fired. It goes back on for
+	// what is left, at the moved stop, whatever happens to the sale.
+	hadStop := p.StopOrderID != ""
+	if proceed, err := e.clearStopForSale(ctx, &p, domain.ExitScaleOut); !proceed {
+		return err
+	}
+	if hadStop {
+		defer func() {
+			if err := e.restoreProtectiveStop(ctx, sess, p.ID, price); err != nil {
+				e.log.Error("protective stop not restored after the scale-out", "symbol", p.Symbol, "err", err)
+			}
+		}()
+	}
+
 	quoted := price
-	f, err := e.submit(ctx, sess, p.Symbol, "sell", decision.ScaleShares, quoted, extendedHours)
+	f, err := e.submit(ctx, sess, p.Symbol, "sell", decision.ScaleShares, quoted, 0, extendedHours)
 	if err != nil {
 		// One symbol failing to scale must not abort the pass over the others; the
 		// position simply stays whole and the target is re-tested next tick.
@@ -1592,6 +1674,11 @@ type fill struct {
 	// quote and the full order, which is what the daemon assumed before it read
 	// fills at all; the order is left for Reconcile, and the audit says so.
 	Confirmed bool
+	// StopLegID is the stop the broker attached to a buy (submit's stopLoss), empty
+	// when none was attached. StopAttachErr says why, when the broker refused it and
+	// the buy went alone.
+	StopLegID     string
+	StopAttachErr string
 }
 
 // submit records an order's intent before sending it, so a crash between the two
@@ -1603,7 +1690,14 @@ type fill struct {
 // by, and a remainder filling later would hold shares the store does not know about.
 // The result can therefore be a partial fill or none at all, and every caller has to
 // handle both.
-func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, side string, shares int, price float64, extendedHours bool) (fill, error) {
+//
+// A buy with stopLoss set carries its protective stop with it as an attached leg, so
+// the stop is at the broker the moment the buy fills. The extended session takes
+// simple limit orders only, so there it goes alone; and if the broker refuses the
+// attachment, the buy is sent again alone under the same client order id — which the
+// broker would refuse as a duplicate had the first one landed after all. Either way
+// the caller places the stop separately (protectEntry).
+func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, side string, shares int, price, stopLoss float64, extendedHours bool) (fill, error) {
 	clientOrderID := fmt.Sprintf("%s-%s-%s-%d", sess.Date, symbol, side, e.now().UnixNano())
 
 	rec := store.OrderRecord{
@@ -1640,7 +1734,22 @@ func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, sid
 		req.LimitPrice = price * slip
 	}
 
+	if side == "buy" && stopLoss > 0 && !extendedHours {
+		// The leg takes the parent's time in force, and a protective stop is
+		// good-till-cancelled (protectiveStopTIF). The buy itself still cannot
+		// outlive the day: awaitFill cancels whatever has not filled in fillWait.
+		req.StopLoss, req.TimeInForce = stopLoss, protectiveStopTIF
+	}
+
 	res, err := e.trading.PlaceOrder(ctx, req)
+	var attachErr string
+	if err != nil && req.StopLoss > 0 {
+		attachErr = err.Error()
+		e.log.Warn("broker refused the stop attached to the buy; sending the buy alone",
+			"symbol", symbol, "stop", stopLoss, "err", err)
+		req.StopLoss, req.TimeInForce = 0, ""
+		res, err = e.trading.PlaceOrder(ctx, req)
+	}
 	if err != nil {
 		if updateErr := e.store.UpdateOrderStatus(clientOrderID, "failed", ""); updateErr != nil {
 			e.log.Error("failed to record order failure", "err", updateErr)
@@ -1651,9 +1760,16 @@ func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, sid
 		return fill{}, err
 	}
 
+	// The leg is read from whichever answer carries it: the acknowledgement or the
+	// lookups awaitFill makes.
+	legID := res.StopLegID
 	res, confirmed := e.awaitFill(ctx, res)
+	if legID == "" {
+		legID = res.StopLegID
+	}
 	status := res.Status
-	f := fill{Price: res.FilledPrice, Shares: res.FilledShares, Status: res.Status, Confirmed: confirmed}
+	f := fill{Price: res.FilledPrice, Shares: res.FilledShares, Status: res.Status, Confirmed: confirmed,
+		StopLegID: legID, StopAttachErr: attachErr}
 	if !confirmed {
 		e.log.Warn("order outcome unknown; assuming it filled as sent", "symbol", symbol,
 			"side", side, "shares", shares, "last_status", res.Status)

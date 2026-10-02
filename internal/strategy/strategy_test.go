@@ -271,9 +271,8 @@ func TestScaleOutOnTinyPositions(t *testing.T) {
 
 func TestCandleTrailStop(t *testing.T) {
 	entry := time.Date(2026, 9, 28, 10, 35, 20, 0, time.UTC)
-	candle := func(mm int, low float64) domain.Bar {
-		return domain.Bar{Time: time.Date(2026, 9, 28, 10, mm, 0, 0, time.UTC), Low: low}
-	}
+	at := func(mm int) time.Time { return time.Date(2026, 9, 28, 10, mm, 0, 0, time.UTC) }
+	candle := func(mm int, low float64) domain.Bar { return domain.Bar{Time: at(mm), Low: low} }
 	cfgFor := func(mode string) *config.Config {
 		c := &config.Config{}
 		c.Entry.PatternInterval = time.Minute
@@ -287,37 +286,78 @@ func TestCandleTrailStop(t *testing.T) {
 		name string
 		mode string
 		pos  domain.Position
-		bar  domain.Bar
+		bars []domain.Bar
+		now  time.Time
 		want float64
 	}{
-		{"always trails from the first whole candle held", config.CandleTrailAlways, pos, candle(36, 4.97), 4.97},
-		{"the candle the fill landed in is not held through", config.CandleTrailAlways, pos, candle(35, 4.99), 0},
-		{"a candle closed before entry is not held through", config.CandleTrailAlways, pos, candle(34, 4.90), 0},
+		{"always trails from the first whole candle held", config.CandleTrailAlways, pos,
+			[]domain.Bar{candle(35, 4.99), candle(36, 4.97)}, at(37), 4.97},
+		{"the candle the fill landed in is not held through", config.CandleTrailAlways, pos,
+			[]domain.Bar{candle(35, 4.99)}, at(36), 0},
+		{"a candle closed before entry is not held through", config.CandleTrailAlways, pos,
+			[]domain.Bar{candle(34, 4.90)}, at(36), 0},
 		{"a fill at a candle's open holds all of it", config.CandleTrailAlways,
-			domain.Position{EntryTime: time.Date(2026, 9, 28, 10, 35, 0, 0, time.UTC)}, candle(35, 4.97), 4.97},
-		{"after_target waits for the target", config.CandleTrailAfterTarget, pos, candle(36, 5.02), 0},
-		{"after_target trails the runner", config.CandleTrailAfterTarget, scaled, candle(36, 5.02), 5.02},
-		{"off never trails", config.CandleTrailOff, scaled, candle(36, 5.02), 0},
-		{"empty means off", "", scaled, candle(36, 5.02), 0},
+			domain.Position{EntryTime: at(35)}, []domain.Bar{candle(35, 4.97)}, at(36), 4.97},
+		{"the candle still forming is not read", config.CandleTrailAlways, pos,
+			[]domain.Bar{candle(36, 4.97), candle(37, 5.05)}, at(37).Add(30 * time.Second), 4.97},
+		{"after_target waits for the target", config.CandleTrailAfterTarget, pos,
+			[]domain.Bar{candle(36, 5.02)}, at(37), 0},
+		{"after_target trails the runner", config.CandleTrailAfterTarget, scaled,
+			[]domain.Bar{candle(36, 5.02)}, at(37), 5.02},
+		{"off never trails", config.CandleTrailOff, scaled, []domain.Bar{candle(36, 5.02)}, at(37), 0},
+		{"empty means off", "", scaled, []domain.Bar{candle(36, 5.02)}, at(37), 0},
 	}
 	for _, tc := range cases {
-		if got := CandleTrailStop(tc.pos, tc.bar, cfgFor(tc.mode)); got != tc.want {
+		if got := CandleTrailStop(tc.pos, tc.bars, tc.now, cfgFor(tc.mode)); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
-func TestLastCompletedBarSkipsTheFormingCandle(t *testing.T) {
-	at := func(mm, ss int) time.Time { return time.Date(2026, 9, 28, 10, mm, ss, 0, time.UTC) }
-	bars := []domain.Bar{{Time: at(35, 0), Low: 1}, {Time: at(36, 0), Low: 2}, {Time: at(37, 0), Low: 3}}
+// A wider trail: the lowest low of the last N candles, on candles longer than the
+// ones the setup is read on, built from those.
+func TestCandleTrailStopWider(t *testing.T) {
+	at := func(mm int) time.Time { return time.Date(2026, 9, 28, 10, mm, 0, 0, time.UTC) }
+	pos := domain.Position{EntryTime: time.Date(2026, 9, 28, 10, 31, 20, 0, time.UTC)}
+	// 1-minute candles from 10:31 to 10:44.
+	lows := []float64{4.90, 5.00, 5.04, 5.02, 5.06, 5.10, 5.08, 5.12, 5.15, 5.11, 5.18, 5.20, 5.16, 5.22}
+	var bars []domain.Bar
+	for i, l := range lows {
+		bars = append(bars, domain.Bar{Time: at(31 + i), Low: l})
+	}
+	cfg := func(interval time.Duration, n int) *config.Config {
+		c := &config.Config{}
+		c.Entry.PatternInterval = time.Minute
+		c.Exit.CandleTrail = config.CandleTrailAlways
+		c.Exit.CandleTrailInterval, c.Exit.CandleTrailBars = interval, n
+		return c
+	}
 
-	if b, ok := LastCompletedBar(bars, at(37, 10), time.Minute); !ok || b.Low != 2 {
-		t.Errorf("at 10:37:10 got %+v ok=%v, want the 10:36 candle", b, ok)
+	cases := []struct {
+		name     string
+		interval time.Duration
+		n        int
+		now      time.Time
+		want     float64
+	}{
+		// 10:31 holds the fill, so the held candles are 10:32 onwards.
+		{"the last three 1m candles' lowest low", time.Minute, 3, at(38), 5.06},
+		{"not until three candles have been held", time.Minute, 3, at(34), 0},
+		// 5m candles: 10:30 holds the fill; 10:35-10:39 is the first held, low 5.06.
+		{"a 5m candle's low", 5 * time.Minute, 1, at(40), 5.06},
+		{"the 5m candle still forming is not read", 5 * time.Minute, 1, at(44), 5.06},
+		{"none before the first whole 5m candle closes", 5 * time.Minute, 1, at(39), 0},
+		{"two 5m candles need two", 5 * time.Minute, 2, at(40), 0},
 	}
-	if b, ok := LastCompletedBar(bars, at(38, 0), time.Minute); !ok || b.Low != 3 {
-		t.Errorf("at 10:38:00 got %+v ok=%v, want the 10:37 candle, which has just closed", b, ok)
-	}
-	if _, ok := LastCompletedBar(bars, at(35, 30), time.Minute); ok {
-		t.Error("at 10:35:30 no candle has closed yet")
+	for _, tc := range cases {
+		var held []domain.Bar
+		for _, b := range bars {
+			if !b.Time.Add(time.Minute).After(tc.now) {
+				held = append(held, b)
+			}
+		}
+		if got := CandleTrailStop(pos, held, tc.now, cfg(tc.interval, tc.n)); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

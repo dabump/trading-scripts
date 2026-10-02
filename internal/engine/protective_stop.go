@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/audit"
 	"github.com/martincoetzee/trading-agent/internal/broker"
@@ -72,12 +73,69 @@ func (e *Engine) placeProtectiveStop(ctx context.Context, sess scheduler.Session
 	return res.BrokerOrderID, nil
 }
 
+// protectEntry leaves a freshly bought position's stop resting at the broker, and
+// reports whether it did, with a note when it did not or when the order is not live.
+//
+// The usual case is that the stop came attached to the buy (submit's stopLoss) and
+// only has to be adopted. A short fill gets a fresh stop for exactly what was bought
+// instead, because a leg sized for the whole order would sell shares that were never
+// held. With no leg — the extended session, or the broker refused the attachment —
+// the stop is placed separately, as soon after the fill as the daemon can.
+//
+// A failure is reported and faulted but does not unwind the buy: selling straight back
+// across the spread is a certain loss to avoid an uncertain one, and with no order
+// working the engine evaluates the stop on the tick (stopIsUnenforced).
+func (e *Engine) protectEntry(ctx context.Context, sess scheduler.Session, pos domain.Position,
+	f fill, ordered int, extendedHours bool) (bool, string) {
+	if f.StopLegID != "" {
+		pos.StopOrderID = f.StopLegID
+		if err := e.store.SetStopOrderID(pos.ID, f.StopLegID); err != nil {
+			e.log.Error("could not record the attached stop", "symbol", pos.Symbol, "err", err)
+		}
+		if f.Shares >= ordered {
+			return true, ""
+		}
+		if _, err := e.releaseProtectiveStop(ctx, &pos); err != nil {
+			// Still recorded on the row, so every sell cancels it first.
+			e.faultStop(pos, "the stop attached to a short-filled buy could not be resized", err)
+			return true, "attached to the buy, but sized for more than was bought and could not be resized"
+		}
+	}
+
+	id, err := e.placeProtectiveStop(ctx, sess, pos)
+	if err != nil {
+		e.faultStop(pos, "the resting stop order could not be placed; its stop is evaluated on the tick instead", err)
+		return false, "it could not be placed: " + err.Error()
+	}
+	pos.StopOrderID = id
+	if extendedHours {
+		// Accepted, but a stop cannot trigger in the extended session, so it is inert
+		// until the bell. The engine covers that window.
+		return true, "resting at the broker, but a stop cannot trigger before 09:30 — " +
+			"until the open the agent holds this stop on the scan tick"
+	}
+	if f.StopAttachErr != "" {
+		return true, "placed just after the buy: the broker refused it attached (" + f.StopAttachErr + ")"
+	}
+	return true, ""
+}
+
+// faultStop records that a position is not protected the way it should be.
+func (e *Engine) faultStop(pos domain.Position, what string, err error) {
+	e.log.Error("protective stop: "+what, "symbol", pos.Symbol, "stop", pos.StopPrice, "err", err)
+	e.record(audit.Fault, pos.Symbol, fmt.Sprintf("%s: %s", pos.Symbol, what),
+		map[string]any{
+			"protective_stop": "not placed",
+			"stop_price":      pos.StopPrice,
+			"shares":          pos.SharesOpen,
+			"err":             err.Error(),
+		})
+}
+
 // pollProtectiveStop asks whether a position's resting stop has fired.
 //
-// The broker does not call back, so asking is the only way to learn. That costs one
-// order lookup per manual position per tick, which is the same order of expense as
-// the candle trail's bar request and is the price of the stop being enforced
-// off-process.
+// The broker does not call back, so asking is the only way to learn. Each call is
+// one order lookup; checkProtectiveStop decides when one is worth making.
 //
 // A terminal order that filled nothing — cancelled at the broker, rejected, expired —
 // is reported as gone: the id is cleared so the engine stops asking and starts
@@ -165,6 +223,81 @@ func (e *Engine) releaseProtectiveStop(ctx context.Context, pos *domain.Position
 	}
 	e.log.Info("protective stop cancelled", "symbol", pos.Symbol, "status", res.Status)
 	return broker.OrderResult{}, nil
+}
+
+// protectiveStopPoll is how often a resting stop is looked up while price is above it.
+// The broker enforces the stop either way; the lookup is only how the daemon learns
+// that it fired, and every sell looks the order up before selling regardless. At
+// or under the stop it is asked on every tick.
+const protectiveStopPoll = 15 * time.Second
+
+// checkProtectiveStop asks whether p's resting stop has fired, when that is worth a
+// request: on every tick once price is at or under the stop, otherwise every
+// protectiveStopPoll. One lookup per position per 2-second tick would be 30 requests a
+// minute each, against a 200/min budget the scan already spends most of.
+func (e *Engine) checkProtectiveStop(ctx context.Context, p *domain.Position, price float64) (broker.OrderResult, error) {
+	if p.StopOrderID == "" {
+		return broker.OrderResult{}, nil
+	}
+	now := e.now()
+	near := price > 0 && price <= p.StopPrice*(1+protectiveStopNear)
+	if !near && now.Sub(e.stopPolled[p.ID]) < protectiveStopPoll {
+		return broker.OrderResult{}, nil
+	}
+	if e.stopPolled == nil {
+		e.stopPolled = map[int64]time.Time{}
+	}
+	e.stopPolled[p.ID] = now
+	return e.pollProtectiveStop(ctx, p)
+}
+
+// protectiveStopNear widens "at the stop" a little for checkProtectiveStop: the mark
+// is the last trade, and a stop that printed between two marks may already have
+// filled while the next mark sits a cent above it.
+const protectiveStopNear = 0.005
+
+// moveProtectiveStop re-places p's resting stop at p.StopPrice, after the candle trail
+// has raised it. Cancel, confirm, place: a replacement that lost the race to the old
+// order filling records that fill instead.
+//
+// Any failure leaves the position safe rather than unprotected. If the old order could
+// not be taken off it still rests at the lower stop, and the engine evaluates the new
+// one on the tick; if the new one could not be placed, the tick holds it alone. A raised
+// stop that price is already under is not placed at all — the broker would refuse it —
+// and the tick sells the position instead.
+func (e *Engine) moveProtectiveStop(ctx context.Context, sess scheduler.Session, p *domain.Position, price float64) error {
+	if p.StopOrderID == "" {
+		return nil
+	}
+	res, err := e.releaseProtectiveStop(ctx, p)
+	if err != nil {
+		e.log.Warn("protective stop not moved; it still rests at the old stop",
+			"symbol", p.Symbol, "stop", p.StopPrice, "err", err)
+		return nil
+	}
+	if res.FilledShares > 0 {
+		return e.closeOnProtectiveStop(*p, res)
+	}
+	return e.restoreProtectiveStop(ctx, sess, p.ID, price)
+}
+
+// restoreProtectiveStop places a resting stop for what is held of the position now,
+// at its stored stop — after a scale-out or a move took the old one off.
+func (e *Engine) restoreProtectiveStop(ctx context.Context, sess scheduler.Session, id int64, price float64) error {
+	pos, err := e.store.PositionByID(id)
+	if err != nil {
+		return err
+	}
+	if !pos.Open || pos.SharesOpen <= 0 || pos.StopOrderID != "" {
+		return nil
+	}
+	if price > 0 && price <= pos.StopPrice {
+		return nil
+	}
+	if _, err := e.placeProtectiveStop(ctx, sess, pos); err != nil {
+		e.faultStop(pos, "the resting stop order could not be re-placed; its stop is evaluated on the tick instead", err)
+	}
+	return nil
 }
 
 // stopIsUnenforced reports whether the engine has to evaluate a manual position's

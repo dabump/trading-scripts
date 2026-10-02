@@ -28,6 +28,7 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
+	"github.com/martincoetzee/trading-agent/internal/strategy"
 )
 
 func main() {
@@ -42,16 +43,17 @@ func main() {
 		limit = flag.Int("symbols", 0, "cap the universe (0 = every tradable US equity)")
 		grid  = flag.Bool("grid", true, "sweep exit parameters and report the surface")
 		pats  = flag.Bool("patterns", false, "compare entry settings even when -grid=false")
+		study = flag.Bool("research", false, "study the price paths after each setup instead of the usual reports")
 	)
 	flag.Parse()
 
-	if err := run(*cfgPath, *fromFlag, *toFlag, *cacheDir, *timeframe, *limit, *grid, *pats); err != nil {
+	if err := run(*cfgPath, *fromFlag, *toFlag, *cacheDir, *timeframe, *limit, *grid, *pats, *study); err != nil {
 		fmt.Fprintf(os.Stderr, "backtest: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid, patterns bool) error {
+func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid, patterns, research bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -145,6 +147,10 @@ func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid,
 	fmt.Fprintln(os.Stderr)
 
 	prepared := prepare(cfg, days, benchPrev)
+	if research {
+		reportResearch(cfg, prepared)
+		return nil
+	}
 
 	base := simulate(cfg, prepared, 0)
 	reportFunnel(base, len(dates))
@@ -547,29 +553,66 @@ func reportEntryPatterns(base *config.Config, raw []*DayData, benchPrev map[stri
 }
 
 // reportCandleTrail measures the micro pullback's candle-low exit in each of its
-// modes. It varies only cfg.Exit, so the prepared sessions are reused.
+// modes, and then wider versions of it: the lowest low of several candles, and longer
+// candles built from the 1-minute ones. It varies only cfg.Exit, so the prepared
+// sessions are reused.
 func reportCandleTrail(base *config.Config, days []*preparedDay) {
 	fmt.Printf("\n## Candle trail: sell on the first candle to make a new low (0.25%% slippage per side)\n\n")
-	fmt.Printf("%-28s %7s %9s %7s %7s %9s %6s %9s %7s\n",
+	fmt.Printf("%-34s %7s %9s %7s %7s %9s %6s %9s %7s\n",
 		"exit.candle_trail", "trades", "mean", "t", "mean R", "median", "win", "equity", "maxDD")
-	for _, mode := range []string{config.CandleTrailOff, config.CandleTrailAfterTarget, config.CandleTrailAlways} {
+
+	type variant struct {
+		mode     string
+		interval time.Duration
+		bars     int
+	}
+	variants := []variant{
+		{config.CandleTrailOff, 0, 0},
+		{config.CandleTrailAfterTarget, 0, 0},
+		{config.CandleTrailAlways, 0, 0},
+	}
+	for _, mode := range []string{config.CandleTrailAfterTarget, config.CandleTrailAlways} {
+		for _, w := range []struct {
+			interval time.Duration
+			bars     int
+		}{
+			{time.Minute, 2}, {time.Minute, 3}, {time.Minute, 5},
+			{2 * time.Minute, 1}, {3 * time.Minute, 1}, {5 * time.Minute, 1},
+			{5 * time.Minute, 2}, {15 * time.Minute, 1},
+		} {
+			variants = append(variants, variant{mode, w.interval, w.bars})
+		}
+	}
+
+	baseInterval, baseBars := strategy.TrailInterval(base), strategy.TrailBars(base)
+	for _, v := range variants {
 		cfg := *base
-		cfg.Exit.CandleTrail = mode
+		cfg.Exit.CandleTrail = v.mode
+		cfg.Exit.CandleTrailInterval, cfg.Exit.CandleTrailBars = v.interval, v.bars
+		label := v.mode
+		if v.mode == "" {
+			label = config.CandleTrailOff
+		}
+		if v.interval > 0 {
+			label += fmt.Sprintf(", low of %d × %s", strategy.TrailBars(&cfg), durationLabel(strategy.TrailInterval(&cfg)))
+		}
+		sameMode := v.mode == base.Exit.CandleTrail || (v.mode == config.CandleTrailOff && base.Exit.CandleTrail == "")
+		if sameMode && (v.mode == config.CandleTrailOff ||
+			(strategy.TrailInterval(&cfg) == baseInterval && strategy.TrailBars(&cfg) == baseBars)) {
+			label += " (current)"
+		}
+
 		s := simulate(&cfg, days, 0.25)
 		r := returns(s.Trades)
 		if len(r) == 0 {
-			fmt.Printf("%-28s %7d\n", mode, 0)
+			fmt.Printf("%-34s %7d\n", label, 0)
 			continue
 		}
 		rs := make([]float64, len(s.Trades))
 		for i, tr := range s.Trades {
 			rs[i] = tr.TotalR
 		}
-		label := mode
-		if mode == base.Exit.CandleTrail || (mode == config.CandleTrailOff && base.Exit.CandleTrail == "") {
-			label += " (current)"
-		}
-		fmt.Printf("%-28s %7d %8.2f%% %7.2f %+7.2f %8.2f%% %5.0f%% %9.0f %6.1f%%\n",
+		fmt.Printf("%-34s %7d %8.2f%% %7.2f %+7.2f %8.2f%% %5.0f%% %9.0f %6.1f%%\n",
 			label, len(r), mean(r), tStat(r), mean(rs), median(r), winRate(r),
 			s.EndEquity, s.MaxDrawdownPc)
 	}

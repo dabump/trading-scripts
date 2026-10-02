@@ -47,6 +47,12 @@ type Fake struct {
 	// is how a test reaches the case that matters most: a position bought with no
 	// resting stop behind it.
 	stopOrderErr error
+	// stopsInert holds resting stops untriggered whatever the price does, as Alpaca
+	// does before the opening bell: it accepts a stop then, but will not fire it.
+	stopsInert bool
+	// attachedStopErr rejects only a buy carrying an attached stop, so the buy alone
+	// and a separate stop order both still go through.
+	attachedStopErr error
 
 	// Call counters, so tests can assert the scan's cost profile: a full-market
 	// scan is only affordable if the expensive per-symbol calls stay rare.
@@ -391,8 +397,14 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 	f.placed = append(f.placed, req)
 
 	id := "fake-" + req.ClientOrderID
-	if req.Type == "stop" && f.stopOrderErr != nil {
+	if (req.Type == "stop" || req.StopLoss > 0) && f.stopOrderErr != nil {
 		return OrderResult{}, f.stopOrderErr
+	}
+	if req.StopLoss > 0 && f.attachedStopErr != nil {
+		return OrderResult{}, f.attachedStopErr
+	}
+	if req.StopLoss > 0 && req.ExtendedHours {
+		return OrderResult{}, fmt.Errorf("fake: an attached stop is not accepted in extended hours")
 	}
 	// A stop order is acknowledged and then waits: it fills when the price reaches
 	// its trigger, which here is whenever a caller moves the price.
@@ -431,6 +443,14 @@ func (f *Fake) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, err
 	}
 	if shares > 0 {
 		res.FilledPrice = price
+	}
+	// The attached stop comes alive for what the buy filled, as Alpaca's leg does
+	// once its parent fills.
+	if req.StopLoss > 0 && shares > 0 {
+		legID := id + "-stop"
+		f.orders[legID] = OrderResult{BrokerOrderID: legID, Status: "new"}
+		f.resting[legID] = restingStop{symbol: req.Symbol, side: "sell", shares: shares, stop: req.StopLoss}
+		res.StopLegID = legID
 	}
 	f.orders[res.BrokerOrderID] = res
 	return res, nil
@@ -471,7 +491,7 @@ func (f *Fake) settle(symbol, side string, shares int, price float64) {
 // the resting order is that the gap between trigger and fill is the broker's to
 // manage, and a test that wants to see slippage should ask for it explicitly.
 func (f *Fake) triggerStops(symbol string, price float64) {
-	if price <= 0 {
+	if price <= 0 || f.stopsInert {
 		return
 	}
 	for id, r := range f.resting {
@@ -495,6 +515,35 @@ func (f *Fake) triggerStops(symbol string, price float64) {
 		}
 		delete(f.resting, id)
 	}
+}
+
+// SetStopsInert stops resting stops from triggering, as before the opening bell.
+func (f *Fake) SetStopsInert(inert bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopsInert = inert
+}
+
+// SetAttachedStopError refuses buys that carry an attached stop, and nothing else.
+func (f *Fake) SetAttachedStopError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attachedStopErr = err
+}
+
+// RestingStop reports the one resting stop for symbol: its share count and trigger.
+// ok is false when there is not exactly one.
+func (f *Fake) RestingStop(symbol string) (shares int, stop float64, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.resting {
+		if r.symbol == symbol {
+			shares, stop = r.shares, r.stop
+			n++
+		}
+	}
+	return shares, stop, n == 1
 }
 
 // SetStopOrderError makes stop orders fail while everything else keeps working, so

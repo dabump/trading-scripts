@@ -37,15 +37,18 @@ import (
 // from the stop.
 type qualifier struct {
 	Symbol string
-	// SetupClose is the trigger bar's close — what the daemon would size from. The
-	// backtest fills at the next bar's open instead, so this is recorded only for
-	// comparison.
+	// SetupClose is the trigger bar's close. Neither the daemon nor the backtest
+	// sizes from it: both re-read the price before buying (strategy.CheckEntryPrice),
+	// which here is the next bar's open.
 	SetupClose float64
-	Stop       float64
-	StopPct    float64
-	PauseBars  int
-	VolMult    float64
-	MovePct    float64
+	// PauseHigh is the level the trigger closed above; a price back under it is a
+	// failed breakout and is not bought.
+	PauseHigh float64
+	Stop      float64
+	StopPct   float64
+	PauseBars int
+	VolMult   float64
+	MovePct   float64
 	// BuyStop, when set, makes this an armed buy-stop rather than a buy at the next
 	// open: it fills only if the next bar trades above it. Only a prepare run with
 	// buyStop set produces these (see prepareWith).
@@ -73,8 +76,18 @@ type preparedDay struct {
 
 	// qualifiers[i] are the ranked candidates at Boundaries[i].
 	qualifiers [][]qualifier
+	// firstQualified is when each symbol first passed the screen inside the entry
+	// window, whether or not it ever set up. Only the research report reads it.
+	firstQualified map[string]firstQualification
 
 	funnel funnel
+}
+
+// firstQualification is the moment a symbol first passed all three criteria.
+type firstQualification struct {
+	at      time.Time
+	volMult float64
+	movePct float64
 }
 
 // funnel counts how a session's candidates were whittled down, once per
@@ -119,10 +132,11 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 			continue
 		}
 		p := &preparedDay{
-			Date:   day.Date,
-			EODAt:  sess.close.Add(-time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute),
-			bars:   map[string]map[int64]Bar{},
-			series: day.Intraday,
+			Date:           day.Date,
+			EODAt:          sess.close.Add(-time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute),
+			bars:           map[string]map[int64]Bar{},
+			series:         day.Intraday,
+			firstQualified: map[string]firstQualification{},
 		}
 		p.EntryEndAt = sess.open.Add(cfg.Timing.EntryWindow)
 		if p.EntryEndAt.After(p.EODAt) {
@@ -232,6 +246,10 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 				}
 				if e.Qualifies {
 					seen[sym].qualified = true
+					if _, ok := p.firstQualified[sym]; !ok && t.Before(p.EntryEndAt) {
+						p.firstQualified[sym] = firstQualification{at: t, volMult: e.VolumeMultiple,
+							movePct: in.IntradayPct}
+					}
 				}
 				evals = append(evals, e)
 				prices[sym] = price
@@ -254,7 +272,7 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 					}
 					seen[e.Symbol].setUp = true
 					p.qualifiers[i] = append(p.qualifiers[i], qualifier{
-						Symbol: e.Symbol, SetupClose: setup.Entry, Stop: setup.Stop,
+						Symbol: e.Symbol, SetupClose: setup.Entry, PauseHigh: setup.PauseHigh, Stop: setup.Stop,
 						StopPct: setup.StopDistancePct, PauseBars: setup.PauseBars,
 						VolMult: e.VolumeMultiple, MovePct: moves[e.Symbol],
 						BuyStop: setup.BuyStop,
@@ -430,13 +448,17 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 		}
 
 		// trail raises the stop to the candle trail's level once bar has completed
-		// with the position still held, as engine.managePositions does.
+		// with the position still held, as engine.managePositions does. heldBars is
+		// every bar each position has held through, which is what a trail over
+		// several candles, or over longer ones, is built from.
+		heldBars := map[string][]domain.Bar{}
 		trail := func(sym string, bar Bar) {
 			pos, held := open[sym]
 			if !held {
 				return
 			}
-			lvl := strategy.CandleTrailStop(*pos, toDomainBars([]Bar{bar})[0], cfg)
+			heldBars[sym] = append(heldBars[sym], toDomainBars([]Bar{bar})[0])
+			lvl := strategy.CandleTrailStop(*pos, heldBars[sym], bar.T.Add(cfg.Entry.PatternInterval), cfg)
 			if lvl > pos.StopPrice {
 				pos.StopPrice = lvl
 			}
@@ -479,6 +501,17 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 				// the bar gapped past it, and not at all if the bar never got there —
 				// which is not a gate turning it away, so nothing is recorded.
 				px := entryBar.O
+				if q.BuyStop == 0 {
+					// The daemon re-reads the price before ordering and refuses a trade
+					// it has moved off; the next open is that price here.
+					setup := strategy.Setup{Entry: q.SetupClose, Stop: q.Stop, PauseHigh: q.PauseHigh}
+					if reason := strategy.CheckEntryPrice(setup, px, cfg); reason != "" {
+						if _, seen := firstBlock[q.Symbol]; !seen {
+							firstBlock[q.Symbol] = "price moved: " + reason
+						}
+						continue
+					}
+				}
 				if q.BuyStop > 0 {
 					if entryBar.H <= q.BuyStop {
 						continue
@@ -511,6 +544,7 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 					continue
 				}
 				cash -= fill * float64(sz.Shares)
+				heldBars[q.Symbol] = nil
 				open[q.Symbol] = &domain.Position{
 					SessionDate: day.Date, Symbol: q.Symbol, Shares: sz.Shares,
 					SharesOpen: sz.Shares, EntryPrice: fill, EntryTime: t,

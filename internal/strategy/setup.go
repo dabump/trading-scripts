@@ -328,6 +328,44 @@ func stopBelow(entry, low float64, cfg *config.Config) Setup {
 	}
 }
 
+// CheckEntryPrice judges a triggered setup against the price an order can actually
+// get now, and returns why the trade is off, or "" when it may go ahead at price.
+//
+// The setup is read on a closed candle, so its Entry is history by the time an order
+// can be sent. On 2026-10-02 all three automated entries filled 2-8% away from the
+// trigger close they were sized on: one 5.7% above it, carrying 2.8x the risk budget,
+// and two after price had already fallen back through the pause — one of them below
+// its own stop, which sold it four seconds later. The setup's levels still stand; it
+// is the price that has to be re-read, and the stop distance with it.
+func CheckEntryPrice(s Setup, price float64, cfg *config.Config) string {
+	switch {
+	case price <= 0:
+		return "no live price"
+	case price <= s.Stop+priceEpsilon:
+		return fmt.Sprintf("price %.2f is already at or below the %.2f stop", price, s.Stop)
+	case s.PauseHigh > 0 && price < s.PauseHigh-priceEpsilon:
+		return fmt.Sprintf("price %.2f is back under the %.2f pause high: the breakout failed",
+			price, s.PauseHigh)
+	}
+	if drift := (price - s.Entry) / s.Entry * 100; drift > cfg.Entry.MaxEntryDriftPct+priceEpsilon {
+		return fmt.Sprintf("price %.2f has run %.2f%% past the %.2f trigger, beyond the %.2f%% limit",
+			price, drift, s.Entry, cfg.Entry.MaxEntryDriftPct)
+	}
+	dist := (price - s.Stop) / price * 100
+	if dist > cfg.Entry.MaxStopDistancePct+priceEpsilon {
+		return fmt.Sprintf("stop is %.2f%% away at %.2f, beyond the %.2f%% limit",
+			dist, price, cfg.Entry.MaxStopDistancePct)
+	}
+	// Not widened, unlike a tight stop on the chart: here the stop is close because
+	// price has fallen back towards it since the trigger, which is the breakout
+	// failing, not noise in a valid one.
+	if dist < cfg.Entry.MinStopDistancePct-priceEpsilon {
+		return fmt.Sprintf("stop is only %.2f%% away at %.2f, inside the %.2f%% minimum",
+			dist, price, cfg.Entry.MinStopDistancePct)
+	}
+	return ""
+}
+
 // EMA returns the exponential moving average of values, seeded with a simple
 // average of the first `period` points so the first published value is not simply
 // the first input. The result is aligned to the tail of values: the last element

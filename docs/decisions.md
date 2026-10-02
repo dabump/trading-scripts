@@ -1139,10 +1139,209 @@ so none of this is in any backtest number, and the automated path is untouched �
 stop is still evaluated on the tick, deliberately, because that position is one the
 strategy sized, entered and watches.
 
+## 2026-10-03 — Entries re-read the price, and the screen no longer blocks the tick
+
+**What happened on 2026-10-02.** All three automated entries hit their stop, for
+−$169.83. Each one was decided and sized on the trigger candle's close and filled a
+long way from it:
+
+| Trade | Trigger close | Fill | Outcome |
+|---|---|---|---|
+| QTEX 14:06 | 1.135 | 1.20 (+5.7%) | Risk was $242 against a ~$87 budget (2.8x): the stop was 8.4% from the fill when the limit is 4%. Candle-trailed to 1.17, sold at 1.14 |
+| QTEX 17:33 | 1.295 | 1.27 (−1.9%) | Filled at the pause low, so the stop was 0.1% away. Stopped out after 5.6s |
+| SDEV 18:27 | 7.4501 | 6.85 (−8.0%) | Filled *below* its own 7.18 stop. Sold 4s later — `enterPositions` accepted this on purpose ("the stop sells it on the next tick either way") |
+
+**Why the price was old.** The setup check ran at the end of the screen, and the
+screen is ~130 mostly-serial requests: the log shows each entry ~15s after the
+tradability line, ~55s into the minute. So the trigger close was close to a minute old
+when the market order went. `Tick` was also synchronous, so for most of every minute
+the 2-second position checks did not run either — the stop checks, the trail and the
+target were all held up behind the screen.
+
+**Changes.**
+
+- **`strategy.CheckEntryPrice`** re-judges a triggered setup at the live price just
+  before ordering: refused if at or below the stop, back under the pause high, more than
+  `entry.max_entry_drift_pct` above the trigger close, or with the stop outside the
+  distance band at that price. Sizing uses the live price. All three trades above are
+  refused by it (tests replay them). **`max_entry_drift_pct: 1.0` is PROPOSED, not
+  measured.**
+- **The screen runs on a background goroutine under `Run`** and publishes a watchlist;
+  `Tick` reads it. The setup check reads each watchlist name's chart **once per
+  completed candle** (retrying for `setupBarGrace`, 10s, while the bar is unpublished),
+  on **closed candles only** — the feed includes the forming candle, and before this it
+  could be read as the trigger. Orders are still sent only from `Tick`. A test calling
+  `Tick` directly gets the screen inline, so simulated days stay deterministic.
+- **The candidate table is re-saved whenever an outcome changes**, under the screen's
+  timestamp; `SaveScreenSnapshot` now replaces a same-timestamp row in one transaction.
+- **`cmd/backtest` applies `CheckEntryPrice` to the next bar's open** in the
+  close-triggered mode, so it measures what the daemon does. Its numbers have **not**
+  been re-run since this change.
+
+**Request budget, which this tightens.** The 2-second tick used to be mostly stalled
+behind the screen, so its ~60 requests a minute (account plus held-position snapshot)
+were really far fewer. They now happen in full alongside the screen's ~130, which puts
+a busy minute close to Alpaca's 200/min. Nothing measures this yet. **Done later the
+same day:** `refreshAccount` now reads the balance at most every 10s (`accountRefresh`) —
+the page polls every 12s, so reading it every 2s bought nothing — which takes ~25
+requests a minute off the tick.
+
+**Not done:** a broker-side buy-stop-limit entry (`ArmMicroPullback`). That would remove
+the remaining gap between the trigger and the fill.
+
+## 2026-10-03 — Every stop is sent with the buy
+
+**On request**: "ensure stops are placed as part of the buy order". Until now only a
+manual position's stop rested at the broker, and it was sent just *after* the fill;
+an automated position's stop existed only on the tick, which is how all three
+stop-outs on 2026-10-02 were executed.
+
+**What changed.**
+- `broker.OrderRequest.StopLoss` sends a buy as an Alpaca **`oto`** order with a
+  `stop_loss` leg; the leg's id comes back as `OrderResult.StopLegID`. The parent and leg
+  are **`gtc`**, because a leg takes its parent's time in force and a protective stop is
+  good-till-cancelled; the buy still cannot linger, since `awaitFill` cancels whatever
+  has not filled within 10s.
+- `engine.protectEntry` adopts the leg on both entry paths (automated and Open). After a
+  **short fill** it replaces the leg with a stop for what was actually bought: Alpaca's
+  handling of a leg whose parent was part-filled and then cancelled is not verified, and
+  a leg sized for the whole order would sell shares that were never held.
+- **Fallbacks keep the old behaviour.** Pre-market, where only simple limit orders are
+  accepted, the buy goes alone and the stop follows the fill, as manual opens already
+  did. If the broker refuses the attachment, `submit` resends the buy alone **under the
+  same client order id** — had the first one landed after all, the duplicate is refused
+  rather than buying twice — and the stop follows the fill.
+- **Automated positions move their stop, and the order now moves with it.**
+  `moveProtectiveStop` cancels, confirms and re-places when the candle trail raises the
+  stop (at most once per candle). `scaleOut` takes the order off before selling part — it
+  covers every share, and the broker holds shares against an open sell — and restores it
+  for the runner at the moved stop. If a move fails, the old order still rests at the
+  lower stop, or the tick holds the new one; the position is never left bare.
+- **The tick still evaluates an automated position's rules, stop included.** This is
+  deliberately not the manual position's "mutually exclusive" design: every sell goes
+  through `clearStopForSale`, which takes the resting order off first and records it as
+  the exit if it had already filled, so the two cannot both sell. The tick is what
+  covers a failed move or a missing order.
+- **The status lookup is throttled.** `checkProtectiveStop` asks every 15s, or every
+  tick once the mark is within 0.5% of the stop, instead of every tick. The broker
+  enforces the stop either way, and every sell looks the order up first.
+- Manual and automated exits now share one sell path (`exitPosition`); the two copies
+  had drifted only in their audit wording.
+
+**Unverified against a live account**, and worth checking on the first paper day:
+Alpaca accepting `gtc` on a market `oto` parent, and the leg id appearing in the
+order responses (`legs`, read from the placement and from the fill lookups). The first
+fails safe: a refusal falls back to the buy alone plus a separate stop. If the second
+is missing, the leg is not adopted and a separate stop is attempted, which Alpaca
+should refuse because the leg already holds the shares — a `FAULT` beside an `oto` buy
+with `stop_order_attached: false` would show it, and exits would then fail loudly
+rather than go short. **Not measurable in
+`cmd/backtest`**, which already models the stop as filling at its trigger.
+
+## 2026-10-03 — Re-measured under today's rules: trail after the target, and no wider trail helps
+
+All runs: full universe, `sip`, 1-minute bars, 0.25% slippage per side unless stated,
+with the 2026-10-03 entry price check (`max_entry_drift_pct` 1.0, applied to the next
+bar's open).
+
+**One year (2025-10-02 → 2026-10-02), `exit.candle_trail`:**
+
+```
+exit.candle_trail   trades   mean      t     mean R   win   equity   maxDD
+off                   139   -0.43%   -0.93   -0.24    29%    8168    21.2%
+after_target          144   -0.48%   -1.49   -0.25    29%    7941    21.6%
+always                156   -0.68%   -3.78   -0.29    26%    7154    29.6%
+```
+
+`always` was the shipped value, and its loss is no longer noise (t −3.78). It trails
+from the first whole candle held, so the median hold was **1 minute**. **Changed to
+`after_target`** (by the operator, on this evidence): it beats `always` on every line,
+and `off` is within noise of it. Even with no slippage `always` lost −0.15% a trade.
+The two months 2026-08-03 → 2026-10-02 (18 trades) agree in direction: `after_target`
++0.05%, `always` −0.12%, `off` −0.73%. Buy-stop entry over the year: 507 trades,
+−0.74%, equity 3096, max drawdown 71.3% — confirming the 2026-09-29 decision not to
+build it.
+
+**Wider trails: none helps.** `exit.candle_trail_interval` and `exit.candle_trail_bars`
+were added (defaults reproduce the one-candle trail) so `CandleTrailStop` could take
+the lowest low of N candles, or of candles longer than the setup's, in the daemon and
+the backtest alike. One year:
+
+```
+                         after_target            always
+trail                    mean   equity  maxDD    mean   equity  maxDD
+1 × 1m (default)        -0.48%   7941   21.6%   -0.68%   7154   29.6%
+low of 2 × 1m           -0.53%   7837   22.8%   -0.69%   7262   29.5%
+low of 3 × 1m           -0.55%   7766   23.3%   -0.63%   7485   28.0%
+low of 5 × 1m           -0.50%   7994   21.7%   -0.81%   6893   32.8%
+1 × 2m                  -0.51%   7913   22.1%   -0.72%   7180   30.3%
+1 × 3m                  -0.55%   7829   22.7%   -0.66%   7385   29.2%
+1 × 5m                  -0.56%   7824   23.0%   -0.94%   6537   36.6%
+low of 2 × 5m           -0.62%   7611   24.3%   -0.82%   6973   31.1%
+1 × 15m                 -0.75%   7214   28.8%   -0.82%   7013   31.0%
+```
+
+**Why the "money left behind" did not turn into a better exit.** The exit-quality table
+says positions went a mean +17% beyond entry and +16.7% beyond the exit. That is
+measured to the end of the session, so it counts recoveries *after* the chart stop had
+already sold the position: 93% of trades dipped 2% below entry at some point, and the
+median trade is a −2.1% chart stop-out under every `after_target` variant. A wider
+trail cannot help a trade that never got past its initial stop — and from entry
+(`always`) it only moves the exit from the trail to the chart stop. The loss is in the
+entry and the initial stop, not in how the runner is managed.
+
+**Still open.** Every configuration measured loses money after 0.25% slippage, and the
+worst rolling five-session day-trade count is 10 against a PDT limit of 3. Nothing here
+changes the case for staying on paper.
+
+## 2026-10-03 — Looking for a way to capture the upside: none found
+
+**The question.** After a setup, positions reached a mean +16–17% before the bell, and
+the exits kept almost none of it. Is there an entry, stop and target that captures it?
+
+**Method.** `cmd/backtest -research` (new, report-only — it changes no rule) follows
+each entry's 1-minute path to the forced exit and scores every pair of stop
+(chart, −2 … −15%) and target (+3 … +30%, or none: hold to the bell), equal-weight per
+entry, net of 0.5% round-trip cost, with the year split into halves at 2026-04-09 so a
+rule chosen on one half can be checked on the other. It also reports the mean without
+the five best entries and the median, because the returns have a very heavy right tail.
+Five entries, each the first per symbol per session, on 2025-10-02 → 2026-10-02:
+
+```
+entry (n)                                      the order things happen in       best stop × target by the weaker half
+                                               +10% before −2%  dip before high  stop/target  h1      h2      ex-top-5  median
+micro pullback setup, as configured (128)          13%            −3.3%         −15%/+3%   +0.37%  −0.05%   +0.06%   +2.50%
+at first qualification, next open (2062)           12%            −2.6%         −15%/none  −0.15%  +0.49%   −1.63%   −4.05%
+new high of day after qualifying (976)              6%            −3.9%         −15%/none  −0.83%  −0.49%   −2.29%   −7.68%
+15-min opening-range breakout (1472)               10%            −2.8%         −15%/+3%   −0.40%  −0.50%   −0.48%   +2.50%
+VWAP reclaim after qualifying (1484)               13%            −2.4%          −4%/none  +0.10%  +1.14%   −1.44%   −4.50%
+```
+
+**What it says.**
+- **The upside comes after the drawdown, not before it.** On every entry the typical
+  path dips 2.4–3.9% before making its high, about 30–40 minutes later, and only 6–13%
+  of entries reach +10% before a 2% dip. A tight stop is out before the move; a wide
+  one gives back more on the losers than the winners make.
+- **No fixed target works.** Every target cell loses in at least one half, and the
+  ones that win most often (+3%, ~75–80% of the time) still lose after costs.
+- **The only cells positive in both halves are "no target, hold to the bell" on the
+  VWAP reclaim** (+0.69% a trade with a −4% stop, +0.17R) — and that is **five trades
+  out of 1,484**: without them the mean is −1.44% and the median trade is −4.5%. The
+  same holds for the first-qualification entry. The upside is real, but it lives in a
+  handful of extreme runners that nothing known at entry (hour, relative volume, move,
+  price, stop distance) picks out consistently in both halves.
+
+**Decision: no new settings.** Nothing measured is robust enough to recommend, and a
+rule chosen from 320 cells on one year would most likely be chosen by chance. The
+least harmful configuration measured remains `exit.candle_trail: after_target` (or
+`off`) with the current entry. The edge, if there is one, is in information this agent
+does not have — float, Level 2, the tape — or in costs below the 0.25% a side assumed
+here, not in stop and target placement.
+
 ## Open items (not yet decided)
 
-- **The automated path still has no resting stop.** Only manual positions got one, which is what was asked for, and the asymmetry is now the obvious question: an automated position's stop is evaluated once per `timing.position_poll_interval` and is not enforced at all if the daemon stops. The reason for leaving it is that the automated path also *moves* its stop — the candle trail and the breakeven move after the target — and each move means cancel-and-replace, so the cost is a second order per position per trail step rather than one per position. Worth measuring against realised slippage on the automated exits before changing.
-- **The resting stop costs one order lookup per manual position per tick.** The broker does not call back, so `pollProtectiveStop` asks. At the position cap that is a small number against Alpaca's 200/min, but it is on the same budget as the ~130-request scan and nothing measures tick duration — the same blind spot recorded above.
+- **(Resolved 2026-10-03: every position's stop now rests at the broker, attached to the buy; see above.)** **The automated path still has no resting stop.** Only manual positions got one, which is what was asked for, and the asymmetry is now the obvious question: an automated position's stop is evaluated once per `timing.position_poll_interval` and is not enforced at all if the daemon stops. The reason for leaving it is that the automated path also *moves* its stop — the candle trail and the breakeven move after the target — and each move means cancel-and-replace, so the cost is a second order per position per trail step rather than one per position. Worth measuring against realised slippage on the automated exits before changing.
+- **(Resolved 2026-10-03: looked up every 15s, or every tick only near the stop.)** **The resting stop costs one order lookup per manual position per tick.** The broker does not call back, so `pollProtectiveStop` asks. At the position cap that is a small number against Alpaca's 200/min, but it is on the same budget as the ~130-request scan and nothing measures tick duration — the same blind spot recorded above.
 - **A manual position can no longer be carried overnight**, which the 2026-09-30 request wanted. If that need returns, it conflicts directly with the forced exit and needs a deliberate choice rather than both.
 
 - **(Superseded 2026-09-29: the micro pullback trades ~150 times a year and still measured no edge; see above.)** **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.

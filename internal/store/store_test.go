@@ -251,6 +251,23 @@ func TestScreenSnapshotKeepsOnlyLatest(t *testing.T) {
 		t.Errorf("criteria lost in round trip: %+v", got[0].Criteria)
 	}
 
+	// The same pass re-saved with a changed outcome replaces itself: the setup check
+	// does this whenever a candidate's Action changes between screens.
+	second[0].Outcome = "no setup: not yet"
+	if err := s.SaveScreenSnapshot("2026-09-28", t0.Add(time.Minute), second); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM screen_snapshots`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("%d snapshot rows after re-saving the same pass, want 1", rows)
+	}
+	if got, _, _ := s.LatestScreenSnapshot("2026-09-28"); got[0].Outcome != "no setup: not yet" {
+		t.Errorf("outcome = %q, want the re-saved one", got[0].Outcome)
+	}
+
 	// An absent snapshot is not an error; the page just has nothing to show yet.
 	empty, _, err := s.LatestScreenSnapshot("2026-09-29")
 	if err != nil || empty != nil {

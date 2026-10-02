@@ -26,13 +26,21 @@ func (h *harness) openByHand(t *testing.T, symbol string, price float64) domain.
 	return res.Position
 }
 
-// restingStopFor returns the stop order the open left at the broker.
+// restingStopFor returns the stop order the open left at the broker: either one sent
+// on its own, or the leg attached to the buy, described as the sell stop it becomes.
 func (h *harness) restingStopFor(t *testing.T, symbol string) broker.OrderRequest {
 	t.Helper()
 	var found []broker.OrderRequest
 	for _, o := range h.fake.Placed() {
-		if o.Symbol == symbol && o.Type == "stop" {
+		switch {
+		case o.Symbol != symbol:
+		case o.Type == "stop":
 			found = append(found, o)
+		case o.StopLoss > 0:
+			found = append(found, broker.OrderRequest{
+				Symbol: o.Symbol, Shares: o.Shares, Side: "sell", Type: "stop",
+				StopPrice: o.StopLoss, TimeInForce: o.TimeInForce, ExtendedHours: o.ExtendedHours,
+			})
 		}
 	}
 	if len(found) != 1 {

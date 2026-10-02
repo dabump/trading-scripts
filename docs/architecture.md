@@ -16,7 +16,7 @@ There is one Alpaca account/API key set used for both market data and order exec
 | Package | Responsibility |
 |---|---|
 | `scheduler` | Pure session arithmetic, including the countdowns the status page shows (`UntilOpen`, `UntilClose`, `FormatCountdown`): given the exchange's calendar day and config, reports which phase the clock is in (closed / pre-market / sentiment-gate window / trading / EOD window) and where the boundaries fall. Holds no state and does no I/O. |
-| `engine` | Drives the daily loop that `scheduler` describes, plus restart reconciliation. One `Tick` decides what is due; there are no per-phase goroutines and no direct `time.Now()` calls (the clock is injected, which is what makes a whole day testable). |
+| `engine` | Drives the daily loop that `scheduler` describes, plus restart reconciliation. One `Tick` decides what is due, and every order is sent from it; there are no per-phase goroutines and no direct `time.Now()` calls (the clock is injected, which is what makes a whole day testable). The one exception to running inline is the screen: under `Run` it runs on a background goroutine and publishes a watchlist, so a pass that takes most of a minute no longer holds up the 2-second position checks or the per-candle setup check. A test calling `Tick` directly gets the screen inline. |
 | `config` | Loads and validates `config/config.yaml`, rejecting configurations that would only fail mid-session — for example sizing × concurrency exceeding 100% of the portfolio. Credentials are read from the environment here, never from YAML. |
 | `domain` | Shared types (positions, snapshots, evaluations, agent states). Exists to keep `store`, `broker`, `strategy`, `risk` and `web` from importing each other. |
 | `sentiment` | Polls market data every `timing.sentiment_poll_interval` (2m) through the gate window after the open — `timing.sentiment_window`, 5m, shortened from the hour originally specified — and produces a bullish/overwhelmingly-bearish/neutral reading. See [`strategy.md`](./strategy.md) for what feeds this. |
@@ -43,8 +43,10 @@ scheduler: market opens
   -> sentiment: poll every 10min for 1 hour, write readings to store
   -> scheduler: read sentiment history from store, decide bullish/bearish
        bearish -> risk: trigger daily kill switch, done for the day
-       bullish -> screener: find candidates
-                    -> strategy: decide buy -> risk: size position, check exposure cap
+       bullish -> screener (background, ~1/min): publish a watchlist
+                  tick, once per closed candle per watchlist name:
+                    -> strategy: setup on closed candles -> live price re-checked
+                    -> risk: size from the live price, check exposure cap
                          -> broker: place order -> store: record open position
                     (repeat through the day as candidates and exits occur)
   -> strategy: continuously evaluate open positions against exit rules
@@ -52,7 +54,7 @@ scheduler: market opens
   -> scheduler: force-exit any remaining open positions at T-30min-before-close
 ```
 
-`web` runs alongside this the whole time, independently reading `store` to render status — it never blocks or is blocked by the trading loop, and it makes no broker calls of its own: the loop persists each position's last mark, so the ~12s page poll costs nothing upstream. The account balance reaches the page the same way. Every tick reads `broker.Account` and publishes the result on the engine (`engine.Account`, alongside `Session` and `NextSession`), so the figure is refreshed once per tick — bounded by the loop — rather than once per page poll by every open browser.
+`web` runs alongside this the whole time, independently reading `store` to render status — it never blocks or is blocked by the trading loop, and it makes no broker calls of its own: the loop persists each position's last mark, so the ~12s page poll costs nothing upstream. The account balance reaches the page the same way. The tick reads `broker.Account` at most every 10s (`accountRefresh`) and publishes the result on the engine (`engine.Account`, alongside `Session` and `NextSession`), so the figure is refreshed on a fixed cadence — bounded by the loop — rather than once per page poll by every open browser.
 
 The page is not purely passive any more. `engine.CheckSentiment` and
 `engine.ScreenNow` back the two manual buttons; both share code with the automated

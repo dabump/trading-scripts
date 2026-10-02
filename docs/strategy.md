@@ -85,6 +85,14 @@ momentum approach it was always modelled on.
 Entry uses **the same evaluation** the status page displays — one `screener.Evaluate`
 pass per scan feeds both, so the two can never disagree about what qualifies.
 
+**The screen and the setup run at different speeds.** The screen (news, move, volume)
+costs ~130 requests and takes most of a minute; its answer changes over minutes. The
+setup changes every candle and costs one bar request per qualifying name. So the screen
+publishes a *watchlist* in the background, and the setup check reads each watchlist
+name's chart **once per completed candle, a second or two after it closes**. Until
+2026-10-03 the setup waited behind the screen, and every entry was decided on a candle
+that had closed almost a minute earlier (docs/decisions.md).
+
 ### The pattern: a micro pullback
 
 A qualifying candidate is bought only when its chart prints a **micro pullback**
@@ -119,12 +127,29 @@ so on a vertical mover it reported a 0-bar pullback for as long as the move was 
 That is why KNRX was refused at 09:59 (docs/decisions.md). The two were compared on a
 year of history before the switch; the numbers are in docs/decisions.md.
 
-**The daemon enters at the close, not the break.** It scans closed candles once a
-minute, so it waits for the trigger candle to close above the level and buys at that
-close. The discretionary approach buys the moment price trades through, using a
-buy-stop order. That order type is not built. `cmd/backtest` measures both entries
+**The daemon enters after the close, not at the break.** It reads closed candles, so
+it waits for the trigger candle to close above the level — only closed ones: the feed
+includes the candle still forming, and that is never read as a trigger. The
+discretionary approach buys the moment price trades through, using a buy-stop order.
+That order type is not built. `cmd/backtest` measures both entries
 (`strategy.ArmMicroPullback` gives the buy-stop price) so the gap between them is a
 number, not a guess.
+
+**The price is re-read before buying** (`strategy.CheckEntryPrice`). The trigger close
+is history by the time an order can go, and on these names a few seconds is several
+percent. Just before ordering, the live price is read and the trade is refused if it is
+
+- at or below the stop,
+- back under the pause high — the breakout has failed,
+- more than `entry.max_entry_drift_pct` (1%) above the trigger close — a chase, or
+- puts the stop outside the `min_stop_distance_pct`–`max_stop_distance_pct` band
+  measured from the live price. A stop that is too close here is refused, not widened:
+  it is close because price fell back toward it, not because the chart drew it tight.
+
+A trade that passes is **sized from the live price**, not the trigger close. The order
+is still a market order, so the fill can differ again; what this removes is deciding
+and sizing on a price that is a minute old. All three automated entries on 2026-10-02
+would have been refused. `cmd/backtest` applies the same check to the next bar's open.
 
 ### Why the pattern matters more than the pattern
 
@@ -194,7 +219,8 @@ candidates are taken in relative-volume order until slots run out:
 3. the concurrent-position cap,
 4. not already holding the symbol,
 5. the same-day re-entry rule,
-6. sizing being able to afford at least one share from available cash.
+6. the live price still agreeing with the setup (above),
+7. sizing being able to afford at least one share from available cash.
 
 Each qualifying candidate's outcome ("bought 6600 @ $5.00, stop $4.85", "no setup:
 close 9.93 has not cleared the 10.02 pullback high", "entry window closed", …) is
@@ -237,7 +263,7 @@ what sized the position, so letting price through it means losing more than the 
 was opened under. `strategy.EvaluateManualExit` is that rule.
 
 In the ordinary case the engine does not evaluate it at all. The stop is left with the
-broker as a resting good-till-cancelled order, so it is enforced between ticks and
+broker as a resting good-till-cancelled order, attached to the buy itself, so it is enforced between ticks and
 while the daemon is not running; the engine covers only what the order cannot — the
 close, and the windows where the order is missing or cannot yet trigger. Every path
 that sells cancels the resting order first. See [`risk.md`](./risk.md).
@@ -255,8 +281,8 @@ below the previous candle's low. It raises the stop to the low of each
 `STOP_LOSS`; the close event's `initial_stop` shows how far the trail had raised it.
 It never lowers a stop.
 
-- `always` (the current setting, and the discretionary version) trails from the first
-  candle held whole. A trade that makes a new low before it pays is abandoned rather
+- `always` (the discretionary version, and the setting until 2026-10-03) trails from
+  the first candle held whole. A trade that makes a new low before it pays is abandoned rather
   than held to the pause-low stop. After the target, it trails what is left.
 
 **The candle the buy landed in does not count.** A live order fills part-way through
@@ -267,8 +293,14 @@ minute: on 2026-09-29 it stopped out 10 of 11 trailed positions, four of them at
 "breakeven" that lost money once the spread was paid. The chart stop covers the entry
 candle. The backtest already worked this way for its default fill at a bar's open,
 which holds the whole bar; its buy-stop variant now skips the entry bar too.
-- `after_target` trails only what is left after the first target.
+- `after_target` (the current setting since 2026-10-03, when `always` measured a real
+  loss over a year) trails only what is left after the first target.
 - `off` holds what is left to the breakeven stop or the bell.
+
+`exit.candle_trail_interval` and `exit.candle_trail_bars` widen the trail: candles
+longer than the setup's, built from them, and the lowest low of several. Unset, they
+give the one-candle trail above. Every wider version measured no better over a year
+(docs/decisions.md, 2026-10-03), so none is set.
 
 The engine reads one bar request per held position per completed candle, and never
 trails on the candle still forming. **On a year of history it did not improve the

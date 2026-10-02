@@ -26,15 +26,6 @@ func CanOpen(openPositions int, cfg *config.Config) bool {
 	return openPositions < cfg.Risk.MaxConcurrentPositions
 }
 
-// FreeSlots is how many more positions may be opened right now.
-func FreeSlots(openPositions int, cfg *config.Config) int {
-	free := cfg.Risk.MaxConcurrentPositions - openPositions
-	if free < 0 {
-		return 0
-	}
-	return free
-}
-
 // AllowEntry gates a single symbol at entry time, applying the concurrency cap,
 // the same-day re-entry rule, and the requirement that only one position per
 // symbol is held at a time.

@@ -610,6 +610,14 @@ func (a *Alpaca) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult,
 	if req.Type == "stop" {
 		payload["stop_price"] = strconv.FormatFloat(req.StopPrice, 'f', 2, 64)
 	}
+	// One-triggers-other: the stop leg is held until the buy fills, then rests as an
+	// ordinary sell stop with its own id (see alpacaOrder.Legs).
+	if req.StopLoss > 0 {
+		payload["order_class"] = "oto"
+		payload["stop_loss"] = map[string]any{
+			"stop_price": strconv.FormatFloat(req.StopLoss, 'f', 2, 64),
+		}
+	}
 	// Sent only when asked for. Alpaca accepts extended_hours on a day limit order
 	// and rejects it on anything else, so setting it unconditionally would break
 	// every regular-session market order.
@@ -648,18 +656,27 @@ func (a *Alpaca) CancelOrder(ctx context.Context, brokerOrderID string) error {
 // the string empty and parses to 0.
 type alpacaOrder struct {
 	ID          string `json:"id"`
+	Type        string `json:"type"`
 	Status      string `json:"status"`
 	FilledQty   string `json:"filled_qty"`
 	FilledPrice string `json:"filled_avg_price"`
+	// Legs are the orders an "oto" or bracket order carries; null on a simple one.
+	Legs []alpacaOrder `json:"legs"`
 }
 
 func (o alpacaOrder) result() OrderResult {
-	return OrderResult{
+	res := OrderResult{
 		BrokerOrderID: o.ID,
 		Status:        o.Status,
 		FilledPrice:   parseFloat(o.FilledPrice),
 		FilledShares:  int(parseFloat(o.FilledQty)),
 	}
+	for _, leg := range o.Legs {
+		if leg.Type == "stop" || leg.Type == "stop_limit" {
+			res.StopLegID = leg.ID
+		}
+	}
+	return res
 }
 
 func (a *Alpaca) Positions(ctx context.Context) ([]BrokerPosition, error) {

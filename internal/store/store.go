@@ -487,25 +487,33 @@ func (s *Store) SessionPositions(date string) ([]domain.Position, error) {
 }
 
 // SaveScreenSnapshot stores the latest screening pass for the web page.
+//
+// The same pass is saved again whenever what happened to a candidate changes, under
+// the same takenAt, so it replaces rather than adds: older and equal rows go in the
+// same transaction as the insert, and a reader never sees two passes or none.
 func (s *Store) SaveScreenSnapshot(date string, takenAt time.Time, evals []domain.Evaluation) error {
 	payload, err := json.Marshal(evals)
 	if err != nil {
 		return fmt.Errorf("encode evaluations: %w", err)
 	}
-	if _, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin screen snapshot: %w", err)
+	}
+	defer tx.Rollback()
+	// Only the newest pass is displayed, and a 1-minute scan cadence would
+	// otherwise accumulate ~390 rows a day for no reader.
+	if _, err := tx.Exec(
+		`DELETE FROM screen_snapshots WHERE session_date = ? AND taken_at <= ?`,
+		date, formatTime(takenAt)); err != nil {
+		return fmt.Errorf("prune screen snapshots: %w", err)
+	}
+	if _, err := tx.Exec(
 		`INSERT INTO screen_snapshots (session_date, taken_at, payload) VALUES (?, ?, ?)`,
 		date, formatTime(takenAt), string(payload)); err != nil {
 		return fmt.Errorf("insert screen snapshot: %w", err)
 	}
-	// Only the newest pass is displayed, and a 1-minute scan cadence would
-	// otherwise accumulate ~390 rows a day for no reader.
-	_, err = s.db.Exec(
-		`DELETE FROM screen_snapshots WHERE session_date = ? AND taken_at < ?`,
-		date, formatTime(takenAt))
-	if err != nil {
-		return fmt.Errorf("prune screen snapshots: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 // LatestScreenSnapshot returns the most recent screening pass for a date.

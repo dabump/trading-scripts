@@ -223,6 +223,10 @@ type Entry struct {
 	// MinStopDistancePct widens a stop that sits implausibly close to entry, where
 	// ordinary noise would trigger it.
 	MinStopDistancePct float64 `yaml:"min_stop_distance_pct"`
+	// MaxEntryDriftPct is how far above the setup's trigger close the live price may
+	// have run when the order is about to go, before the entry is refused as a chase.
+	// The setup is read on a closed candle; the order fills at whatever trades now.
+	MaxEntryDriftPct float64 `yaml:"max_entry_drift_pct"`
 }
 
 type Risk struct {
@@ -273,6 +277,13 @@ type Exit struct {
 	// rather than held to the pause-low stop. See docs/decisions.md for how each
 	// measured.
 	CandleTrail string `yaml:"candle_trail"`
+	// CandleTrailInterval is the candle the trail is read on, built from
+	// entry.pattern_interval candles; unset means entry.pattern_interval. A longer
+	// candle gives a position more room before one red candle sells it.
+	CandleTrailInterval time.Duration `yaml:"candle_trail_interval"`
+	// CandleTrailBars puts the stop under the lowest low of this many completed trail
+	// candles rather than only the last one; unset means 1.
+	CandleTrailBars int `yaml:"candle_trail_bars"`
 }
 
 // The values Exit.CandleTrail accepts.
@@ -419,6 +430,11 @@ func (c *Config) Validate() error {
 	if c.Entry.MinStopDistancePct <= 0 {
 		add("entry.min_stop_distance_pct must be > 0")
 	}
+	// Zero would refuse any entry the price has moved up from at all; a missing key
+	// reads as zero, so it is rejected rather than silently stopping every trade.
+	if c.Entry.MaxEntryDriftPct <= 0 {
+		add("entry.max_entry_drift_pct must be > 0")
+	}
 	if c.Entry.MaxStopDistancePct <= c.Entry.MinStopDistancePct {
 		add("entry.max_stop_distance_pct (%.2f) must be greater than entry.min_stop_distance_pct (%.2f)",
 			c.Entry.MaxStopDistancePct, c.Entry.MinStopDistancePct)
@@ -508,6 +524,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Exit.EODExitOffsetMins < 1 {
 		add("exit.eod_exit_offset_minutes must be >= 1")
+	}
+	if iv, pi := c.Exit.CandleTrailInterval, c.Entry.PatternInterval; iv < 0 ||
+		(iv > 0 && pi > 0 && (iv < pi || iv%pi != 0)) {
+		add("exit.candle_trail_interval (%s) must be a whole multiple of entry.pattern_interval (%s)", iv, pi)
+	}
+	if c.Exit.CandleTrailBars < 0 {
+		add("exit.candle_trail_bars must be >= 0")
 	}
 	switch c.Exit.CandleTrail {
 	case "", CandleTrailOff, CandleTrailAfterTarget, CandleTrailAlways:

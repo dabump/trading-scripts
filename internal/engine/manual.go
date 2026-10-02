@@ -275,7 +275,7 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 			"nothing left to sell", ErrPositionNotOpen, res.FilledPrice)
 	}
 
-	f, err := e.submit(ctx, sess, pos.Symbol, "sell", pos.SharesOpen, quoted, extendedHours)
+	f, err := e.submit(ctx, sess, pos.Symbol, "sell", pos.SharesOpen, quoted, 0, extendedHours)
 	if err != nil {
 		return domain.Position{}, err
 	}
@@ -452,7 +452,7 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 	}
 
 	quoted := res.Entry
-	f, err := e.submit(ctx, sess, symbol, "buy", sizing.Shares, quoted, extendedHours)
+	f, err := e.submit(ctx, sess, symbol, "buy", sizing.Shares, quoted, res.Stop, extendedHours)
 	if err != nil {
 		return domain.ManualOpen{}, err
 	}
@@ -476,42 +476,17 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 		return domain.ManualOpen{}, err
 	}
 
-	// The stop goes to the broker as a resting order, not just into the row. A stop
-	// that only exists inside this process is no stop at all for a position an
-	// operator means to hold — through the close, through a restart — and the
-	// difference between a stop order and a stop checked once a minute is the whole
-	// of the slippage on a mover that halves in that minute.
-	//
-	// A failure here does not unwind the buy: selling straight back across the spread
-	// is a certain loss to avoid an uncertain one, and the position still has its stop
-	// — managePositions evaluates it on the tick when no order is working. It is
-	// reported rather than swallowed, because an operator who thinks they have a
-	// resting stop and does not would size the next decision wrongly.
-	stopOrderID, stopErr := e.placeProtectiveStop(ctx, sess,
-		domain.Position{ID: id, Symbol: symbol, SharesOpen: res.Shares, StopPrice: res.Stop})
-	switch {
-	case stopErr != nil:
-		res.StopOrderNote = "it could not be placed: " + stopErr.Error()
-		e.log.Error("protective stop could not be placed; the engine holds this stop on the tick",
-			"symbol", symbol, "stop", res.Stop, "err", stopErr)
-		e.record(audit.Fault, symbol,
-			fmt.Sprintf("the resting stop order for %s was rejected; its stop is evaluated on the "+
-				"scan tick instead, which cannot protect it between ticks", symbol),
-			map[string]any{
-				"protective_stop": "not placed",
-				"stop_price":      res.Stop,
-				"shares":          res.Shares,
-				"err":             stopErr.Error(),
-			})
-	case extendedHours:
-		// Accepted, but a stop cannot trigger in the extended session, so it is inert
-		// until the bell. The engine covers that window; the operator should still
-		// know the order is not live yet.
-		res.StopOrderPlaced = true
-		res.StopOrderNote = "resting at the broker, but a stop cannot trigger before 09:30 — " +
-			"until the open the agent holds this stop on the scan tick"
-	default:
-		res.StopOrderPlaced = true
+	// The stop goes to the broker as a resting order, not just into the row — attached
+	// to the buy itself when the broker allows it. A stop that only exists inside this
+	// process is no stop at all for a position an operator means to hold through a
+	// restart, and the difference between a stop order and a stop checked on the tick
+	// is the whole of the slippage on a mover that halves in between.
+	res.StopOrderPlaced, res.StopOrderNote = e.protectEntry(ctx, sess,
+		domain.Position{ID: id, Symbol: symbol, SharesOpen: res.Shares, StopPrice: res.Stop},
+		f, sizing.Shares, extendedHours)
+	stored, err := e.store.PositionByID(id)
+	if err != nil {
+		return domain.ManualOpen{}, err
 	}
 
 	e.log.Info("position opened by hand", "symbol", symbol, "shares", res.Shares,
@@ -536,16 +511,12 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 			"pre_market":         extendedHours,
 			"exit_rules":         "its own stop and the forced end-of-day exit; no backstop, trail or scale-out",
 			"stop_order_placed":  res.StopOrderPlaced,
-			"stop_order_id":      stopOrderID,
+			"stop_order_id":      stored.StopOrderID,
 			"stop_order_note":    res.StopOrderNote,
 			"screen_qualified":   res.Qualified,
 			"screen_reason":      res.ScreenReason,
 		}, f, quoted, sizing.Shares))
 
-	stored, err := e.store.PositionByID(id)
-	if err != nil {
-		return domain.ManualOpen{}, err
-	}
 	res.Position = stored
 	return res, nil
 }

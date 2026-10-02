@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"math"
+	"slices"
 	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
@@ -149,22 +150,32 @@ func EvaluateManualExit(in ExitInput) ExitDecision {
 }
 
 // CandleTrailStop is the stop the candle trail (exit.candle_trail) puts under a
-// position once last has completed: that candle's low, so the next candle to trade
-// below it sells what is held. It returns 0 when the trail does not apply — switched
-// off, waiting for the first target, or a candle that opened before the position was
-// filled.
+// position: the lowest low of the last exit.candle_trail_bars completed candles of
+// exit.candle_trail_interval, so the next candle to trade below it sells what is held.
+// With the defaults — one candle, at entry.pattern_interval — that is "sell on the
+// first candle below the previous candle's low".
 //
-// That last case includes the candle the buy landed in. A live order fills part-way
-// through a candle, so its low is usually a price printed *before* the fill, a
-// fraction under the entry — and on a thin pre-market book it can be the fill price
-// itself. Trailing to it put the stop at or within a cent of entry within the first
-// minute, and on 2026-09-29 that stopped out 10 of 11 trailed positions, four at
-// "breakeven" that was a loss after the spread. A candle counts only if the whole of
-// it was held; the chart stop covers the entry candle.
+// bars are the position's entry.pattern_interval candles, oldest first; longer trail
+// candles are built from them here, aligned to the clock, so the daemon and the
+// backtest feed it the same 1-minute bars. A candle counts once it has completed by
+// now.
+//
+// It returns 0 when the trail does not apply — switched off, waiting for the first
+// target, or fewer qualifying candles than the trail looks back over. A wider trail
+// that started on a single candle would be the tight one it was chosen not to be.
+//
+// Only candles that opened at or after the fill qualify. That excludes the candle the
+// buy landed in: a live order fills part-way through a candle, so its low is usually a
+// price printed *before* the fill, a fraction under the entry — and on a thin
+// pre-market book it can be the fill price itself. Trailing to it put the stop at or
+// within a cent of entry within the first minute, and on 2026-09-29 that stopped out
+// 10 of 11 trailed positions, four at "breakeven" that was a loss after the spread. A
+// candle counts only if the whole of it was held; the chart stop covers the entry
+// candle.
 //
 // Callers only ever raise the stop to this, never lower it, which is what makes it a
 // trail: a lower low after a higher one does not give ground back.
-func CandleTrailStop(p domain.Position, last domain.Bar, cfg *config.Config) float64 {
+func CandleTrailStop(p domain.Position, bars []domain.Bar, now time.Time, cfg *config.Config) float64 {
 	switch cfg.Exit.CandleTrail {
 	case config.CandleTrailAlways:
 	case config.CandleTrailAfterTarget:
@@ -174,22 +185,39 @@ func CandleTrailStop(p domain.Position, last domain.Bar, cfg *config.Config) flo
 	default:
 		return 0
 	}
-	if last.Time.Before(p.EntryTime) || last.Low <= 0 {
-		return 0
-	}
-	return last.Low
-}
+	interval, n := TrailInterval(cfg), TrailBars(cfg)
 
-// LastCompletedBar returns the most recent bar that had closed by now, and false if
-// none had. Bar feeds include the candle still forming; trailing on its low would be
-// trailing on a price that can still move.
-func LastCompletedBar(bars []domain.Bar, now time.Time, interval time.Duration) (domain.Bar, bool) {
-	for i := len(bars) - 1; i >= 0; i-- {
-		if !bars[i].Time.Add(interval).After(now) {
-			return bars[i], true
+	var lows []float64
+	var current time.Time
+	for _, b := range bars {
+		start := b.Time.Truncate(interval)
+		if start.Before(p.EntryTime) || start.Add(interval).After(now) || b.Low <= 0 {
+			continue
+		}
+		if len(lows) == 0 || !start.Equal(current) {
+			lows, current = append(lows, b.Low), start
+		} else if b.Low < lows[len(lows)-1] {
+			lows[len(lows)-1] = b.Low
 		}
 	}
-	return domain.Bar{}, false
+	if len(lows) < n {
+		return 0
+	}
+	return slices.Min(lows[len(lows)-n:])
+}
+
+// TrailInterval is the candle the trail is read on: exit.candle_trail_interval, or
+// entry.pattern_interval when that is unset.
+func TrailInterval(cfg *config.Config) time.Duration {
+	if cfg.Exit.CandleTrailInterval > 0 {
+		return cfg.Exit.CandleTrailInterval
+	}
+	return cfg.Entry.PatternInterval
+}
+
+// TrailBars is how many of those candles the trail's low is taken over, at least one.
+func TrailBars(cfg *config.Config) int {
+	return max(cfg.Exit.CandleTrailBars, 1)
 }
 
 // scaleShares is how many shares the partial sale takes, rounded down but never to

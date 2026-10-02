@@ -30,6 +30,12 @@ type OrderRequest struct {
 	// left resting at the broker rather than evaluated on a tick. It is the only
 	// order type here that is not expected to fill when it is placed.
 	StopPrice float64
+	// StopLoss, when set on a buy, attaches a sell stop at that price to the order
+	// (Alpaca's "oto" order class), so the stop rests at the broker from the moment
+	// the buy fills rather than from the moment the daemon gets round to sending
+	// it. Not accepted with ExtendedHours: the extended session takes simple limit
+	// orders only.
+	StopLoss float64
 	// TimeInForce defaults to "day" when empty. A resting protective stop sets
 	// "gtc": a day order would expire at the close and leave the position bare the
 	// moment the daemon was not watching, which is the case it exists for.
@@ -49,6 +55,9 @@ type OrderResult struct {
 	Status        string
 	FilledPrice   float64
 	FilledShares  int
+	// StopLegID is the broker's id for the stop attached by OrderRequest.StopLoss,
+	// empty when there is none.
+	StopLegID string
 }
 
 // Done reports whether the order can no longer fill. A placed order is usually not

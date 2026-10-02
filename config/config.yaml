@@ -112,6 +112,12 @@ entry:
   # is part of the strategy rather than a safety rail: with risk that wide the size
   # has to shrink until the winner cannot pay for the losers.
   max_stop_distance_pct: 4.0
+  # The setup is read on a closed candle, so by the time the order goes the price has
+  # moved. Just before buying, the live price is re-read: the entry is refused if it is
+  # at or under the stop, back under the pause high, more than this far above the
+  # trigger close, or puts the stop outside the distance limits above. Size comes from
+  # the live price. PROPOSED, unmeasured — docs/decisions.md 2026-10-03.
+  max_entry_drift_pct: 1.0
 
 risk:
   # Fixed risk per trade, not a fixed slice of the portfolio. The share count comes
@@ -156,7 +162,7 @@ exit:
   # candle's low, by raising the stop to each completed candle's low. off |
   # after_target (the runner only) | always (from the entry candle). See
   # docs/decisions.md for how each measured.
-  candle_trail: always
+  candle_trail: after_target
 
 timing:
   sentiment_poll_interval: 2m # docs/strategy.md §1

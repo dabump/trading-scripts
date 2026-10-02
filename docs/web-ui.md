@@ -149,11 +149,11 @@ What it overrides is the **signal**, and only the signal:
 
 **Once open, its stop and the bell sell it — nothing else does.** A position opened here has no gap backstop, no candle trail and no scale-out at a target, but it does have the stop that sized it, and it is force-closed before the close like any other position (changed 2026-10-02, on request; between 2026-09-30 and that date it had no exit rules at all and was held overnight).
 
-**The stop is a real order at the broker**, placed right after the entry fill: a good-till-cancelled sell stop at the 1R price, so it is enforced between scans and while the agent is not running. That is the point of it — a stop checked once per scan is a stop with a tick of latency, and on the kind of mover this screen finds that latency is most of the loss it was supposed to cap. The confirmation says it is resting. Every way of selling the position — Close, the forced exit — cancels that order first.
+**The stop is a real order at the broker**, sent as part of the buy (or straight after the fill pre-market, where Alpaca takes only simple limit orders): a good-till-cancelled sell stop at the 1R price, so it is enforced between scans and while the agent is not running. That is the point of it — a stop checked once per scan is a stop with a tick of latency, and on the kind of mover this screen finds that latency is most of the loss it was supposed to cap. The confirmation says it is resting. Every way of selling the position — Close, the forced exit — cancels that order first.
 
 If the order could not be placed, the confirmation says so in an **alert**, not a footnote: the agent then checks that stop on each scan instead, which is a weaker guarantee, and an operator who believes they have a resting stop and does not will size the next decision wrongly. The same is true before the bell, where a stop order is accepted but cannot trigger until 09:30.
 
-In the positions table a manual row shows its stop as a price, with `on tick` beside it when no order is resting, and the cell's tooltip says which rules apply. A position carried from an earlier session says `held since <date>` under its share count.
+In the positions table every row shows its stop as a price, with `on tick` beside it when no order is resting, and the cell's tooltip says which rules apply. A position carried from an earlier session says `held since <date>` under its share count.
 
 A table of tickers currently being evaluated, with a per-criterion breakdown rather than a single pass/fail — this is what lets you see *why* a candidate did or didn't qualify:
 

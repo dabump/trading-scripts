@@ -8,7 +8,6 @@ import (
 
 	"github.com/martincoetzee/trading-agent/internal/broker"
 	"github.com/martincoetzee/trading-agent/internal/domain"
-	"github.com/martincoetzee/trading-agent/internal/scheduler"
 	"github.com/martincoetzee/trading-agent/internal/screener"
 )
 
@@ -170,15 +169,6 @@ func TestScreenNowUsesTheSameCriteriaAsTheAutomatedScan(t *testing.T) {
 		t.Errorf("automated path evaluated %d criteria, manual %d — they must match",
 			len(auto[0].Criteria), len(manual.Criteria))
 	}
-}
-
-func mustSession(t *testing.T, h *harness) scheduler.Session {
-	t.Helper()
-	sess, ok := h.eng.Session()
-	if !ok {
-		t.Fatal("expected a trading session to be loaded")
-	}
-	return sess
 }
 
 // Running with the exchange closed is the explicitly requested case.

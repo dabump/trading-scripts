@@ -56,6 +56,7 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `entry.stop_buffer_pct` | 0.1 | `strategy.md` §3 — the stop sits under the pause low, not on it |
 | `entry.min_stop_distance_pct` | 0.5 | `strategy.md` §3 — a nearer stop is widened to this |
 | `entry.max_stop_distance_pct` | 4.0 | `strategy.md` §3 — a wider setup is refused; validated below `risk.stop_loss_pct` |
+| `entry.max_entry_drift_pct` | 1.0 | `strategy.md` §3 — the live price may be at most this far above the trigger close when the order goes; must be > 0. PROPOSED |
 | `risk.risk_per_trade_pct` | 1.0 | `risk.md` — the account fraction put at risk per trade; sizing follows from the stop |
 | `risk.max_position_pct` | 33.0 | `risk.md` — notional cap; must exceed `risk_per_trade_pct ÷ entry.max_stop_distance_pct` or it binds on every trade |
 | `risk.max_concurrent_positions` | 3 | `risk.md` — three at 33% keeps maximum exposure just under fully invested; validated so sizing × concurrency cannot exceed 100% |
@@ -65,7 +66,9 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `exit.first_target_fraction` | 0.5 | `strategy.md` §4 — validated in (0, 1): selling all of it is the rule that measured t = −9.76 |
 | `exit.breakeven_after_target` | `true` | `strategy.md` §4 |
 | `exit.eod_exit_offset_minutes` | 5 | `strategy.md` §4 |
-| `exit.candle_trail` | `always` | `strategy.md` §4 — `off` / `after_target` / `always`; empty means `off` |
+| `exit.candle_trail` | `after_target` | `strategy.md` §4 — `off` / `after_target` / `always`; empty means `off` |
+| `exit.candle_trail_interval` | unset (`entry.pattern_interval`) | the candle the trail is read on, built from `entry.pattern_interval` candles; must be a whole multiple of it. Wider settings measured no better — `decisions.md` 2026-10-03 |
+| `exit.candle_trail_bars` | unset (1) | the stop goes under the lowest low of this many completed trail candles |
 | `timing.sentiment_poll_interval` | 2m | `strategy.md` §1 — tightened with the shorter gate window |
 | `timing.sentiment_window` | 5m | `strategy.md` §1 — shortened from 1h so the opening range is tradeable |
 | `timing.entry_window` | 5h30m | `strategy.md` §3 — from a 09:30 open the last entry is 15:00; validated longer than `sentiment_window` |

@@ -71,7 +71,7 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `timing.entry_window` | 5h30m | `strategy.md` §3 — from a 09:30 open the last entry is 15:00; validated longer than `sentiment_window` |
 | `timing.entry_cutoff_buffer` | 30m | `strategy.md` §3 — quiet time before the forced exit, enforced against the close so a half day tightens the window rather than collapsing the gap |
 | `timing.screener_scan_interval` | 1m | `strategy.md` §2 |
-| `timing.position_poll_interval` | 15s | **PROPOSED** — how often open positions are re-marked |
+| `timing.position_poll_interval` | 2s | **PROPOSED** — how often open positions are re-marked (also the engine tick interval) |
 | `sentiment.symbols` | SPY, QQQ, IWM | IWM included because the strategy trades small caps |
 | `sentiment.bearish_avg_pct` | −0.8 | **PROPOSED** — must be negative |
 | `sentiment.require_all_negative` | `true` | **PROPOSED** |

@@ -181,7 +181,12 @@ timing:
   # the gap.
   entry_cutoff_buffer: 30m
   screener_scan_interval: 1m # docs/strategy.md §2
-  position_poll_interval: 15s # PROPOSED: how often open positions are re-checked
+  # How often open positions are re-marked and their exits evaluated. Also the
+  # engine's tick interval — Run ticks at the shortest configured cadence — so each
+  # tick's one account request and one batched snapshot run at this rate: ~60 requests
+  # a minute at 2s, on top of the scan's ~130, against Alpaca's 200/min. Raise this
+  # first if requests start being refused. PROPOSED.
+  position_poll_interval: 2s
 
 sentiment:
   # IWM is included because the strategy trades small caps; SPY/QQQ alone would

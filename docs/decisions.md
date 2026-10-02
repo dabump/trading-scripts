@@ -1052,6 +1052,29 @@ unaffected, and so is the backtest, which never opens a position by hand.
 position would be force-sold within minutes, which no longer happens to a manual
 position. Left as it was; whether to lift it is open.
 
+## 2026-10-02 — The agent-state legend is rendered from config
+
+**The bug.** Three of the legend's meanings were written as prose and never moved when
+the values did: `SENTIMENT_CHECK` read "First hour. Polling market sentiment every 10
+minutes" against a configured 5m window and 2m poll, and `EOD_WINDOW` read "Final 30
+minutes" against `eod_exit_offset_minutes: 5`. The 2026-09-29 drift pass above recorded
+the forced-exit interval as "no longer restated as a number in the `EOD_WINDOW`
+legend"; that was true of `docs/web-ui.md`, which names the key, and not of the page,
+which kept the number. Both are fixed here, and in the direction the page needs: a
+reader of the status page wants the minutes, not the key, so `legendFor(cfg)` now
+derives them — sentiment window, sentiment poll, scan cadence and forced-exit offset —
+through `durationText`, exactly as `strategySections` does. A test pins it with values
+that are none of the old defaults.
+
+**`timing.position_poll_interval`: 15s → 2s.** On request, so open positions re-mark
+and their exits evaluate near-continuously. It is also the engine's tick interval (the
+shortest configured cadence), so the per-tick cost multiplies by 7.5: one account
+request plus one batched snapshot every 2s is ~60 requests a minute, on top of the
+1-minute scan's ~130, against Alpaca's 200/min. Nothing measures tick duration or
+rate-limit headroom, so this is the value to look at first if requests start to fail
+— `premarket.scan_interval` is the cheap place to buy the headroom back. The scan
+cadence itself is unchanged: `claimScan` gates it independently of the tick.
+
 ## Open items (not yet decided)
 
 - **(Superseded 2026-09-29: the micro pullback trades ~150 times a year and still measured no edge; see above.)** **55 trades a year is the thing to resolve first.** It is too few to measure and probably too few to be worth running. Either the setup definition is stricter than the discretionary version it models — a human reads a flag more loosely than "1–5 bars reclaiming the high of day" — or the screening criteria and the setup rarely coincide. Loosening `entry.max_pullback_bars`, allowing a reclaim of a recent swing high rather than the session high, or reading the pattern on 2-minute candles are the obvious things to measure, one at a time, against this baseline.

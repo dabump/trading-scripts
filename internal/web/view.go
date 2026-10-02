@@ -25,7 +25,7 @@ type LegendEntry struct {
 	IsActive bool
 }
 
-// legend is the documented set of states. ERROR and HALTED_BEARISH share a tone
+// legendFor is the documented set of states. ERROR and HALTED_BEARISH share a tone
 // but carry different icons and labels, because docs/web-ui.md requires them to
 // be distinguishable without relying on colour alone.
 //
@@ -34,21 +34,32 @@ type LegendEntry struct {
 // session where the sentiment gate has not run and, by default, nothing is bought.
 // Showing it as MARKET_CLOSED would misreport a scanning agent as idle, and as
 // SCREENING would imply entries that are not happening.
-var legend = []LegendEntry{
-	{State: domain.StateMarketClosed, Tone: "idle", Icon: "○",
-		Meaning: "Outside exchange hours. Waiting for the next open."},
-	{State: domain.StatePreMarket, Tone: "pre", Icon: "◔",
-		Meaning: "Pre-market session. Screening the early tape; the sentiment gate has not run yet."},
-	{State: domain.StateSentimentCheck, Tone: "warn", Icon: "◐",
-		Meaning: "First hour. Polling market sentiment every 10 minutes. No trades placed."},
-	{State: domain.StateScreening, Tone: "good", Icon: "●",
-		Meaning: "Sentiment gate passed. Screening for candidates every minute."},
-	{State: domain.StateEODWindow, Tone: "warn", Icon: "◑",
-		Meaning: "Final 30 minutes. Flattening all positions; no new entries."},
-	{State: domain.StateHaltedBearish, Tone: "bad", Icon: "■",
-		Meaning: "Sentiment was overwhelmingly bearish. Halted for the rest of the session."},
-	{State: domain.StateError, Tone: "bad", Icon: "▲",
-		Meaning: "A fault needs attention. This is not a deliberate trading halt."},
+//
+// The cadences and window lengths come from config for the same reason the strategy
+// panel does: they are tunable, and a legend that says "every 10 minutes" while the
+// agent polls every two describes a different daemon than the one running. Durations
+// print through durationText so a tuned value reads the way it was written.
+func legendFor(cfg *config.Config) []LegendEntry {
+	return []LegendEntry{
+		{State: domain.StateMarketClosed, Tone: "idle", Icon: "○",
+			Meaning: "Outside exchange hours. Waiting for the next open."},
+		{State: domain.StatePreMarket, Tone: "pre", Icon: "◔",
+			Meaning: "Pre-market session. Screening the early tape; the sentiment gate has not run yet."},
+		{State: domain.StateSentimentCheck, Tone: "warn", Icon: "◐",
+			Meaning: "First " + durationText(cfg.Timing.SentimentWindow) +
+				" after the open. Polling market sentiment every " +
+				durationText(cfg.Timing.SentimentPollInterval) + ". No trades placed."},
+		{State: domain.StateScreening, Tone: "good", Icon: "●",
+			Meaning: "Sentiment gate passed. Screening for candidates every " +
+				durationText(cfg.Timing.ScreenerScanInterval) + "."},
+		{State: domain.StateEODWindow, Tone: "warn", Icon: "◑",
+			Meaning: "Final " + durationText(time.Duration(cfg.Exit.EODExitOffsetMins)*time.Minute) +
+				" before the close. Flattening all positions; no new entries."},
+		{State: domain.StateHaltedBearish, Tone: "bad", Icon: "■",
+			Meaning: "Sentiment was overwhelmingly bearish. Halted for the rest of the session."},
+		{State: domain.StateError, Tone: "bad", Icon: "▲",
+			Meaning: "A fault needs attention. This is not a deliberate trading halt."},
+	}
 }
 
 type SentimentRow struct {
@@ -324,7 +335,7 @@ func BuildView(
 		GeneratedAt: now.In(scheduler.ET).Format("15:04:05 MST"),
 		SessionDate: date,
 		State:       state,
-		Legend:      make([]LegendEntry, len(legend)),
+		Legend:      legendFor(cfg),
 		PollSeconds: int(cfg.Web.PollInterval.Seconds()),
 		PaperMode:   paperMode,
 	}
@@ -332,7 +343,6 @@ func BuildView(
 		v.PollSeconds = 12
 	}
 
-	copy(v.Legend, legend)
 	for i := range v.Legend {
 		if v.Legend[i].State == state {
 			v.Legend[i].IsActive = true

@@ -55,9 +55,9 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 |---|---|---|
 | `MARKET_CLOSED` | Gray | Outside exchange hours. Daemon idle, waiting for next open. |
 | `PRE_MARKET` | Orange | The pre-market session (`premarket.start` → 09:30). Screening the early tape; the sentiment gate has not run yet, and nothing is bought unless `premarket.allow_entry` is set. |
-| `SENTIMENT_CHECK` | Amber | Market open, inside the gate window (`timing.sentiment_window`, 5m). Polling every `timing.sentiment_poll_interval` (2m). No trades placed. |
-| `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates and may hold open positions. |
-| `EOD_WINDOW` | Amber | The last `exit.eod_exit_offset_minutes` before the close (currently 5m). Flattening open positions; no new entries. |
+| `SENTIMENT_CHECK` | Amber | Market open, inside the gate window (`timing.sentiment_window`). Polling every `timing.sentiment_poll_interval`. No trades placed. |
+| `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates, every `timing.screener_scan_interval`, and may hold open positions. |
+| `EOD_WINDOW` | Amber | The last `exit.eod_exit_offset_minutes` before the close. Flattening open positions; no new entries. |
 | `HALTED_BEARISH` | Red | The gate's sentiment came back overwhelmingly bearish, **or** the daemon started after the gate window and had no readings to judge. No trades for the rest of the session. The second case can be dismissed from the page — see "Dismissing a halt the gate could not judge". |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
 
@@ -66,6 +66,13 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 The market-hours badge stays on the *regular* session throughout: during pre-market it reads `PRE-MARKET` and still counts down to 09:30, because that bell is when the sentiment gate and ordinary entries begin.
 
 `EOD_WINDOW` was added during implementation. The original five states had no way to describe the window between the forced-exit mark and the close: the market is still open, so `MARKET_CLOSED` would be untrue, and `SCREENING` would imply entries were still possible. Rather than misreport either, the window got its own state.
+
+The legend's own text is built from config (`legendFor` in `internal/web/view.go`),
+not written out: the gate window, its poll cadence, the scan cadence and the
+forced-exit offset are all tunable, and the legend shipped once with the originally
+specified hour / 10-minute / 30-minute wording long after all three had changed. Keys
+are named in the table above because this document is read against the config; the
+page renders the values, because its reader wants the minutes.
 
 `ERROR` must be visually distinguishable from `HALTED_BEARISH` beyond color alone (e.g. a different icon or label text) since both are red but mean very different things — one is a deliberate risk decision, the other is a fault.
 

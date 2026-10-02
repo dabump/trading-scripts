@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"github.com/martincoetzee/trading-agent/internal/config"
+	"github.com/martincoetzee/trading-agent/internal/domain"
 	"strings"
 	"testing"
 	"time"
@@ -409,6 +410,47 @@ func TestGroupNumberSeparatesWithoutRounding(t *testing.T) {
 	for _, tt := range tests {
 		if got := groupNumber(tt.in); got != tt.want {
 			t.Errorf("groupNumber(%v) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// The legend's cadences are config, not prose. They shipped hardcoded at the
+// originally specified hour window / 10-minute poll / 30-minute EOD window, and went
+// on reading that way after all three were tuned — so the page described a daemon
+// nobody was running. Distinct values here, none of them the old defaults.
+func TestLegendQuotesConfiguredCadences(t *testing.T) {
+	f := newFixture(t)
+	f.cfg.Timing.SentimentWindow = 5 * time.Minute
+	f.cfg.Timing.SentimentPollInterval = 2 * time.Minute
+	f.cfg.Timing.ScreenerScanInterval = 90 * time.Second
+	f.cfg.Exit.EODExitOffsetMins = 7
+
+	var sentiment, screening, eod string
+	for _, l := range legendFor(f.cfg) {
+		switch l.State {
+		case domain.StateSentimentCheck:
+			sentiment = l.Meaning
+		case domain.StateScreening:
+			screening = l.Meaning
+		case domain.StateEODWindow:
+			eod = l.Meaning
+		}
+	}
+	for _, tt := range []struct{ state, meaning, want string }{
+		{"SENTIMENT_CHECK", sentiment, "First 5m"},
+		{"SENTIMENT_CHECK", sentiment, "every 2m"},
+		{"SCREENING", screening, "every 1m30s"},
+		{"EOD_WINDOW", eod, "Final 7m"},
+	} {
+		if !strings.Contains(tt.meaning, tt.want) {
+			t.Errorf("%s legend = %q, want it to mention %q", tt.state, tt.meaning, tt.want)
+		}
+	}
+
+	_, body := f.get(t, "/")
+	for _, stale := range []string{"every 10 minutes", "Final 30 minutes", "First hour"} {
+		if strings.Contains(body, stale) {
+			t.Errorf("the page still carries the hardcoded %q", stale)
 		}
 	}
 }

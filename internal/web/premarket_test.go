@@ -78,8 +78,9 @@ func TestLegendIncludesPreMarket(t *testing.T) {
 		t.Fatal("the legend must list PRE_MARKET")
 	}
 
+	entries := legendFor(f.cfg)
 	var entry LegendEntry
-	for _, l := range legend {
+	for _, l := range entries {
 		if l.State == domain.StatePreMarket {
 			entry = l
 		}
@@ -89,7 +90,7 @@ func TestLegendIncludesPreMarket(t *testing.T) {
 	}
 	// Icons carry the distinction when colour cannot, so no two states may share one.
 	seen := map[string]domain.AgentState{}
-	for _, l := range legend {
+	for _, l := range entries {
 		if other, dup := seen[l.Icon]; dup {
 			t.Errorf("%s and %s share the icon %q", other, l.State, l.Icon)
 		}

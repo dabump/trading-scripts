@@ -115,6 +115,8 @@ What it does *not* do matters as much:
 
 **Closed** lists everything closed on one day — selected by when it closed, not when it opened, since a manual position may have been opened in an earlier session — symbol, shares, opened, closed, P&L in dollars and percent, and which rule (or `MANUAL`) closed it — with that day's net P&L and win/loss count underneath.
 
+Each row has a **▸ arrow** before the symbol. Clicking it folds out a line underneath with the exact time the position was **opened** and **closed** (ET, to the second, with the date — a manual position can close sessions after it opened) and how long it was **held**. Which rows are open is kept in the browser, keyed by position id, and re-applied after every poll; like the shown day, it is not remembered across a reload.
+
 It is visible from the moment something closes, not only after the bell. It used to be an "End of day" card hidden until the forced-exit mark, which was reasonable while a strategy rule was the only thing that could close a position; once the page can close one by hand, an operator who has just sold something cannot be made to wait four hours to see what it made. After the close it reads the same way the end-of-day summary did.
 
 ### Stepping back through earlier days

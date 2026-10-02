@@ -116,6 +116,9 @@ type PositionRow struct {
 }
 
 type EODRow struct {
+	// ID keys the row's fold-out detail line, so which rows are expanded survives
+	// the fragment poll replacing the table.
+	ID     int64
 	Symbol string
 	Shares int
 	Open   string
@@ -127,6 +130,12 @@ type EODRow struct {
 	PnLPct     string
 	Reason     string
 	Tone       string
+	// OpenedAt, ClosedAt and Held fill the fold-out line under the row. The times
+	// carry their date because a manual position can be closed sessions after it
+	// was opened.
+	OpenedAt string
+	ClosedAt string
+	Held     string
 }
 
 // View is everything the template renders.
@@ -572,10 +581,12 @@ func BuildView(
 			losses++
 		}
 		v.ClosedRows = append(v.ClosedRows, EODRow{
-			Symbol: p.Symbol, Shares: p.Shares,
+			ID: p.ID, Symbol: p.Symbol, Shares: p.Shares,
 			Open: money(p.EntryPrice), Close: money(p.ExitPrice),
 			PnLDollars: signedMoney(realized), PnLPct: pct(p.RealizedPct()),
 			Reason: string(p.ExitReason), Tone: toneForPnL(realized),
+			OpenedAt: tradeTime(p.EntryTime), ClosedAt: tradeTime(p.ExitTime),
+			Held: heldText(p.EntryTime, p.ExitTime),
 		})
 	}
 	v.ShowTotals = len(v.ClosedRows) > 0
@@ -956,6 +967,38 @@ func groupDigits(s string) string {
 		intPart = intPart[:i] + "," + intPart[i:]
 	}
 	return sign + intPart + frac
+}
+
+// tradeTime renders a position's entry or exit instant in exchange time, to the
+// second. An unrecorded instant reads as a dash rather than year one.
+func tradeTime(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	return t.In(scheduler.ET).Format("Mon 2 Jan, 15:04:05 MST")
+}
+
+// heldText is how long a position was open. Seconds are kept below an hour because a
+// quick stop-out is a matter of seconds; past a day, minutes stop mattering.
+func heldText(opened, closed time.Time) string {
+	if opened.IsZero() || closed.IsZero() || closed.Before(opened) {
+		return "—"
+	}
+	d := closed.Sub(opened).Round(time.Second)
+	days := int(d / (24 * time.Hour))
+	hours := int(d/time.Hour) % 24
+	minutes := int(d/time.Minute) % 60
+	seconds := int(d/time.Second) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	case minutes > 0:
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	default:
+		return fmt.Sprintf("%ds", seconds)
+	}
 }
 
 // durationText renders a config duration the way someone reading the page would say

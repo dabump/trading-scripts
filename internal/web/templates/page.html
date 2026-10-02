@@ -155,6 +155,22 @@ button.mini.danger:hover:not(:disabled) {
   color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
 }
 
+/* Fold-out detail under a closed row: the arrow sits before the symbol link and
+   turns to point down while the line beneath it is open. */
+button.fold {
+  font: inherit; font-size: 11px; line-height: 1; cursor: pointer; padding: 2px 4px;
+  margin-right: 6px; background: none; border: none; color: var(--muted);
+  display: inline-block; transition: transform .12s ease;
+}
+button.fold:hover { color: var(--text); }
+button.fold[aria-expanded="true"] { transform: rotate(90deg); color: var(--text); }
+tr.foldout td { background: var(--panel-2); padding: 8px 12px 10px 36px; font-size: 13px;
+  font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+tr.foldout td > span { margin-right: 28px; white-space: nowrap; }
+tr.foldout .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin-right: 8px; font-family: inherit; }
+tbody tr.foldout:hover { background: none; }
+
 /* Date arrows over the closed list. It sits above the table and stays visible when
    the day is empty — stepping off a day with nothing on it is the main reason to
    have arrows at all. */
@@ -405,6 +421,25 @@ document.addEventListener('click', (e) => {
   refresh();
 });
 
+// Which closed rows are folded open. Kept here, keyed by position id, for the same
+// reason as the tab: the poll swaps in freshly rendered rows, all folded shut.
+const unfolded = new Set();
+function applyFolds() {
+  document.querySelectorAll('button[data-fold]').forEach(btn => {
+    const open = unfolded.has(btn.dataset.fold);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    const row = document.getElementById('fold-' + btn.dataset.fold);
+    if (row) row.hidden = !open;
+  });
+}
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-fold]');
+  if (!btn) return;
+  const id = btn.dataset.fold;
+  if (unfolded.has(id)) unfolded.delete(id); else unfolded.add(id);
+  applyFolds();
+});
+
 // Re-fetches the rendered fragment and swaps it in, so the markup is produced in
 // exactly one place (the Go template) rather than duplicated in JS.
 const POLL_MS = {{.PollSeconds}} * 1000;
@@ -415,6 +450,7 @@ async function refresh() {
     if (!res.ok) return;
     document.getElementById('content').innerHTML = await res.text();
     applyTab();
+    applyFolds();
   } catch (e) { /* a transient failure just leaves the last good render up */ }
 }
 setInterval(refresh, POLL_MS);
@@ -577,13 +613,21 @@ setInterval(refresh, POLL_MS);
     <tbody>
       {{range .ClosedRows}}
       <tr>
-        {{template "symbolCell" .Symbol}}
+        <td class="sym"><button type="button" class="fold" data-fold="{{.ID}}" aria-expanded="false"
+                aria-controls="fold-{{.ID}}" title="Show when it was opened and closed">&#9656;</button><a href="https://www.tradingview.com/chart/?symbol={{.Symbol}}" target="_blank" rel="noopener noreferrer" title="Open {{.Symbol}} on TradingView">{{.Symbol}}</a></td>
         <td class="num">{{.Shares}}</td>
         <td class="num muted">{{.Open}}</td>
         <td class="num">{{.Close}}</td>
         <td class="num {{.Tone}}">{{.PnLDollars}}</td>
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
         <td class="muted">{{.Reason}}</td>
+      </tr>
+      <tr class="foldout" id="fold-{{.ID}}" hidden>
+        <td colspan="7">
+          <span><span class="label">Opened</span>{{.OpenedAt}}</span>
+          <span><span class="label">Closed</span>{{.ClosedAt}}</span>
+          <span><span class="label">Held</span>{{.Held}}</span>
+        </td>
       </tr>
       {{end}}
     </tbody>

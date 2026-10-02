@@ -183,3 +183,40 @@ func TestAdjacentClosedDays(t *testing.T) {
 		t.Errorf("with no closed positions both arrows must be dead; got %q, %q", prev, next)
 	}
 }
+
+// Each closed row carries a fold-out line with when it was opened and closed and
+// how long it was held, keyed by the position so the toggle survives the poll.
+func TestClosedRowFoldsOutTimesAndDuration(t *testing.T) {
+	f := newFixture(t)
+	f.closeOn(t, "2026-09-25", "BBBB", 50, 4.00, 4.40)
+
+	_, body := f.get(t, "/?closed=2026-09-25")
+	for _, want := range []string{
+		`data-fold="1"`, `id="fold-1"`,
+		"Fri 25 Sep, 15:00:00 EDT", "Fri 25 Sep, 15:30:00 EDT", "30m 0s",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("closed row fold-out missing %q", want)
+		}
+	}
+}
+
+func TestHeldText(t *testing.T) {
+	at := time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{42 * time.Second, "42s"},
+		{12*time.Minute + 5*time.Second, "12m 5s"},
+		{3*time.Hour + 7*time.Minute + 9*time.Second, "3h 7m"},
+		{50 * time.Hour, "2d 2h"},
+	} {
+		if got := heldText(at, at.Add(c.d)); got != c.want {
+			t.Errorf("heldText(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+	if got := heldText(time.Time{}, at); got != "—" {
+		t.Errorf("unrecorded entry should read as a dash, got %q", got)
+	}
+}

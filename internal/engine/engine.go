@@ -76,8 +76,12 @@ type Engine struct {
 	// session rather than on every one-minute scan.
 	universe     []string
 	universeDate string
-	// lastAuditedFault de-duplicates a repeating fault so the trail is not swamped.
-	lastAuditedFault string
+	// lastAuditedFault de-duplicates a repeating fault so the trail is not swamped,
+	// keyed by op. A single slot was not enough: two ops failing in turn — "manage
+	// positions" and "force exit", both on the same stuck QTEX sell on 2026-10-05 —
+	// each overwrote the other's message, so neither ever looked like a repeat and
+	// the trail took 246 copies of one fault.
+	lastAuditedFault map[string]string
 	// auditedSkips remembers the last skip reason audited per symbol, so a reason
 	// that recurs on every scan — being at the position cap, most of all — is
 	// recorded once rather than several hundred times a day.
@@ -100,6 +104,13 @@ type Engine struct {
 	// well under the price is asked about every protectiveStopPoll rather than on
 	// every tick. Only Tick touches it.
 	stopPolled map[int64]time.Time
+	// rejectedSells latches the positions whose exit order the broker refused and
+	// whose holding the broker then confirmed, so the order is not re-sent every
+	// tick. A refusal the store cannot explain is a standing condition, not a
+	// transient one: QTEX sent 2,862 of the same rejected sell in three hours on
+	// 2026-10-05. Cleared as soon as a sell is accepted, or once the holding is
+	// corrected, so a later attempt is made normally.
+	rejectedSells map[int64]bool
 
 	// background is set by Run: the screen then runs on its own goroutine so the
 	// position checks and the setup check keep their cadence while it does. A test
@@ -226,7 +237,7 @@ func (e *Engine) setState(s domain.AgentState) {
 		e.lastError = ""
 		// Recovery resets the de-duplication, so a fault that comes back later is
 		// recorded again rather than being swallowed as a repeat.
-		e.lastAuditedFault = ""
+		e.lastAuditedFault = nil
 	}
 }
 
@@ -284,8 +295,11 @@ func (e *Engine) fail(op string, err error) {
 	message := fmt.Sprintf("%s: %v", op, err)
 
 	e.mu.Lock()
-	repeat := e.lastAuditedFault == message
-	e.lastAuditedFault = message
+	repeat := e.lastAuditedFault[op] == message
+	if e.lastAuditedFault == nil {
+		e.lastAuditedFault = map[string]string{}
+	}
+	e.lastAuditedFault[op] = message
 	e.state = domain.StateError
 	e.lastError = message
 	e.mu.Unlock()
@@ -1342,6 +1356,12 @@ func (e *Engine) exitPosition(ctx context.Context, sess scheduler.Session, p dom
 		quoted = p.EntryPrice
 	}
 
+	if e.rejectedSells[p.ID] {
+		// The broker refused this sell and then confirmed it holds what the store
+		// says, so re-sending it changes nothing. Faulted once already.
+		return nil
+	}
+
 	hadStop := p.StopOrderID != ""
 	if proceed, err := e.clearStopForSale(ctx, &p, reason); !proceed {
 		return err
@@ -1349,8 +1369,9 @@ func (e *Engine) exitPosition(ctx context.Context, sess scheduler.Session, p dom
 
 	f, err := e.submit(ctx, sess, p.Symbol, "sell", p.SharesOpen, quoted, 0, extendedHours)
 	if err != nil {
-		return err
+		return e.sellRejected(ctx, p, quoted, reason, err)
 	}
+	delete(e.rejectedSells, p.ID)
 	if short, err := e.shortExit(p, f, quoted, reason); short || err != nil {
 		// Whatever is still held now has no resting stop: the engine keeps its floor
 		// (stopIsUnenforced is true with the id cleared) and the exit is tried again
@@ -1399,6 +1420,90 @@ func (e *Engine) exitPosition(ctx context.Context, sess scheduler.Session, p dom
 			pnl/(p.EntryPrice*float64(p.Shares))*100),
 		fillDetail(detail, f, quoted, p.SharesOpen))
 	return nil
+}
+
+// sellRejected handles a sell the broker refused: it checks the store's share count
+// against what the broker actually holds, corrects the store when they disagree, and
+// otherwise latches the position so the order is not re-sent on every tick.
+//
+// A refused sell is nearly always the store claiming shares the broker does not have
+// — Alpaca calls that "cannot be sold short", because selling what you do not hold is
+// a short. Retrying cannot fix it, and the tick is 2 seconds: QTEX sent 2,862 of the
+// same rejected order over three hours on 2026-10-05, each one an API call against
+// the same 200/min budget the scan needs. The store is the thing that is wrong, so
+// ask the broker what it holds and write that down; the next tick then sells what is
+// really there, or nothing, because the position is closed.
+//
+// Only this one symbol is touched. Startup reconciliation closes every local position
+// the broker does not hold, which is right when the daemon has just started and knows
+// nothing; doing that from a single rejected order would let one bad Positions reply
+// flatten the book.
+//
+// The original error is always returned, so the caller still faults: a rejected exit
+// is a position that did not sell when a rule said it should, whether or not the
+// store could be corrected.
+func (e *Engine) sellRejected(ctx context.Context, p domain.Position, price float64,
+	reason domain.ExitReason, cause error) error {
+	held, herr := e.trading.Positions(ctx)
+	if herr != nil {
+		// Nothing was learned, so nothing is latched: the next tick asks again.
+		e.log.Error("a sell was refused and the broker's holdings could not be read",
+			"symbol", p.Symbol, "reason", reason, "err", herr)
+		return cause
+	}
+
+	shares := 0
+	for _, bp := range held {
+		if bp.Symbol == p.Symbol {
+			shares = bp.Shares
+			break
+		}
+	}
+	if shares >= p.SharesOpen {
+		// The holding is there and the refusal is something else — a halted symbol,
+		// a wash-trade block, an account state. Not something a retry resolves
+		// either, so latch it and let the caller's fault say so once.
+		if e.rejectedSells == nil {
+			e.rejectedSells = map[int64]bool{}
+		}
+		e.rejectedSells[p.ID] = true
+		return cause
+	}
+
+	// The store is overstating the position. Correct it to the broker's count, at the
+	// best price available — the phantom shares left without a fill to record, so
+	// there is no honest exit price for them and this is the same mark startup
+	// reconciliation uses.
+	exitPrice := price
+	if exitPrice <= 0 {
+		exitPrice = p.EntryPrice
+	}
+	phantom := p.SharesOpen - shares
+	e.log.Warn("a sell was refused for shares the broker does not hold; correcting the position",
+		"symbol", p.Symbol, "reason", reason, "store_shares", p.SharesOpen,
+		"broker_shares", shares, "err", cause)
+	e.record(audit.Reconciled, p.Symbol,
+		fmt.Sprintf("a %s sale of %s was refused: the store held %d shares and the broker holds %d, "+
+			"so %d were written off", reason, p.Symbol, p.SharesOpen, shares, phantom),
+		map[string]any{
+			"action":        "sell_rejected",
+			"reason":        string(reason),
+			"store_shares":  p.SharesOpen,
+			"broker_shares": shares,
+			"exit_price":    exitPrice,
+			"err":           cause.Error(),
+		})
+
+	if shares == 0 {
+		if err := e.store.ClosePosition(p.ID, exitPrice, e.now(), domain.ExitReconciled); err != nil {
+			return err
+		}
+	} else if err := e.store.ReduceShares(p.ID, phantom, exitPrice); err != nil {
+		return err
+	}
+	// Corrected, so the next tick may try again on the real share count.
+	delete(e.rejectedSells, p.ID)
+	return cause
 }
 
 // clearStopForSale takes p's resting stop off the book before a sell, and reports

@@ -149,6 +149,17 @@ jq 'select(.kind == "POSITION_OPENED")' logs/audit-2026-09-28.jsonl
 - The status web page (reading from `store`), the audit trail above, and structured log output (`log/slog`, to stderr) are the observability in v1. `/api/status` returns the same state as JSON, which is what makes a running daemon checkable without scraping HTML.
 - Refusals that repeat every scan (a symbol already held, or already traded today) log at debug level; everything else that skips a candidate logs at info. At a one-minute cadence the routine ones would otherwise bury the log in hundreds of identical lines.
 - No external alerting (Slack, email, etc.) yet. If/when that's wanted, the natural hook points are: position opened/closed, daily kill switch triggered, and unhandled errors — but don't build this speculatively ahead of it being asked for.
+- **Faults are de-duplicated per op.** A single slot was not enough: on 2026-10-05 `manage positions` and `force exit` failed in turn on the same stuck sell, each overwriting the other's message, so neither ever looked like a repeat and the trail took 246 copies of one fault.
+
+## A sell the broker refuses
+
+`cannot be sold short` means the store is claiming shares the broker does not have, and a 2-second tick will re-send that order until someone notices — QTEX sent **2,862** of them over three hours on 2026-10-05, each one an API call against the same 200/min budget the scan needs. A refused exit order therefore asks the broker what it actually holds (`engine.sellRejected`):
+
+- **The broker holds less than the store thinks.** The store is corrected to the broker's count: closed as `RECONCILED` if the broker holds nothing, otherwise the phantom shares are written off at the last mark, since there was no fill to price them. A `RECONCILED` event records both counts, and the next tick sells what is really there.
+- **The broker holds the shares.** The refusal is something else — a halted symbol, a wash-trade block, an account state — and no more a retry's to fix. The position is latched so the order goes out once and the fault says so; the latch clears as soon as a sell is accepted.
+- **The holdings could not be read.** Nothing was learned, so nothing is latched and the next tick asks again.
+
+Only the one symbol is touched. Startup reconciliation closes *every* local position the broker does not hold, which is right when the daemon has just started and knows nothing; doing that from a single rejected order would let one bad `Positions` reply flatten the book. The original error is still returned either way, so a rule that said sell and did not is always a fault.
 
 ## Deployment
 

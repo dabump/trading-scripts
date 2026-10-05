@@ -50,6 +50,11 @@ type Fake struct {
 	// stopsInert holds resting stops untriggered whatever the price does, as Alpaca
 	// does before the opening bell: it accepts a stop then, but will not fire it.
 	stopsInert bool
+	// restingFill caps how many shares one trigger of a resting stop sells, so a stop
+	// on a thin name fills in pieces and reads as "partially_filled" in between. A
+	// trigger that leaves shares behind is the state that stalled QTEX on 2026-10-05,
+	// and without this the fake can only ever fill a resting stop whole.
+	restingFill map[string]int
 	// attachedStopErr rejects only a buy carrying an attached stop, so the buy alone
 	// and a separate stop order both still go through.
 	attachedStopErr error
@@ -74,19 +79,23 @@ func NewFake(acct domain.Account) *Fake {
 		sessionVolume:  map[string]float64{},
 		avgVolumeCalls: map[string]int{},
 
-		fillPrice: map[string]float64{},
-		fillLimit: map[string]int{},
-		orders:    map[string]OrderResult{},
-		resting:   map[string]restingStop{},
+		fillPrice:   map[string]float64{},
+		fillLimit:   map[string]int{},
+		restingFill: map[string]int{},
+		orders:      map[string]OrderResult{},
+		resting:     map[string]restingStop{},
 	}
 }
 
-// restingStop is a placed-but-untriggered stop order.
+// restingStop is a placed-but-untriggered stop order. filled carries what an earlier
+// trigger already sold, so an order that fills in pieces reports a running total the
+// way the broker's does.
 type restingStop struct {
 	symbol string
 	side   string
 	shares int
 	stop   float64
+	filled int
 }
 
 // SetFillPrice makes orders in symbol execute at price rather than at the quote or
@@ -508,13 +517,35 @@ func (f *Fake) triggerStops(symbol string, price float64) {
 		if p, ok := f.fillPrice[symbol]; ok {
 			fillAt = p
 		}
-		f.settle(r.symbol, r.side, r.shares, fillAt)
-		f.orders[id] = OrderResult{
-			BrokerOrderID: id, Status: "filled",
-			FilledPrice: fillAt, FilledShares: r.shares,
+		want := r.shares - r.filled
+		if n, ok := f.restingFill[symbol]; ok && n < want {
+			want = n
 		}
-		delete(f.resting, id)
+		f.settle(r.symbol, r.side, want, fillAt)
+		r.filled += want
+		res := OrderResult{
+			BrokerOrderID: id, Status: "filled",
+			FilledPrice: fillAt, FilledShares: r.filled,
+		}
+		if r.filled < r.shares {
+			// Still working for the rest, which is the whole point: the daemon must
+			// not read this share count as the exit.
+			res.Status = "partially_filled"
+			f.resting[id] = r
+		} else {
+			delete(f.resting, id)
+		}
+		f.orders[id] = res
 	}
+}
+
+// SetRestingFillLimit caps how many shares each trigger of a resting stop in symbol
+// sells, so the order fills in pieces and reports "partially_filled" until the last
+// one. Moving the price through the stop again fills the next piece.
+func (f *Fake) SetRestingFillLimit(symbol string, shares int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restingFill[symbol] = shares
 }
 
 // SetStopsInert stops resting stops from triggering, as before the opening bell.

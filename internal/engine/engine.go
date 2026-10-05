@@ -398,7 +398,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			if err != nil {
 				e.log.Warn("could not read the protective stop while reconciling",
 					"symbol", sym, "err", err)
-			} else if res.FilledShares > 0 {
+			} else if res.Done() && res.FilledShares > 0 {
 				e.log.Info("protective stop had fired while the agent was not running",
 					"symbol", sym, "shares", res.FilledShares, "fill", res.FilledPrice)
 				e.record(audit.Reconciled, sym,
@@ -1445,7 +1445,16 @@ func (e *Engine) clearStopForSale(ctx context.Context, p *domain.Position, reaso
 // running, so the only honest exit price is the one that executed. The reason is
 // ExitStopLoss, because that is what happened — the position was stopped out, and
 // nothing about it being enforced off-process makes it a different exit.
+//
+// The order must be terminal. Everything below records a sale as finished — it clears
+// the stop id, banks the fill, and either closes the position or leaves the remainder
+// for the engine to hold — and none of that is true of an order still working through
+// a partial fill. The callers check, and this says so rather than trusting them.
 func (e *Engine) closeOnProtectiveStop(p domain.Position, res broker.OrderResult) error {
+	if !res.Done() {
+		return fmt.Errorf("protective stop for %s is still working as %q; its %d-share fill "+
+			"is not the exit", p.Symbol, res.Status, res.FilledShares)
+	}
 	if err := e.store.SetStopOrderID(p.ID, ""); err != nil {
 		return err
 	}

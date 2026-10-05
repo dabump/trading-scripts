@@ -137,6 +137,17 @@ func (e *Engine) faultStop(pos domain.Position, what string, err error) {
 // The broker does not call back, so asking is the only way to learn. Each call is
 // one order lookup; checkProtectiveStop decides when one is worth making.
 //
+// Only a *terminal* order is an outcome. A stop filling in pieces reports
+// "partially_filled" with a share count that is a snapshot of a sale still in
+// progress, not the exit: the broker owns the remaining shares and goes on selling
+// them. Reading that snapshot as the whole exit banks shares that are about to sell
+// anyway and — because recording it clears the id — hands the floor to the engine
+// while the order is still live, the one state the two are meant never to share. The
+// engine then tries to sell shares the broker no longer holds, every tick, forever.
+// That is what happened to QTEX on 2026-10-05. Keep asking instead; the order
+// becomes "filled", or "canceled" with a partial, and both of those are answers.
+// releaseProtectiveStop reads the same status the same way.
+//
 // A terminal order that filled nothing — cancelled at the broker, rejected, expired —
 // is reported as gone: the id is cleared so the engine stops asking and starts
 // keeping the floor itself. It is cleared on the caller's copy too, so the takeover
@@ -150,26 +161,27 @@ func (e *Engine) pollProtectiveStop(ctx context.Context, pos *domain.Position) (
 	if err != nil {
 		return broker.OrderResult{}, fmt.Errorf("read protective stop for %s: %w", pos.Symbol, err)
 	}
+	if !res.Done() {
+		return broker.OrderResult{}, nil
+	}
 	if res.FilledShares > 0 {
 		return res, nil
 	}
-	if res.Done() {
-		if err := e.store.SetStopOrderID(pos.ID, ""); err != nil {
-			return broker.OrderResult{}, err
-		}
-		pos.StopOrderID = ""
-		e.log.Warn("protective stop is no longer working; the engine now holds the stop",
-			"symbol", pos.Symbol, "status", res.Status)
-		e.record(audit.Fault, pos.Symbol,
-			fmt.Sprintf("the resting stop order for %s ended as %q without filling; the stop is now "+
-				"evaluated on the tick instead", pos.Symbol, res.Status),
-			map[string]any{
-				"protective_stop": "gone",
-				"order_status":    res.Status,
-				"stop_price":      pos.StopPrice,
-				"shares_open":     pos.SharesOpen,
-			})
+	if err := e.store.SetStopOrderID(pos.ID, ""); err != nil {
+		return broker.OrderResult{}, err
 	}
+	pos.StopOrderID = ""
+	e.log.Warn("protective stop is no longer working; the engine now holds the stop",
+		"symbol", pos.Symbol, "status", res.Status)
+	e.record(audit.Fault, pos.Symbol,
+		fmt.Sprintf("the resting stop order for %s ended as %q without filling; the stop is now "+
+			"evaluated on the tick instead", pos.Symbol, res.Status),
+		map[string]any{
+			"protective_stop": "gone",
+			"order_status":    res.Status,
+			"stop_price":      pos.StopPrice,
+			"shares_open":     pos.SharesOpen,
+		})
 	return broker.OrderResult{}, nil
 }
 

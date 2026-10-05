@@ -105,12 +105,15 @@ type Engine struct {
 	// every tick. Only Tick touches it.
 	stopPolled map[int64]time.Time
 	// rejectedSells latches the positions whose exit order the broker refused and
-	// whose holding the broker then confirmed, so the order is not re-sent every
-	// tick. A refusal the store cannot explain is a standing condition, not a
-	// transient one: QTEX sent 2,862 of the same rejected sell in three hours on
-	// 2026-10-05. Cleared as soon as a sell is accepted, or once the holding is
-	// corrected, so a later attempt is made normally.
-	rejectedSells map[int64]bool
+	// whose holding the broker then confirmed, holding the refusal that did it. The
+	// order is not re-sent — a refusal the store cannot explain is a standing
+	// condition, not a transient one, and QTEX sent 2,862 of the same rejected sell
+	// in three hours on 2026-10-05 — but the refusal is still returned on every
+	// tick, so the agent stays faulted and the page keeps saying a position the
+	// rules wanted sold is still held. The per-op audit de-duplication is what keeps
+	// that from swamping the trail. Cleared as soon as a sell is accepted, or once
+	// the holding is corrected, so a later attempt is made normally.
+	rejectedSells map[int64]error
 
 	// background is set by Run: the screen then runs on its own goroutine so the
 	// position checks and the setup check keep their cadence while it does. A test
@@ -1356,10 +1359,12 @@ func (e *Engine) exitPosition(ctx context.Context, sess scheduler.Session, p dom
 		quoted = p.EntryPrice
 	}
 
-	if e.rejectedSells[p.ID] {
+	if cause := e.rejectedSells[p.ID]; cause != nil {
 		// The broker refused this sell and then confirmed it holds what the store
-		// says, so re-sending it changes nothing. Faulted once already.
-		return nil
+		// says, so re-sending it changes nothing. Still returned, so the agent stays
+		// faulted while a position the rules wanted sold is held; the audit trail
+		// de-duplicates it per op.
+		return cause
 	}
 
 	hadStop := p.StopOrderID != ""
@@ -1464,9 +1469,9 @@ func (e *Engine) sellRejected(ctx context.Context, p domain.Position, price floa
 		// a wash-trade block, an account state. Not something a retry resolves
 		// either, so latch it and let the caller's fault say so once.
 		if e.rejectedSells == nil {
-			e.rejectedSells = map[int64]bool{}
+			e.rejectedSells = map[int64]error{}
 		}
-		e.rejectedSells[p.ID] = true
+		e.rejectedSells[p.ID] = cause
 		return cause
 	}
 

@@ -115,6 +115,12 @@ func TestRejectedSellWithTheHoldingIntactIsNotRetried(t *testing.T) {
 	if after := h.positionByID(t, pos.ID); !after.Open {
 		t.Error("position was closed; the broker holds the shares and the refusal was something else")
 	}
+	// Not re-sending the order must not make the problem look resolved: a position
+	// the rules wanted sold is still held, and the page says so until it is.
+	if state, msg := h.eng.State(); state != domain.StateError {
+		t.Errorf("state = %q (%s), want ERROR while an exit the rules called for cannot be placed",
+			state, msg)
+	}
 }
 
 // Two ops failing in turn used to defeat the fault de-duplication entirely: a single

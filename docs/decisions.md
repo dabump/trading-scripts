@@ -1396,11 +1396,41 @@ qualified symbol-days), no slippage:
 | `High <= prevHigh` (old) | 17 | 17 | 35.3% | +0.03% | −1.57% | 0.04 | 9,957 | 2.3% |
 | `Low < prevLow` (new) | 9 | 8 | 37.5% | −0.75% | −1.40% | −0.84 | 9,825 | 2.4% |
 
-Neither is distinguishable from zero, and on this window the fix removes slightly
-more winners than losers. **The fix is justified mechanically, not by this
-measurement** — the old rule was not detecting the pattern the strategy is defined
-on, and a rule that buys unbroken green runs is wrong whatever two months of noise
-says. A full year has not yet been run on the corrected rule.
+A full year, 2025-10-06 to 2026-10-06, 252 sessions, no slippage:
+
+| rule | setups | trades | win | mean | median | t | equity | maxDD | worst 5bd |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `High <= prevHigh` (old) | 138 | 142 | 35.2% | **+0.11%** | −1.52% | 0.38 | **10,433** | 11.3% | 9 |
+| `Low < prevLow` (new) | 88 | 89 | 32.6% | −0.02% | −1.63% | −0.06 | 9,943 | 11.8% | 11 |
+
+**The old rule measures better on every headline column, including the PDT count.**
+Both t-statistics are inside the noise, so the gap is not itself significant — but
+the point estimate moved the wrong way and the fix cannot be defended on
+performance. **It is kept on correctness:** the old rule was not detecting the
+pattern the strategy is defined on, and the stop it derived sat on a level nothing
+had defended, which makes the risk-per-share that sizes every position meaningless.
+A measurement of the wrong pattern is not evidence for keeping it.
+
+Matching the two years' trade lists trade by trade says where the cost is:
+
+| group | n | mean | win |
+| --- | --- | --- | --- |
+| taken by both — old rule's version | 75 | +0.38% | 38.7% |
+| taken by both — corrected version | 75 | +0.16% | 34.7% |
+| only the old rule (the fix removes) | 67 | −0.18% | 31.3% |
+| only the corrected rule (the fix adds) | 14 | −0.98% | 21.4% |
+
+The fix does what it was meant to — the 67 trades it removes are net losers, AIFA
+among them. It loses on the other two counts: it *adds* 14 trades averaging
+−0.98%, and on 11 of the 75 shared trades it picks a different pause candle and so
+a different entry, dragging that group from +0.38% to +0.16%.
+
+A hypothesis for the added trades, not yet verified: with fewer candles counting as
+a pause, a pullback that ran past `entry.max_pullback_bars` under the old rule —
+and was refused as too long — now reads as a 1 or 2 bar pause, because the candles
+in the middle of it no longer qualify. If so, `microPause`'s walk-back needs to
+tolerate a non-qualifying candle inside a pullback rather than stopping at the
+first one.
 
 The entry-pattern comparison under the corrected rule, 0.25% slippage per side:
 
@@ -1432,8 +1462,9 @@ this time by `exit.breakeven_after_target` rather than by a trailing stop.
 
 ## Open items (not yet decided)
 
-- **Whether `entry.max_retrace_pct: 50` is the right ceiling, or should exist at all.** It refused the AIFA 10:06 setup at a retrace of 50.0938%, and that trade would have reached its 2R target three minutes later. On two months under the corrected pause rule, "any retrace" measured better on every column (21 setups vs 9, mean −0.02% vs −0.88%, mean R +0.16 vs −0.12, 45% win vs 38%). n=20, t=−0.02 — sweep it over a full year before changing it.
-- **Whether `exit.breakeven_after_target` truncates the right tail.** Over the same two months every trade in both arms exited `STOP_LOSS`, mean MFE +7.4% against mean realised −0.75%, 7.97% left behind. Measure removing the breakeven move, keeping the scale-out.
+- **Why the corrected pause rule adds 14 trades a year the old one never took.** They average −0.98% against the kept trades' +0.16% and are most of the fix's measured cost. The suspected cause is `microPause`'s walk-back stopping at the first non-qualifying candle, so a too-long pullback now reads as a short one. Verify before tuning anything else on the entry side.
+- **(Resolved 2026-10-06 on the year: the cap stays.)** `entry.max_retrace_pct: 50` refused the AIFA 10:06 setup at a retrace of 50.0938%, and that trade would have reached its 2R target three minutes later. On two months "any retrace" measured better on every column, which looked like a reason to drop the cap. Over the full year it is the *worst* entry variant measured: 160 setups / 171 trades, mean −0.84%, **t = −2.80**, equity 6,449 against 8,451 as configured, max drawdown 36.3% against 17.8%. The two-month signal was noise. Recorded because the reversal is the point: a finding from one trade, or from a short window, does not survive the longer measurement.
+- **Whether `exit.breakeven_after_target` truncates the right tail.** This is now the largest unexplained number in the strategy. Over the year on the corrected rule, 88 of 89 trades exited `STOP_LOSS` and exactly one reached the forced EOD exit; mean MFE was +15.22% against a mean realised −0.04%, with 14.97% left behind after the exit. 42.7% of trades reached +10% and 22.5% reached +20%, and the book still finished flat. The winners are all scale-outs whose runner was then taken at breakeven. Measure removing the breakeven move while keeping the scale-out — it is a bigger term than anything on the entry side.
 - **(Resolved 2026-10-03: every position's stop now rests at the broker, attached to the buy; see above.)** **The automated path still has no resting stop.** Only manual positions got one, which is what was asked for, and the asymmetry is now the obvious question: an automated position's stop is evaluated once per `timing.position_poll_interval` and is not enforced at all if the daemon stops. The reason for leaving it is that the automated path also *moves* its stop — the candle trail and the breakeven move after the target — and each move means cancel-and-replace, so the cost is a second order per position per trail step rather than one per position. Worth measuring against realised slippage on the automated exits before changing.
 - **(Resolved 2026-10-03: looked up every 15s, or every tick only near the stop.)** **The resting stop costs one order lookup per manual position per tick.** The broker does not call back, so `pollProtectiveStop` asks. At the position cap that is a small number against Alpaca's 200/min, but it is on the same budget as the ~130-request scan and nothing measures tick duration — the same blind spot recorded above.
 - **A manual position can no longer be carried overnight**, which the 2026-09-30 request wanted. If that need returns, it conflicts directly with the forced exit and needs a deliberate choice rather than both.

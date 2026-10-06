@@ -100,7 +100,7 @@ A qualifying candidate is bought only when its chart prints a **micro pullback**
 
 ```
             ┃ ← top of the surge: the high of day
-          ┃ ┃ ╻   ← pause: 1–2 candles that close red or fail to make a higher high
+          ┃ ┃ ╻   ← pause: 1–2 candles that close red or undercut the previous low
         ┃   ╹ ┃ ← trigger: closes above the last pause candle's high
       ┃
   surge_bars candles, up at least min_surge_pct
@@ -109,10 +109,19 @@ A qualifying candidate is bought only when its chart prints a **micro pullback**
 - **The surge.** The `entry.surge_bars` candles before the pause must have risen at
   least `entry.min_surge_pct`, from their lowest low to the top, and the top must be
   the high of day.
-- **The pause.** 1 to `entry.max_pullback_bars` candles that each close red or fail
-  to make a higher high than the candle before. A candle that ticks a marginal new
-  high and then closes red still counts. The pause may give back at most
-  `entry.max_retrace_pct` of the surge's range.
+- **The pause.** 1 to `entry.max_pullback_bars` candles that each **give something
+  back**: they close red, or they trade below the previous candle's low. A candle
+  that ticks a marginal new high and then closes red still counts. The pause may
+  give back at most `entry.max_retrace_pct` of the surge's range.
+
+  Merely *failing to extend* is not a pause. Until 2026-10-06 it was — any candle
+  whose high did not exceed the previous candle's qualified, with no magnitude
+  attached — and on a vertical mover that admits pure continuation. AIFA was bought
+  at 10:09 ET that day on a "pause" that closed green, on a higher low and a higher
+  close, whose sole qualification was a high $0.0006 below the previous candle's.
+  The entry was 7.9% into an unbroken run of green candles and the stop went under a
+  level nothing had defended; it was stopped out eleven seconds after the fill. See
+  docs/decisions.md.
 - **The trigger.** A candle closes above the last pause candle's high.
 
 Plus two trend filters, because the strategy only buys strength: price must be above

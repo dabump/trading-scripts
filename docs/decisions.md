@@ -1338,8 +1338,102 @@ least harmful configuration measured remains `exit.candle_trail: after_target` (
 does not have — float, Level 2, the tape — or in costs below the 0.25% a side assumed
 here, not in stop and target placement.
 
+## 2026-10-06 — The pause candle never required a pullback
+
+AIFA was bought at 10:09 ET and stopped out eleven seconds later for −$106.17
+(−3.77%, −1.12R). The loss was not the market's doing: the setup that bought it was
+not a micro pullback.
+
+`isPauseCandle` read a candle as part of a pullback when it closed red **or** failed
+to make a higher high:
+
+```go
+return b.Close < b.Open || b.High <= bars[i-1].High
+```
+
+The second clause carried no magnitude. The candle it accepted — 10:07 ET — closed
+green, on a higher low (7.79 vs 7.6789) and a higher close (7.89 vs 7.7901); its
+only qualification was a high of 7.8994 against the previous candle's 7.9000, a gap
+of **$0.0006**. `priceEpsilon` is 1e-9, so nothing absorbed it. The last red close
+had been nine candles earlier at 10:00, so the trade was an entry 7.9% into an
+unbroken run — the extension-buying the micro pullback exists to replace — and the
+stop went 0.1% under a continuation candle's low, a level no seller had ever been
+rejected at. It was taken out by a 223-share off-exchange print at 7.7408 while no
+lit venue traded meaningfully below the stop (per-venue lows that minute: Cboe BZX
+7.78, Nasdaq round-lot 7.75, EDGX/Arca 7.79).
+
+**The fix** is to require the pause to give something back:
+
+```go
+return b.Close < b.Open || b.Low < bars[i-1].Low
+```
+
+The two rules are not nested; each admits candles the other rejects. That matters
+here, because **there was a real pullback in that window and the old rule could not
+see it**. 10:05 ET undercut the previous low (7.5797 vs 7.5901) but also made a
+higher high, so the old rule skipped it and flagged the fake pause at 10:07 instead.
+Walking the window with the new rule:
+
+| | correct setup (10:06) | what it actually did (10:09) |
+| --- | --- | --- |
+| Entry | 7.7901 | 8.05 — 3.3% higher, 3 minutes later |
+| Stop | 7.57212 (2.80%) | 7.78221 — directly in the next wick's path |
+| 2R target | 8.2261, reached at 10:09 | never armed |
+| Lowest low before the target | 7.7408 — **16.9c above the stop** | stop hit 11s after the fill |
+
+So the corrected rule finds the right candle, at a better price, with a stop the
+10:09 wick never reaches. It still would not have traded: the 10:06 trigger is
+refused by `entry.max_retrace_pct: 50` at a measured retrace of **50.0938%** — over
+by 0.094 percentage points. That is now the most interesting open question here.
+
+### What it measures
+
+Two months, 2026-08-06 → 2026-10-06, 43 sessions, identical candidate set (488
+qualified symbol-days), no slippage:
+
+| rule | setups | trades | win | mean | median | t | equity | maxDD |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `High <= prevHigh` (old) | 17 | 17 | 35.3% | +0.03% | −1.57% | 0.04 | 9,957 | 2.3% |
+| `Low < prevLow` (new) | 9 | 8 | 37.5% | −0.75% | −1.40% | −0.84 | 9,825 | 2.4% |
+
+Neither is distinguishable from zero, and on this window the fix removes slightly
+more winners than losers. **The fix is justified mechanically, not by this
+measurement** — the old rule was not detecting the pattern the strategy is defined
+on, and a rule that buys unbroken green runs is wrong whatever two months of noise
+says. A full year has not yet been run on the corrected rule.
+
+The entry-pattern comparison under the corrected rule, 0.25% slippage per side:
+
+```
+as configured: close above pause high      9 setups   8 trades   -0.88%   mean R -0.12   38% win   9807
+  any retrace                             21 setups  20 trades   -0.02%   mean R +0.16   45% win  10049
+```
+
+Dropping the retrace cap more than doubles the setup count and is the best entry
+variant measured on this window — and the AIFA 10:06 setup is exactly the kind of
+trade it excludes. At n=20 and t=−0.02 that is suggestive, not established.
+
+A separate observation from the same run, worth its own measurement later: **every
+trade in both arms exited `STOP_LOSS`, not one by the forced EOD exit**, with mean
+MFE +7.4% against mean realised −0.75%, and 7.97% "left behind" after the exit. Half
+the trades reached +5% and 37.5% reached +10%. The winners are all scale-outs whose
+runner was then taken at breakeven. That is the right tail being truncated again,
+this time by `exit.breakeven_after_target` rather than by a trailing stop.
+
+### Also in this change
+
+- `cmd/backtest -trades` lists every simulated trade, which is what made the above
+  legible; the aggregates alone cannot say whether an entry landed where the chart
+  says it should have.
+- `Trade.InitialRisk` is recorded alongside `Trade.StopPrice`. `StopPrice` is the
+  stop as it stood at the exit, which the breakeven move and the candle trail raise
+  above the entry on a scaled winner — printing only that made a won trade look like
+  a stop placed above its own entry.
+
 ## Open items (not yet decided)
 
+- **Whether `entry.max_retrace_pct: 50` is the right ceiling, or should exist at all.** It refused the AIFA 10:06 setup at a retrace of 50.0938%, and that trade would have reached its 2R target three minutes later. On two months under the corrected pause rule, "any retrace" measured better on every column (21 setups vs 9, mean −0.02% vs −0.88%, mean R +0.16 vs −0.12, 45% win vs 38%). n=20, t=−0.02 — sweep it over a full year before changing it.
+- **Whether `exit.breakeven_after_target` truncates the right tail.** Over the same two months every trade in both arms exited `STOP_LOSS`, mean MFE +7.4% against mean realised −0.75%, 7.97% left behind. Measure removing the breakeven move, keeping the scale-out.
 - **(Resolved 2026-10-03: every position's stop now rests at the broker, attached to the buy; see above.)** **The automated path still has no resting stop.** Only manual positions got one, which is what was asked for, and the asymmetry is now the obvious question: an automated position's stop is evaluated once per `timing.position_poll_interval` and is not enforced at all if the daemon stops. The reason for leaving it is that the automated path also *moves* its stop — the candle trail and the breakeven move after the target — and each move means cancel-and-replace, so the cost is a second order per position per trail step rather than one per position. Worth measuring against realised slippage on the automated exits before changing.
 - **(Resolved 2026-10-03: looked up every 15s, or every tick only near the stop.)** **The resting stop costs one order lookup per manual position per tick.** The broker does not call back, so `pollProtectiveStop` asks. At the position cap that is a small number against Alpaca's 200/min, but it is on the same budget as the ~130-request scan and nothing measures tick duration — the same blind spot recorded above.
 - **A manual position can no longer be carried overnight**, which the 2026-09-30 request wanted. If that need returns, it conflicts directly with the forced exit and needs a deliberate choice rather than both.

@@ -7,7 +7,7 @@ package strategy
 // high (docs/strategy.md §3):
 //
 //	            ┃ ← top of the surge: the high of day
-//	          ┃ ┃ ╻   ← pause: 1-2 candles that close red or fail to make a higher high
+//	          ┃ ┃ ╻   ← pause: 1-2 candles that close red or undercut the previous low
 //	        ┃   ╹ ┃ ← trigger: closes above the last pause candle's high
 //	      ┃
 //	  surge_bars candles, up at least min_surge_pct
@@ -15,6 +15,7 @@ package strategy
 // A candle that ticks a marginal new high and then closes red still counts as a
 // pause. The flag detector this replaced read every such candle as a new pole, so on
 // a vertical mover it reported a 0-bar pullback for as long as the move was clean.
+// What does *not* count is a candle that simply failed to extend: see isPauseCandle.
 //
 // Two things fall out of that shape, and both matter more than the entry itself:
 // the stop has an obvious home (just under the pause's low) and therefore the risk
@@ -175,7 +176,7 @@ func microPause(bars []domain.Bar, cfg *config.Config) (microShape, string) {
 		return microShape{}, "not enough bars for a pullback"
 	}
 	if !isPauseCandle(bars, end) {
-		return microShape{}, "no pullback: the last candle made a higher high and closed green"
+		return microShape{}, "no pullback: the last candle closed green without undercutting the previous low"
 	}
 
 	// Walk back over the whole run of pause candles, not just the allowed number, so
@@ -238,11 +239,22 @@ func microPause(bars []domain.Bar, cfg *config.Config) (microShape, string) {
 	return microShape{Bars: count, Trigger: bars[end].High, Low: pauseLow}, ""
 }
 
-// isPauseCandle reports whether bars[i] is part of a pullback: it closed red, or it
-// failed to make a higher high than the candle before it.
+// isPauseCandle reports whether bars[i] is part of a pullback: it gave something
+// back, either by closing red or by trading below the previous candle's low.
+//
+// It used to accept any candle that merely failed to make a higher high, with no
+// magnitude attached. On a vertical mover that admits pure continuation: AIFA on
+// 2026-10-06 was bought at 10:09 ET on a "pause" whose only qualification was a high
+// $0.0006 below the previous candle's, while it closed green on a higher low and a
+// higher close. The last red close had been nine candles earlier at 10:00, so the
+// entry was 7.9% into an unbroken run -- the extension-buying the micro pullback
+// exists to replace -- and the stop went under a continuation candle's low, a level
+// nothing had defended. It was stopped out eleven seconds after the fill. A
+// tolerance on the higher-high test would not have helped: the gap was real, just
+// meaningless. What the pattern needs is evidence that price actually retraced.
 func isPauseCandle(bars []domain.Bar, i int) bool {
 	b := bars[i]
-	return b.Close < b.Open || b.High <= bars[i-1].High
+	return b.Close < b.Open || b.Low < bars[i-1].Low
 }
 
 // MACD returns the latest MACD line (12-EMA minus 26-EMA of closes) and its 9-period

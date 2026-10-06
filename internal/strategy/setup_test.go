@@ -143,6 +143,20 @@ func TestFindSetupRefusals(t *testing.T) {
 			},
 			reason: "no pullback",
 		},
+		{
+			// AIFA, 2026-10-06 10:09 ET. The "pause" closed green on a higher low
+			// and a higher close; its sole claim to being a pullback was a high
+			// $0.0006 under the previous candle's. Buying that is buying extension,
+			// and the stop lands under a continuation candle's low. See
+			// isPauseCandle.
+			name: "pause only failed to extend, by a fraction of a cent",
+			bars: func() []domain.Bar {
+				b := ramp(12, 9.00, 10.00)
+				b = appendBar(b, 9.98, 10.0221, 9.96, 10.02)
+				return appendBar(b, 10.02, 10.10, 10.01, 10.08)
+			},
+			reason: "no pullback",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

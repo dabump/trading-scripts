@@ -328,9 +328,14 @@ type Trade struct {
 	Reason     domain.ExitReason
 	// Scaled records that the first target was banked before this exit, so the
 	// return below is a blend of two fills rather than one price move.
-	Scaled    bool
-	StopPrice float64
-	RMultiple float64
+	Scaled bool
+	// StopPrice is the stop as it stood at the exit, which the breakeven move and
+	// the candle trail raise above the entry on a scaled winner. InitialRisk is
+	// entry − the chart stop the trade was sized from, so the risk actually taken
+	// stays readable after the stop has moved.
+	StopPrice   float64
+	InitialRisk float64
+	RMultiple   float64
 	// TotalR is the whole trade's P&L, banked part included, in multiples of the
 	// dollars it put at risk. With risk-based sizing this is what compounds into
 	// equity; ReturnPct weights a small wide-stop position the same as a large
@@ -771,16 +776,17 @@ func closeTrade(cash *float64, day *preparedDay, sym string, pos *domain.Positio
 	return Trade{
 		Symbol: sym, Date: day.Date, EntryTime: pos.EntryTime, EntryPrice: pos.EntryPrice,
 		Shares: pos.Shares, ExitTime: at, ExitPrice: fill, Reason: reason,
-		Scaled:    pos.TargetHit,
-		StopPrice: pos.StopPrice,
-		RMultiple: pos.RMultiple(fill),
-		TotalR:    totalR,
-		ReturnPct: ret,
-		PnL:       pnl,
-		VolMult:   volMult,
-		MovePct:   movePct,
-		HoldMins:  at.Sub(pos.EntryTime).Minutes(),
-		MFEPct:    mfe, MAEPct: mae, MFEBeforeExit: mfeBefore, MFEAfterExit: mfeAfter,
+		Scaled:      pos.TargetHit,
+		StopPrice:   pos.StopPrice,
+		InitialRisk: pos.InitialRisk,
+		RMultiple:   pos.RMultiple(fill),
+		TotalR:      totalR,
+		ReturnPct:   ret,
+		PnL:         pnl,
+		VolMult:     volMult,
+		MovePct:     movePct,
+		HoldMins:    at.Sub(pos.EntryTime).Minutes(),
+		MFEPct:      mfe, MAEPct: mae, MFEBeforeExit: mfeBefore, MFEAfterExit: mfeAfter,
 		CloseIfHeldPct: closeIfHeld,
 	}
 }

@@ -44,16 +44,17 @@ func main() {
 		grid  = flag.Bool("grid", true, "sweep exit parameters and report the surface")
 		pats  = flag.Bool("patterns", false, "compare entry settings even when -grid=false")
 		study = flag.Bool("research", false, "study the price paths after each setup instead of the usual reports")
+		list  = flag.Bool("trades", false, "list every simulated trade, one row each, before the summaries")
 	)
 	flag.Parse()
 
-	if err := run(*cfgPath, *fromFlag, *toFlag, *cacheDir, *timeframe, *limit, *grid, *pats, *study); err != nil {
+	if err := run(*cfgPath, *fromFlag, *toFlag, *cacheDir, *timeframe, *limit, *grid, *pats, *study, *list); err != nil {
 		fmt.Fprintf(os.Stderr, "backtest: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid, patterns, research bool) error {
+func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid, patterns, research, list bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -153,6 +154,9 @@ func run(cfgPath, fromFlag, toFlag, cacheDir, timeframe string, limit int, grid,
 	}
 
 	base := simulate(cfg, prepared, 0)
+	if list {
+		reportTradeList(base)
+	}
 	reportFunnel(base, len(dates))
 	reportTrades(base, "as configured, no slippage")
 
@@ -205,6 +209,45 @@ func (c *client) benchmarkPrevCloses(cfg *config.Config, from, to time.Time) (ma
 // trimPct renders a configured percentage without inventing precision.
 func trimPct(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64) + "%"
+}
+
+// reportTradeList prints one row per trade. The aggregates answer whether the
+// strategy works; this answers what it actually did, which is what you need when
+// checking that an entry landed where the chart says it should have.
+//
+// move% is the intraday move at the moment of entry and relvol the volume multiple,
+// so the two screening numbers travel with the trade. MFE is the best the position
+// reached before the bell and EOD% what holding to the bell would have returned,
+// which together say whether the name kept trending after the buy.
+//
+// "init stop"/"risk%" is the chart stop the trade was sized from; "stop@exit" is
+// where the stop had been moved to by the time it sold, which is above the entry on
+// a scaled winner. Printing only the latter makes a won trade look like a stop
+// placed above its entry.
+func reportTradeList(s Stats) {
+	if len(s.Trades) == 0 {
+		return
+	}
+	fmt.Printf("## Trade list\n\n")
+	fmt.Printf("%-7s %-7s %7s %9s %8s %9s %8s %7s %7s %8s %8s %8s %-14s\n",
+		"date", "symbol", "entry", "init stop", "risk%", "stop@exit", "ret%", "R",
+		"move%", "relvol", "MFE%", "EOD%", "exit reason")
+	for _, t := range s.Trades {
+		initStop, stopPct := 0.0, 0.0
+		if t.EntryPrice > 0 {
+			initStop = t.EntryPrice - t.InitialRisk
+			stopPct = t.InitialRisk / t.EntryPrice * 100
+		}
+		scaled := ""
+		if t.Scaled {
+			scaled = " (scaled)"
+		}
+		fmt.Printf("%-7s %-7s %7.2f %9.2f %7.2f%% %9.2f %7.2f%% %7.2f %6.1f%% %7.1fx %7.1f%% %7.1f%% %s%s\n",
+			t.Date[5:], t.Symbol, t.EntryPrice, initStop, stopPct, t.StopPrice,
+			t.ReturnPct, t.TotalR, t.MovePct, t.VolMult, t.MFEPct, t.CloseIfHeldPct,
+			t.Reason, scaled)
+	}
+	fmt.Println()
 }
 
 func reportFunnel(s Stats, sessions int) {

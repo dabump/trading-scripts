@@ -670,3 +670,81 @@ func TestSentimentCadenceSurvivesRestart(t *testing.T) {
 		t.Fatalf("got %d readings, want 2 once the interval elapsed", len(readings))
 	}
 }
+
+// armedBars is a micro pullback whose most recent candle is the pause, which is what
+// ArmMicroPullback reads: there is no trigger candle yet, so the buy-stop is armed at
+// the pause high and nothing should be bought until price trades there.
+func (h *harness) armedBars(symbol string, top float64) (pauseHigh float64) {
+	const ramp = 14
+	bars := make([]domain.Bar, 0, ramp+1)
+	base := top * 0.80
+	step := (top*0.985 - base) / float64(ramp-1)
+	for i := 0; i < ramp; i++ {
+		c := base + step*float64(i)
+		bars = append(bars, domain.Bar{
+			Time: h.open.Add(time.Duration(i) * h.cfg.Entry.PatternInterval),
+			Open: c - step/2, High: c + step/4, Low: c - step, Close: c, Volume: 50_000,
+		})
+	}
+	high := bars[len(bars)-1].High
+	pauseLow := high * 0.985
+	bars = append(bars, domain.Bar{
+		Time: h.open.Add(ramp * h.cfg.Entry.PatternInterval),
+		Open: high * 0.995, High: high * 0.998, Low: pauseLow, Close: pauseLow * 1.002,
+		Volume: 30_000,
+	})
+	h.fake.SetBars(symbol, bars)
+	return high * 0.998
+}
+
+// With entry.buy_stop_entry the setup arms on the pause candle and waits: the trade
+// fires on whichever later tick price breaks the pause high, without a new candle
+// closing. This is the difference between the two entries, so it is asserted on both
+// sides — no order while price is under the level, one order once it trades through.
+func TestBuyStopEntryWaitsForTheBreak(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Entry.BuyStopEntry = true
+	h.setBullish()
+
+	const sym = "ABCD"
+	pauseHigh := h.armedBars(sym, 5.00)
+	prevClose := 5.00 / 1.14
+	h.fake.SetAverageVolume(sym, 1_000_000)
+	h.fake.SetNews(sym, 2)
+
+	// Open the gate with price still under the pause high.
+	h.fake.SetSnapshot(sym, pauseHigh*0.995, prevClose, 6_000_000)
+	for _, m := range []int{30, 40, 50} {
+		h.at(9, m)
+		h.tick()
+	}
+	h.at(10, 31)
+	h.tick()
+	if got := len(h.fake.Placed()); got != 0 {
+		t.Fatalf("placed %d orders with price under the %.4f pause high, want 0", got, pauseHigh)
+	}
+	if len(h.openPositions()) != 0 {
+		t.Fatal("a buy-stop must not fill before price breaks its level")
+	}
+
+	// Price breaks the level. No new candle has closed, so only the armed setup can
+	// produce this trade.
+	h.fake.SetSnapshot(sym, pauseHigh*1.001, prevClose, 6_000_000)
+	h.at(10, 32)
+	h.tick()
+
+	pos := h.openPositions()
+	if len(pos) != 1 {
+		t.Fatalf("got %d positions after price broke the pause high, want 1", len(pos))
+	}
+	if pos[0].Symbol != sym {
+		t.Fatalf("position = %s, want %s", pos[0].Symbol, sym)
+	}
+	if pos[0].EntryPrice < pauseHigh {
+		t.Errorf("entry %.4f is below the %.4f level it was supposed to break",
+			pos[0].EntryPrice, pauseHigh)
+	}
+	if pos[0].StopPrice >= pos[0].EntryPrice {
+		t.Errorf("stop %.4f is not below entry %.4f", pos[0].StopPrice, pos[0].EntryPrice)
+	}
+}

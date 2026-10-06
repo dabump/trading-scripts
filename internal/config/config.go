@@ -209,6 +209,11 @@ type Entry struct {
 	// RequireMACD demands the MACD (12, 26, 9) line above its signal line. With fewer
 	// candles than it needs, the filter has no opinion rather than refusing.
 	RequireMACD bool `yaml:"require_macd"`
+	// BuyStopEntry reads the pattern a candle earlier and enters intrabar at the
+	// pause high, the way the discretionary micro pullback is traded, instead of
+	// waiting for a candle to close above it. The daemon cannot place that order;
+	// it exists so cmd/backtest can measure the difference. Default false.
+	BuyStopEntry bool `yaml:"buy_stop_entry"`
 	// RequireVolumeDecline demands lighter average volume on the pause than on the
 	// surge.
 	RequireVolumeDecline bool `yaml:"require_volume_decline"`
@@ -259,6 +264,11 @@ type Risk struct {
 type Exit struct {
 	// FirstTargetR is the first profit target, in multiples of initial risk.
 	FirstTargetR float64 `yaml:"first_target_r"`
+	// FirstTargetCents overrides FirstTargetR with a fixed cash move when > 0, which
+	// is how the discretionary version states its first target ("10 to 15 cents").
+	// It is scale-dependent and therefore only meaningful on a bounded price band.
+	// Zero (the default) leaves FirstTargetR in charge.
+	FirstTargetCents float64 `yaml:"first_target_cents"`
 	// FirstTargetFraction is how much of the position is sold there. The remainder
 	// is the runner that pays for the losing trades.
 	FirstTargetFraction float64 `yaml:"first_target_fraction"`

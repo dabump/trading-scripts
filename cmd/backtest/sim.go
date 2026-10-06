@@ -110,7 +110,7 @@ type funnel struct {
 // prepare applies the sentiment gate and the three screening criteria to every
 // session, leaving the exit rules to simulate.
 func prepare(cfg *config.Config, days []*DayData, benchPrev map[string]map[string]float64) []*preparedDay {
-	return prepareWith(cfg, days, benchPrev, false)
+	return prepareWith(cfg, days, benchPrev, cfg.Entry.BuyStopEntry)
 }
 
 // prepareWith is prepare with the entry read as a buy-stop: with buyStop set, each

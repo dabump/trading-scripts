@@ -122,7 +122,8 @@ A qualifying candidate is bought only when its chart prints a **micro pullback**
   The entry was 7.9% into an unbroken run of green candles and the stop went under a
   level nothing had defended; it was stopped out eleven seconds after the fill. See
   docs/decisions.md.
-- **The trigger.** A candle closes above the last pause candle's high.
+- **The trigger.** Price trades through the last pause candle's high
+  (`entry.buy_stop_entry`), or — with that off — a candle closes above it.
 
 Plus two trend filters, because the strategy only buys strength: price must be above
 its `entry.ema_period` EMA, and above the session VWAP — the line separating a name
@@ -136,13 +137,22 @@ so on a vertical mover it reported a 0-bar pullback for as long as the move was 
 That is why KNRX was refused at 09:59 (docs/decisions.md). The two were compared on a
 year of history before the switch; the numbers are in docs/decisions.md.
 
-**The daemon enters after the close, not at the break.** It reads closed candles, so
-it waits for the trigger candle to close above the level — only closed ones: the feed
-includes the candle still forming, and that is never read as a trigger. The
-discretionary approach buys the moment price trades through, using a buy-stop order.
-That order type is not built. `cmd/backtest` measures both entries
-(`strategy.ArmMicroPullback` gives the buy-stop price) so the gap between them is a
-number, not a guess.
+**With `entry.buy_stop_entry` the daemon enters at the break, not after the close.**
+This branch has it on. The chart is still read once per completed candle, but what it
+produces is an *armed* setup (`strategy.ArmMicroPullback`) whose Entry and BuyStop are
+the pause high; the trade then fires on whichever later tick the live price trades
+through that level, and `entry.max_entry_drift_pct` is what stops it chasing. Armed
+symbols are price-checked on every tick, from one batched snapshot per pass — a
+per-symbol read would cost 30 requests a minute each on a budget already near
+Alpaca's 200.
+
+With the switch off (the baseline) the daemon instead waits for a candle to **close**
+above the level — only closed ones: the feed includes the candle still forming, and
+that is never read as a trigger. `cmd/backtest` measures both, so the gap between them
+is a number rather than a guess, and over a year the close trigger measured
+**better** (equity 9,943 against 8,511). The break entry is on test here because the
+backtest fills a buy-stop at exactly its trigger price, which is the least realistic
+assumption in that comparison.
 
 **The price is re-read before buying** (`strategy.CheckEntryPrice`). The trigger close
 is history by the time an order can go, and on these names a few seconds is several
@@ -262,7 +272,7 @@ described below works through the second, raising the stop:
 
 1. **Forced end-of-day exit** at `exit.eod_exit_offset_minutes` before the close, regardless of P&L — settled, and it applies to a position opened by hand as well (see below).
 2. **The stop.** The working stop is the chart stop the setup defined, moved up to the entry price once the first target is banked. Behind it sits `risk.stop_loss_pct` as a **gap backstop**, reachable only when price jumps straight through the chart stop. Config validation requires the backstop to be the wider of the two, or it would fire first and silently turn this back into a fixed-percentage stop.
-3. **The first profit target**, at `exit.first_target_r` multiples of *this trade's own initial risk*. `exit.first_target_fraction` of the position is sold there and the rest keeps running, with its stop at breakeven.
+3. **The first profit target.** `exit.first_target_cents`, when set, puts it a fixed cash distance above entry — the discretionary version's "10 to 15 cents"; otherwise it sits at `exit.first_target_r` multiples of *this trade's own initial risk*. `exit.first_target_fraction` of the position is sold there and the rest keeps running, with its stop at breakeven. **A cents target is not scale-invariant** — 12c is 6% of a $2 stock and 0.9% of a $14 one — which is why `first_target_r` is the default and why `screening.max_price` matters more when cents are in use.
 
 **Positions opened by hand have a shorter rule: the forced exit, then their own
 stop.** The signal rules — the `risk.stop_loss_pct` backstop, the candle trail and the

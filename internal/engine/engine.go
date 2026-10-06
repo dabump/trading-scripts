@@ -1022,6 +1022,30 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 	}
 	openCount := len(open)
 
+	// An armed buy-stop has to be judged against the live price on every tick, so the
+	// per-candidate snapshot below would cost one request per armed symbol per tick —
+	// 30 a minute each, on a budget already close to Alpaca's 200. One batched read
+	// per pass covers all of them instead; a symbol armed during this pass is not in
+	// it yet and falls back to its own request, which happens at most once per candle.
+	armedPrices := map[string]float64{}
+	if e.cfg.Entry.BuyStopEntry && len(e.setups.armed) > 0 {
+		syms := make([]string, 0, len(qualifying))
+		for _, c := range qualifying {
+			if _, ok := e.setups.armed[c.Symbol]; ok {
+				syms = append(syms, c.Symbol)
+			}
+		}
+		if len(syms) > 0 {
+			if snaps, err := e.data.Snapshots(ctx, syms); err != nil {
+				e.log.Warn("armed buy-stop price read failed", "symbols", len(syms), "err", err)
+			} else {
+				for sym, snap := range snaps {
+					armedPrices[sym] = snap.Price
+				}
+			}
+		}
+	}
+
 	for i, cand := range qualifying {
 		if !risk.CanOpen(openCount, e.cfg) {
 			// Explain every remaining candidate rather than leaving them blank.
@@ -1058,29 +1082,62 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 		// already passed all three criteria, once per completed candle.
 		// The chart starts where the pass's session does, so a pre-market setup is read
 		// on pre-market candles rather than on an empty regular session.
+		//
+		// With entry.buy_stop_entry the chart is still read once per candle, but what
+		// it produces is an *armed* setup rather than a decision: the trade fires on
+		// whichever later tick price breaks the pause high. So a symbol whose chart
+		// has not moved is no longer skipped — it falls through to the price check
+		// below carrying the setup armed on an earlier candle.
 		interval := e.cfg.Entry.PatternInterval
 		now := e.now()
+		buyStop := e.cfg.Entry.BuyStopEntry
+		var setup strategy.Setup
 		if !e.setups.due(cand.Symbol, now, interval) {
-			continue
+			if !buyStop {
+				continue
+			}
+			var ok bool
+			if setup, ok = e.setups.armed[cand.Symbol]; !ok {
+				continue
+			}
 		}
-		e.setups.fetched(cand.Symbol, now, interval)
-		bars, err := e.data.IntradayBars(ctx, cand.Symbol, interval, p.barsSince)
-		if err != nil {
-			e.log.Warn("skipping candidate: bars unavailable", "symbol", cand.Symbol, "err", err)
-			outcomes[cand.Symbol] = "bars unavailable"
-			e.recordSkip(cand.Symbol, "bars unavailable",
-				map[string]any{"reason": "bars unavailable", "error": err.Error()})
-			continue
+		if !setup.Triggered {
+			e.setups.fetched(cand.Symbol, now, interval)
+			bars, err := e.data.IntradayBars(ctx, cand.Symbol, interval, p.barsSince)
+			if err != nil {
+				e.log.Warn("skipping candidate: bars unavailable", "symbol", cand.Symbol, "err", err)
+				outcomes[cand.Symbol] = "bars unavailable"
+				e.recordSkip(cand.Symbol, "bars unavailable",
+					map[string]any{"reason": "bars unavailable", "error": err.Error()})
+				continue
+			}
+			// Only candles that have closed: the feed includes the one still forming, and
+			// a "close" that can still move is not a close above anything.
+			bars = completedBars(bars, now, interval)
+			if len(bars) > 0 && !e.setups.read(cand.Symbol, bars[len(bars)-1].Time) {
+				// Nothing new since the last read: the candle that just closed has not
+				// been published yet, and is picked up on a later tick. An armed
+				// buy-stop still wants judging against the live price in the meantime.
+				if !buyStop {
+					continue
+				}
+				var ok bool
+				if setup, ok = e.setups.armed[cand.Symbol]; !ok {
+					continue
+				}
+			} else if buyStop {
+				// Arm on the pause still in progress: Entry and BuyStop are the pause
+				// high, and CheckEntryPrice below refuses until price trades there.
+				setup = strategy.ArmMicroPullback(bars, e.cfg)
+				if setup.Triggered {
+					e.setups.armed[cand.Symbol] = setup
+				} else {
+					delete(e.setups.armed, cand.Symbol)
+				}
+			} else {
+				setup = strategy.FindSetup(bars, e.cfg)
+			}
 		}
-		// Only candles that have closed: the feed includes the one still forming, and
-		// a "close" that can still move is not a close above anything.
-		bars = completedBars(bars, now, interval)
-		if len(bars) > 0 && !e.setups.read(cand.Symbol, bars[len(bars)-1].Time) {
-			// Nothing new since the last read: the candle that just closed has not been
-			// published yet, and is picked up on a later tick.
-			continue
-		}
-		setup := strategy.FindSetup(bars, e.cfg)
 		if !setup.Triggered {
 			// Not a failure: most of the time a screened candidate simply has not set
 			// up yet. It stays a candidate and is re-examined on the next scan, so
@@ -1094,15 +1151,18 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 
 		// The setup was read on a closed candle; the order fills at whatever trades
 		// now. Re-read the price and re-judge the trade at it, and size from it.
-		snaps, err := e.data.Snapshots(ctx, []string{cand.Symbol})
-		if err != nil {
-			e.log.Warn("skipping candidate: price unavailable", "symbol", cand.Symbol, "err", err)
-			outcomes[cand.Symbol] = "price unavailable"
-			e.recordSkip(cand.Symbol, "price unavailable",
-				map[string]any{"reason": "price unavailable", "error": err.Error()})
-			continue
+		price, ok := armedPrices[cand.Symbol]
+		if !ok {
+			snaps, err := e.data.Snapshots(ctx, []string{cand.Symbol})
+			if err != nil {
+				e.log.Warn("skipping candidate: price unavailable", "symbol", cand.Symbol, "err", err)
+				outcomes[cand.Symbol] = "price unavailable"
+				e.recordSkip(cand.Symbol, "price unavailable",
+					map[string]any{"reason": "price unavailable", "error": err.Error()})
+				continue
+			}
+			price = snaps[cand.Symbol].Price
 		}
-		price := snaps[cand.Symbol].Price
 		if reason := strategy.CheckEntryPrice(setup, price, e.cfg); reason != "" {
 			e.log.Info("skipping candidate: price moved off the setup", "symbol", cand.Symbol,
 				"reason", reason, "setup_price", setup.Entry, "live_price", price, "stop", setup.Stop)
@@ -1137,6 +1197,9 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 			continue
 		}
 
+		// Disarm before the order goes: a buy-stop that fires must not fire twice if
+		// the fill is slow to be reflected in the held-position check above.
+		delete(e.setups.armed, cand.Symbol)
 		f, err := e.submit(ctx, sess, cand.Symbol, "buy", sizing.Shares, price, setup.Stop, p.extendedHours)
 		if err != nil {
 			e.log.Warn("skipping candidate: order rejected", "symbol", cand.Symbol, "err", err)

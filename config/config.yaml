@@ -1,3 +1,15 @@
+# WARRIOR TRADING VARIANT -- branch test/warrior-comparison, under evaluation.
+#
+# The micro pullback as described at
+# https://www.warriortrading.com/pull-back-trading-strategy/, applied in full so it
+# can be paper-traded. Each difference from the measured baseline is commented at
+# its key. Backtested results are in docs/decisions.md: over a year this variant
+# ends at 9,890 against the baseline's 9,943, and is worse at every slippage level.
+# It is on test because the backtest fills a buy-stop at its trigger price, which is
+# the least realistic assumption in the comparison; live paper fills are the point.
+#
+# Do not merge to main on the strength of the backtest.
+#
 # Tunable strategy parameters. See docs/operations.md for the canonical table of
 # these keys and which design doc each one comes from.
 #
@@ -20,7 +32,7 @@ screening:
   # The band the strategy trades. Above roughly $20 a 10% move on 5x volume is a
   # different kind of event in a different kind of name, and the pullback entry below
   # is not what moves it. PROPOSED.
-  max_price: 20.0
+  max_price: 10.0
   min_dollar_volume: 1000000
   # A floor with deliberately no ceiling. A max_intraday_pct was tried and removed:
   # under the old profit-target/trailing-stop exits the widest gaps were the worst
@@ -100,14 +112,23 @@ entry:
   # The setup is a micro pullback (docs/strategy.md §3): a surge to the high of day,
   # a 1-2 candle pause, then a close above the last pause candle's high. These values
   # are the ones measured in docs/decisions.md; they have not been tuned.
-  max_pullback_bars: 2 # one or two pause candles; three or more is a flag
+  max_pullback_bars: 3 # "usually just a 1-3 candle pause" (Warrior Trading)
   surge_bars: 3 # candles, ending just before the pause, that the surge spans
   min_surge_pct: 3.0 # rise across those candles, lowest low to the top
   max_retrace_pct: 50 # most of the surge's range the pause may give back
+  # Enter on the BREAK of the pause high, intrabar, rather than waiting for a candle
+  # to close above it. The engine arms the setup on each completed candle and fires on
+  # whichever later tick price trades through the level; max_entry_drift_pct below is
+  # what stops it chasing. Measured WORSE than the close trigger over a year (equity
+  # 8,511 vs 9,943, and far worse on slippage) -- on test to see whether real fills
+  # disagree with the backtest's assumption that a buy-stop fills at its trigger.
+  buy_stop_entry: true
   require_macd: false # MACD(12,26,9) above its signal line
-  require_volume_decline: false # pause lighter on volume than the surge
+  require_volume_decline: true # pause lighter on volume than the surge
   stop_buffer_pct: 0.1 # placed just under the pullback low, not on it
-  min_stop_distance_pct: 0.5 # nearer than this and ordinary noise triggers it
+  # Warrior places the stop just under the pullback low and sizes up on how tight that
+  # is, so a tight stop is the point rather than a hazard. Effectively disabled.
+  min_stop_distance_pct: 0.05
   # If the chart stop is further away than this, the trade is not taken at all. This
   # is part of the strategy rather than a safety rail: with risk that wide the size
   # has to shrink until the winner cannot pay for the losers.
@@ -154,15 +175,21 @@ exit:
   # tail open, which is where this strategy's entire return lives. There is also no
   # MACD trigger: it fired on 24.9% of trades for a mean of -0.08%. See
   # docs/decisions.md. PROPOSED.
-  first_target_r: 2.0
-  first_target_fraction: 0.5
+  first_target_r: 2.0 # ignored while first_target_cents is set
+  # A fixed cash target, as the discretionary version states it. It is NOT
+  # scale-invariant -- 12c is 6% of a $2 stock and 0.9% of a $14 one -- and over a
+  # year its entire measured gain came from 16 trades in the $10-20 band, where it is
+  # a near-instant scratch. Re-expressed as 1.0R or 0.5R the gain vanished. Held under
+  # suspicion; max_price above now caps the band it exploited.
+  first_target_cents: 0.12
+  first_target_fraction: 0.75 # "sell 75% of my position into strength"
   breakeven_after_target: true
   eod_exit_offset_minutes: 5 # docs/strategy.md §4
   # The micro pullback's exit: sell on the first candle to trade below the previous
   # candle's low, by raising the stop to each completed candle's low. off |
   # after_target (the runner only) | always (from the entry candle). See
   # docs/decisions.md for how each measured.
-  candle_trail: after_target
+  candle_trail: off # the rest is held for the next breakout level, not trailed
 
 timing:
   sentiment_poll_interval: 2m # docs/strategy.md §1

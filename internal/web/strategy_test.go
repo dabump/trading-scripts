@@ -426,7 +426,7 @@ func TestLegendQuotesConfiguredCadences(t *testing.T) {
 	f.cfg.Exit.EODExitOffsetMins = 7
 
 	var sentiment, screening, eod string
-	for _, l := range legendFor(f.cfg) {
+	for _, l := range legendFor(f.cfg, "") {
 		switch l.State {
 		case domain.StateSentimentCheck:
 			sentiment = l.Meaning

@@ -532,23 +532,25 @@ func (e *Engine) Tick(ctx context.Context) {
 	case domain.PhaseClosed:
 		e.setState(domain.StateMarketClosed)
 
-	case domain.PhasePreMarket:
-		e.setState(domain.StatePreMarket)
-		// Exits run before the bell too. Normally there is nothing held — the previous
-		// session was flattened at its forced exit — but with premarket.allow_entry on,
-		// a position opened at 07:00 has to be able to stop out at 08:00 rather than
-		// waiting three hours for the regular loop to notice.
+	case domain.PhaseExtended:
+		e.setState(domain.StateExtendedMarket)
+		window := windowAt(now, bounds)
+		// Exits run outside the bells too. Before the open there is normally nothing
+		// held — the previous session was flattened at its forced exit — but with
+		// extended.allow_entry on, a position opened at 07:00 has to be able to stop out
+		// at 08:00 rather than waiting three hours for the regular loop to notice, and
+		// one opened at 17:00 has to be managed up to the post-market forced exit.
 		if err := e.managePositions(ctx, sess, bounds, false); err != nil {
 			e.fail("manage positions", err)
 			return
 		}
-		if e.claimScan(now, e.cfg.PreMarket.ScanInterval) {
-			e.startScreen(ctx, sess, "pre-market screen", func(ctx context.Context) scanPass {
-				return e.preMarketPass(ctx, bounds)
+		if e.claimScan(now, e.cfg.Extended.ScanInterval) {
+			e.startScreen(ctx, sess, window.label()+" screen", func(ctx context.Context) scanPass {
+				return e.extendedPass(ctx, sess, bounds)
 			})
 		}
-		if err := e.checkSetups(ctx, sess, bounds, true); err != nil {
-			e.fail("pre-market entry", err)
+		if err := e.checkSetups(ctx, sess, bounds, window); err != nil {
+			e.fail(window.label()+" entry", err)
 		}
 
 	case domain.PhaseFirstHour:
@@ -576,14 +578,17 @@ func (e *Engine) Tick(ctx context.Context) {
 		e.setState(domain.StateScreening)
 		if e.claimScan(e.now(), e.cfg.Timing.ScreenerScanInterval) {
 			e.startScreen(ctx, sess, "screen", func(context.Context) scanPass {
-				return e.regularPass(e.now(), sess, bounds)
+				return e.regularPass(sess, bounds)
 			})
 		}
-		if err := e.checkSetups(ctx, sess, bounds, false); err != nil {
+		if err := e.checkSetups(ctx, sess, bounds, windowRegular); err != nil {
 			e.fail("enter positions", err)
 		}
 
 	case domain.PhaseEODWindow:
+		// Twice a day when extended hours are on: before the regular close, and again
+		// before the extended one, so a post-market entry is not carried overnight.
+		// managePositions routes the second one to the extended book itself.
 		e.setState(domain.StateEODWindow)
 		if err := e.managePositions(ctx, sess, bounds, true); err != nil {
 			e.fail("force exit", err)
@@ -686,25 +691,76 @@ func (e *Engine) resolveGate(sess scheduler.Session) (bool, error) {
 	return halted, nil
 }
 
+// scanWindow names which of the day's three screening windows a pass belongs to.
+//
+// Pre-market and post-market share a phase, every threshold and the extended-hours
+// book, so almost nothing branches on which of the two it is. Two things do: where
+// the sentiment authority comes from, and the fact that a watchlist published before
+// the bell must never be acted on after the close. That second one is not theoretical
+// — on a halted day the regular session never publishes a watchlist, so the morning's
+// would still be the newest one at 16:00.
+type scanWindow int
+
+const (
+	windowRegular scanWindow = iota
+	windowPreBell
+	windowPostBell
+)
+
+// windowAt reports which window an instant belongs to. Only meaningful inside
+// PhaseExtended and the regular session; the caller already knows the phase.
+func windowAt(now time.Time, bounds scheduler.Boundaries) scanWindow {
+	if scheduler.PhaseAt(now, bounds) != domain.PhaseExtended {
+		return windowRegular
+	}
+	if scheduler.BeforeTheBell(now, bounds) {
+		return windowPreBell
+	}
+	return windowPostBell
+}
+
+// extended reports whether this window runs on the extended-hours thresholds and
+// book.
+func (w scanWindow) extended() bool { return w != windowRegular }
+
+// label names the window for the log, the audit trail and the fault message.
+func (w scanWindow) label() string {
+	switch w {
+	case windowPreBell:
+		return "pre-market"
+	case windowPostBell:
+		return "post-market"
+	default:
+		return "regular session"
+	}
+}
+
 // scanPass is everything one screening pass needs to know about the session it runs
 // in.
 //
-// There are two of them now. The regular session and pre-market share the screening
-// and entry machinery but agree on almost nothing else: a different cadence,
-// different volume thresholds, a different start for the setup's chart, a different
-// order routing, and different reasons to screen without buying. Bundling that into
-// a value built once in Tick keeps the decision in one place instead of re-deriving
-// it from the clock inside every step.
+// There are three of them now. The regular session and the two extended ones share
+// the screening and entry machinery but agree on almost nothing else: a different
+// cadence, different volume thresholds, a different start for the setup's chart, a
+// different order routing, and different reasons to screen without buying. Bundling
+// that into a value built once in Tick keeps the decision in one place instead of
+// re-deriving it from the clock inside every step.
 type scanPass struct {
-	// preMarket labels the pass in the log and the audit trail.
-	preMarket bool
+	// window labels the pass in the log and the audit trail, and decides which
+	// watchlist the setup check is allowed to act on.
+	window scanWindow
 	// thresholds are the screening numbers in force, resolved once so the trail can
 	// say what the candidates were judged against.
 	thresholds screener.Thresholds
 	// barsSince is where the setup detector's chart begins.
 	barsSince time.Time
-	// extendedHours routes any order to the pre-market book.
+	// extendedHours routes any order to the extended-hours book.
 	extendedHours bool
+	// windowEnd is the last moment this pass may buy, zero when it has no deadline.
+	// Pre-market has none — it buys right up to the bell, which is when its session
+	// ends anyway. The other two are judged against it on every tick rather than once
+	// per screen, so the window closes on time even when the watchlist was published
+	// just before it.
+	windowEnd time.Time
 	// blocked, when non-empty, is why this pass may screen but not buy. It becomes the
 	// Action column's text against every qualifying candidate, which is the whole
 	// reason screening continues when entry does not.
@@ -715,9 +771,9 @@ type scanPass struct {
 // running, claiming the slot when both hold.
 //
 // The interval check lives here, called from Tick, rather than inside the pass:
-// pre-market runs on its own cadence (premarket.scan_interval) and a single scan
-// that consulted timing.screener_scan_interval for both would either flood the
-// pre-market with requests or starve the regular session of them.
+// extended hours run on their own cadence (extended.scan_interval) and a single scan
+// that consulted timing.screener_scan_interval for both would either flood the thin
+// sessions with requests or starve the regular one of them.
 func (e *Engine) claimScan(now time.Time, interval time.Duration) bool {
 	if interval <= 0 {
 		return false
@@ -739,38 +795,59 @@ func (e *Engine) claimScan(now time.Time, interval time.Duration) bool {
 // After the entry window closes it keeps screening but stops buying. The page is the
 // reason: an operator watching the afternoon should still see what is setting up and
 // why it was not taken, rather than an empty table that looks like a broken scanner.
-func (e *Engine) regularPass(now time.Time, sess scheduler.Session, bounds scheduler.Boundaries) scanPass {
-	p := scanPass{
+func (e *Engine) regularPass(sess scheduler.Session, bounds scheduler.Boundaries) scanPass {
+	return scanPass{
+		window:     windowRegular,
 		thresholds: screener.ThresholdsFor(e.cfg, false),
 		barsSince:  sess.Open,
+		windowEnd:  bounds.EntryWindowEnd,
 	}
-	if !now.Before(bounds.EntryWindowEnd) {
-		p.blocked = "entry window closed"
-	}
-	return p
 }
 
-// preMarketPass is the scan for the 04:00-09:30 session, including whether it may buy.
+// extendedPass is the scan for the two extended-hours sessions — the pre-market open
+// to the bell, and the close to the post-market end — including whether it may buy.
 //
-// The first-hour sentiment gate has not run and cannot have: its readings are taken
-// after the open. So pre-market entry has no kill switch to inherit. Rather than
-// trade without one, this takes a live reading of the same basket through the same
-// classifier and withholds entry on an overwhelmingly bearish tape — and withholds it
-// just as readily when the reading is unavailable, because no answer is not a
-// passing answer.
+// The two halves differ in exactly one thing: where the authority to buy comes from.
 //
-// The reading is deliberately not persisted. resolveGate decides the session from the
-// stored readings, and a 06:00 sample must not be able to settle the day before the
-// market has opened.
-func (e *Engine) preMarketPass(ctx context.Context, bounds scheduler.Boundaries) scanPass {
+// Before the bell the first-hour sentiment gate has not run and cannot have, since its
+// readings are taken after the open. So pre-market entry has no kill switch to
+// inherit. Rather than trade without one, this takes a live reading of the same basket
+// through the same classifier and withholds entry on an overwhelmingly bearish tape —
+// and withholds it just as readily when the reading is unavailable, because no answer
+// is not a passing answer. That reading is deliberately not persisted: resolveGate
+// decides the session from the stored readings, and a 06:00 sample must not be able to
+// settle the day before the market has opened.
+//
+// After the close the gate has already resolved on real first-hour readings, so
+// post-market defers to the day's verdict exactly as the regular session does rather
+// than taking a second, differently-sourced opinion. A day the kill switch halted
+// stays halted through post-market.
+func (e *Engine) extendedPass(ctx context.Context, sess scheduler.Session, bounds scheduler.Boundaries) scanPass {
+	now := e.now()
+	window := windowAt(now, bounds)
 	p := scanPass{
-		preMarket:     true,
+		window:        window,
 		thresholds:    screener.ThresholdsFor(e.cfg, true),
-		barsSince:     bounds.PreMarketOpen,
+		barsSince:     scheduler.ExtendedStart(now, bounds),
 		extendedHours: true,
 	}
-	if !e.cfg.PreMarket.AllowEntry {
-		p.blocked = "pre-market entry is disabled"
+	if window == windowPostBell {
+		p.windowEnd = bounds.PostEntryEnd
+	}
+	if !e.cfg.Extended.AllowEntry {
+		p.blocked = "extended-hours entry is disabled"
+		return p
+	}
+
+	if window == windowPostBell {
+		halted, err := e.resolveGate(sess)
+		switch {
+		case err != nil:
+			e.log.Warn("could not resolve the sentiment gate; screening only", "err", err)
+			p.blocked = "the session's sentiment gate could not be read"
+		case halted:
+			p.blocked = "halted for the session"
+		}
 		return p
 	}
 
@@ -894,7 +971,7 @@ func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time, th s
 			continue
 		}
 		volume, dollar := snap.TodayVolume, snap.Price*snap.TodayVolume
-		if !th.PreMarket {
+		if !th.Extended {
 			// Regular session: the snapshot already carries volume, so the turnover
 			// floor is applied here too and rejects before any per-symbol call.
 			if ok, reason := screener.TradableLiquidity(dollar, th); !ok {
@@ -906,22 +983,25 @@ func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time, th s
 		movers = append(movers, mover{symbol: sym, snap: snap, volume: volume, dollar: dollar})
 	}
 
-	// Pre-market the snapshot's volume is not merely stale, it does not exist: no
+	// The snapshot's volume is the wrong number in both extended sessions, for
+	// opposite reasons. Pre-market it does not merely go stale, it does not exist: no
 	// daily bar for today has been created yet, so every symbol reads as zero shares
-	// traded. Verified against a live account — see docs/decisions.md. The session's
-	// real volume therefore has to be fetched, and it is fetched batched, for exactly
-	// the names that cleared the move and the price band. Doing it here rather than
-	// during enrichment is what keeps the dollar-volume ranking below meaningful:
-	// ranking on zeros would hand the enrichment budget to whichever symbols happened
-	// to sort first.
-	if th.PreMarket && len(movers) > 0 {
+	// traded. Verified against a live account — see docs/decisions.md. Post-market the
+	// daily bar does exist and carries the whole regular session, which would clear the
+	// deliberately low extended turnover floor for every name on the tape and say
+	// nothing about what is trading now. Either way the extended session's own volume
+	// has to be fetched, and it is fetched batched, for exactly the names that cleared
+	// the move and the price band. Doing it here rather than during enrichment is what
+	// keeps the dollar-volume ranking below meaningful: ranking on zeros would hand the
+	// enrichment budget to whichever symbols happened to sort first.
+	if th.Extended && len(movers) > 0 {
 		symbols := make([]string, 0, len(movers))
 		for _, m := range movers {
 			symbols = append(symbols, m.symbol)
 		}
 		volumes, err := e.data.SessionVolumes(ctx, symbols, sessionStart)
 		if err != nil {
-			return nil, 0, fmt.Errorf("pre-market volumes: %w", err)
+			return nil, 0, fmt.Errorf("extended-hours volumes: %w", err)
 		}
 		kept := movers[:0]
 		for _, m := range movers {
@@ -942,7 +1022,7 @@ func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time, th s
 			"rejected", rejected, "remaining", len(movers),
 			"min_price", th.MinPrice,
 			"min_dollar_volume", th.MinDollarVolume,
-			"pre_market", th.PreMarket)
+			"extended", th.Extended)
 	}
 
 	sort.SliceStable(movers, func(i, j int) bool { return movers[i].dollar > movers[j].dollar })
@@ -971,8 +1051,8 @@ func (e *Engine) gatherCandidates(ctx context.Context, newsSince time.Time, th s
 			Symbol:      m.symbol,
 			Price:       m.snap.Price,
 			IntradayPct: m.snap.IntradayPct,
-			// The session's volume, which pre-market came from SessionVolumes rather
-			// than the snapshot. This is the numerator of the relative-volume
+			// The session's volume, which in extended hours came from SessionVolumes
+			// rather than the snapshot. This is the numerator of the relative-volume
 			// criterion, so taking the snapshot's zero here would fail every
 			// pre-market candidate on a criterion it was never measured against.
 			TodayVolume: m.volume,
@@ -1273,7 +1353,7 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 				"setup_pause_high":     setup.PauseHigh,
 				"setup_pause_bars":     setup.PauseBars,
 				"open_positions_after": openCount + 1,
-				"pre_market":           p.preMarket,
+				"session":              p.window.label(),
 				"stop_order_placed":    stopPlaced,
 				"stop_order_attached":  f.StopLegID != "",
 				"stop_order_note":      stopNote,
@@ -1288,11 +1368,11 @@ func (e *Engine) enterPositions(ctx context.Context, sess scheduler.Session, eva
 // managePositions updates high-water marks and applies the exit rules. When
 // forceEOD is set, every open position is closed regardless of the other rules.
 func (e *Engine) managePositions(ctx context.Context, sess scheduler.Session, bounds scheduler.Boundaries, forceEOD bool) error {
-	// An exit before the bell has to be routed to the pre-market book, or the broker
-	// rejects it and the position sits through its stop. Derived from the clock rather
-	// than passed in, because every caller would otherwise have to remember it and the
-	// one that forgot would be the one holding the loser.
-	extendedHours := scheduler.PhaseAt(e.now(), bounds) == domain.PhasePreMarket
+	// An exit outside the bells has to be routed to the extended-hours book, or the
+	// broker rejects it and the position sits through its stop. Derived from the clock
+	// rather than passed in, because every caller would otherwise have to remember it
+	// and the one that forgot would be the one holding the loser.
+	extendedHours := scheduler.ExtendedHours(e.now(), bounds)
 
 	open, err := e.store.OpenPositions()
 	if err != nil {
@@ -1410,7 +1490,7 @@ func (e *Engine) manageManual(ctx context.Context, sess scheduler.Session,
 	if !decision.Exit {
 		return nil
 	}
-	extendedHours := scheduler.PhaseAt(e.now(), bounds) == domain.PhasePreMarket
+	extendedHours := scheduler.ExtendedHours(e.now(), bounds)
 	return e.exitPosition(ctx, sess, p, decision.Reason, price, extendedHours)
 }
 
@@ -1893,13 +1973,13 @@ func (e *Engine) submit(ctx context.Context, sess scheduler.Session, symbol, sid
 	orderType, slipPct := e.cfg.Execution.OrderType, e.cfg.Execution.LimitSlipPct
 	if extendedHours {
 		// Not a preference. Alpaca accepts only a day limit order for the extended
-		// session, so execution.order_type does not apply before the bell — it keeps
-		// governing the regular session, and pre-market sends a limit order whatever
-		// it says. Coupling the two would have made enabling pre-market entry change
-		// how the rest of the day trades.
+		// sessions, so execution.order_type does not apply outside the bells — it keeps
+		// governing the regular session, and an extended-hours order is a limit order
+		// whatever it says. Coupling the two would have made enabling extended-hours
+		// entry change how the rest of the day trades.
 		orderType = "limit"
-		if e.cfg.PreMarket.LimitSlipPct > 0 {
-			slipPct = e.cfg.PreMarket.LimitSlipPct
+		if e.cfg.Extended.LimitSlipPct > 0 {
+			slipPct = e.cfg.Extended.LimitSlipPct
 		}
 	}
 

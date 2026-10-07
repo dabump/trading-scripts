@@ -129,8 +129,8 @@ func TestClosePositionRefusedWhenExchangeIsShut(t *testing.T) {
 // Pre-market the sale has to be routed to the extended-hours book like any other.
 func TestClosePositionPreMarketUsesExtendedHours(t *testing.T) {
 	h := newHarness(t)
-	h.enablePreMarket()
-	h.allowPreMarketEntry()
+	h.enableExtended()
+	h.allowExtendedEntry()
 	h.setBullish()
 	h.addPreMarketCandidate("EARLY", 5.00)
 	h.at(7, 30)

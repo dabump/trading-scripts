@@ -151,19 +151,20 @@ func (e *Engine) ScreenNow(ctx context.Context) (domain.ScreenPreview, error) {
 	sess, tradingDay := e.Session()
 
 	// The button reports what the agent would find at this moment, so it has to judge
-	// by the numbers that are in force at this moment: pre-market thresholds while
-	// pre-market, regular ones otherwise. Deriving it from the phase rather than a
-	// separate rule keeps the preview honest about which screen it just ran — the
-	// whole promise of this path is that a row it calls qualifying is one the
+	// by the numbers that are in force at this moment: extended-hours thresholds
+	// outside the bells, regular ones between them. Deriving it from the phase rather
+	// than a separate rule keeps the preview honest about which screen it just ran —
+	// the whole promise of this path is that a row it calls qualifying is one the
 	// automated scan would act on.
 	bounds := scheduler.Bounds(sess, e.cfg)
-	preMarket := tradingDay && scheduler.PhaseAt(now, bounds) == domain.PhasePreMarket
-	th := screener.ThresholdsFor(e.cfg, preMarket)
+	extended := tradingDay && scheduler.PhaseAt(now, bounds) == domain.PhaseExtended
+	th := screener.ThresholdsFor(e.cfg, extended)
 
 	// The same catalyst window as the automated scan, which is relative to now and
 	// therefore works just as well with the exchange closed. The session start is
-	// where a pre-market pass sums its volume from, and is unused otherwise.
-	inputs, universe, err := e.gatherCandidates(ctx, e.newsSince(), th, bounds.PreMarketOpen)
+	// where an extended-hours pass sums its volume from — the pre-market open before
+	// the bell, the close after it — and is unused otherwise.
+	inputs, universe, err := e.gatherCandidates(ctx, e.newsSince(), th, scheduler.ExtendedStart(now, bounds))
 	if err != nil {
 		return domain.ScreenPreview{}, err
 	}
@@ -181,7 +182,7 @@ func (e *Engine) ScreenNow(ctx context.Context) (domain.ScreenPreview, error) {
 		MarketOpen:   marketOpen,
 	}
 	e.log.Info("manual screening pass", "universe_scanned", universe,
-		"evaluated", len(evals), "market_open", marketOpen, "pre_market", preMarket,
+		"evaluated", len(evals), "market_open", marketOpen, "extended", extended,
 		"orders_placed", 0)
 	return preview, nil
 }
@@ -239,11 +240,11 @@ func (e *Engine) ClosePosition(ctx context.Context, id int64) (domain.Position, 
 		return domain.Position{}, ErrExchangeClosed
 	}
 	now := e.now()
-	phase := scheduler.PhaseAt(now, scheduler.Bounds(sess, e.cfg))
-	if phase == domain.PhaseClosed {
+	bounds := scheduler.Bounds(sess, e.cfg)
+	if scheduler.PhaseAt(now, bounds) == domain.PhaseClosed {
 		return domain.Position{}, ErrExchangeClosed
 	}
-	extendedHours := phase == domain.PhasePreMarket
+	extendedHours := scheduler.ExtendedHours(now, bounds)
 
 	// A fresh mark, because this one is being priced into an order. Falling back to
 	// the stored mark and then the entry price keeps a data blip from stranding an
@@ -376,7 +377,7 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 			"%w: the end-of-day window has started, and anything bought now would be force-sold within minutes",
 			ErrCannotEnter)
 	}
-	extendedHours := phase == domain.PhasePreMarket
+	extendedHours := scheduler.ExtendedHours(now, bounds)
 
 	// The risk rules that are not about the signal still hold.
 	open, err := e.store.OpenPositions()
@@ -420,7 +421,7 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 	// clicks a fraction early should still get the stop the strategy would have used.
 	barsSince := sess.Open
 	if extendedHours {
-		barsSince = bounds.PreMarketOpen
+		barsSince = scheduler.ExtendedStart(now, bounds)
 	}
 	if bars, err := e.data.IntradayBars(ctx, symbol, e.cfg.Entry.PatternInterval, barsSince); err == nil {
 		if setup := strategy.FindSetup(bars, e.cfg); setup.Triggered {

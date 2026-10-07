@@ -48,45 +48,85 @@ func (s Session) IsEarlyClose() bool {
 }
 
 // Boundaries are the decision points within a session.
+//
+// The day has three screening windows, not one: pre-market, the regular session, and
+// post-market. The two extended ones share their thresholds and their limit-only
+// routing, so they share a phase — but they have separate boundaries here, because the
+// regular session's open and close sit between them.
 type Boundaries struct {
-	// PreMarketOpen is when pre-market coverage begins. It is zero when pre-market
-	// is disabled, and zero is the only signal PhaseAt needs: a session with no
-	// pre-market mark is simply closed until its open, exactly as before.
-	PreMarketOpen time.Time
-	Open          time.Time
-	FirstHourEnd  time.Time
-	// EntryWindowEnd is the last moment a new position may be opened. Screening
-	// continues after it — the page still shows what is setting up — but nothing is
-	// bought. It is the earlier of `open + entry_window` and
+	// ExtendedOpen is when pre-market coverage begins and ExtendedClose is when
+	// post-market coverage ends. Either is zero when that half does not exist — the
+	// section is off, or the configured clock does not leave room for it — and zero is
+	// the only signal PhaseAt needs: a session with no extended mark is simply closed
+	// on that side of the bell, exactly as before.
+	ExtendedOpen time.Time
+	Open         time.Time
+	FirstHourEnd time.Time
+	// EntryWindowEnd is the last moment a new position may be opened in the regular
+	// session. Screening continues after it — the page still shows what is setting up —
+	// but nothing is bought. It is the earlier of `open + entry_window` and
 	// `EODExit − entry_cutoff_buffer`, so a short session tightens it rather than
 	// letting an entry land on top of the forced exit.
 	EntryWindowEnd time.Time
 	EODExit        time.Time
 	Close          time.Time
+	// PostEntryEnd and PostEODExit are the post-market session's own copies of
+	// EntryWindowEnd and EODExit, derived from ExtendedClose the same way those are
+	// derived from Close. The forced exit runs twice a day because the book has to be
+	// flat twice: once before the regular close, and again before the extended one, so
+	// nothing bought at 17:00 is carried overnight.
+	PostEntryEnd  time.Time
+	PostEODExit   time.Time
+	ExtendedClose time.Time
 }
 
-// preMarketOpen resolves the configured pre-market start against a session's own
-// date, or reports false when there is no pre-market to enter.
-//
-// The start is clamped against the session's real open rather than the usual 09:30,
-// so a day the exchange opens late cannot end up with a "pre-market" that overlaps
-// the regular session. A start that does not parse is treated as no pre-market:
-// config validation rejects it at start-up, and a running daemon reaching here with
-// a bad value should scan less, never scan at the wrong time.
-func preMarketOpen(s Session, cfg *config.Config) (time.Time, bool) {
-	if !cfg.PreMarket.Enabled || s.Open.IsZero() {
-		return time.Time{}, false
-	}
-	hour, minute, err := cfg.PreMarket.StartClock()
+// clockOn resolves an "HH:MM" exchange time against a session's own date.
+func clockOn(s Session, clock func() (int, int, error)) (time.Time, bool) {
+	hour, minute, err := clock()
 	if err != nil {
 		return time.Time{}, false
 	}
-	open := s.Open.In(ET)
-	start := time.Date(open.Year(), open.Month(), open.Day(), hour, minute, 0, 0, ET)
-	if !start.Before(s.Open) {
-		return time.Time{}, false
+	day := s.Open.In(ET)
+	return time.Date(day.Year(), day.Month(), day.Day(), hour, minute, 0, 0, ET), true
+}
+
+// extendedBounds resolves the configured extended-hours clocks against a session's
+// own date, filling in the post-market session's entry and forced-exit marks.
+//
+// Each half is clamped against the session's real open or close rather than the usual
+// 09:30 and 16:00, so a day the exchange opens late or closes early cannot end up with
+// an "extended" window that overlaps the regular session. A clock that does not parse
+// is treated as that half not existing: config validation rejects it at start-up, and
+// a running daemon reaching here with a bad value should scan less, never scan at the
+// wrong time.
+//
+// The post-market half additionally has to leave room for its own forced exit. A
+// configured end within exit.eod_exit_offset_minutes of the close would otherwise
+// produce a post-market session that is nothing but a flattening window, which reads
+// as the feature half-working; there is simply no post-market on such a day.
+func extendedBounds(s Session, cfg *config.Config, b *Boundaries) {
+	if !cfg.Extended.Enabled || s.Open.IsZero() || s.Close.IsZero() {
+		return
 	}
-	return start, true
+	if start, ok := clockOn(s, cfg.Extended.StartClock); ok && start.Before(s.Open) {
+		b.ExtendedOpen = start
+	}
+	end, ok := clockOn(s, cfg.Extended.EndClock)
+	if !ok {
+		return
+	}
+	eod := time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute
+	if !end.Add(-eod).After(s.Close) {
+		return
+	}
+	b.ExtendedClose = end
+	b.PostEODExit = end.Add(-eod)
+	b.PostEntryEnd = b.PostEODExit.Add(-cfg.Timing.EntryCutoffBuffer)
+	// A buffer wider than the post-market session leaves no entry window at all
+	// rather than a window running backwards.
+	if b.PostEntryEnd.Before(s.Close) {
+		b.PostEntryEnd = s.Close
+	}
 }
 
 // Bounds derives the session's decision points from config.
@@ -110,9 +150,7 @@ func Bounds(s Session, cfg *config.Config) Boundaries {
 	if b.EntryWindowEnd.Before(b.Open) {
 		b.EntryWindowEnd = b.Open
 	}
-	if start, ok := preMarketOpen(s, cfg); ok {
-		b.PreMarketOpen = start
-	}
+	extendedBounds(s, cfg, &b)
 	return b
 }
 
@@ -124,26 +162,73 @@ func Bounds(s Session, cfg *config.Config) Boundaries {
 // completing the sentiment poll, and entering trades with less than the normal
 // runway was never the intent.
 //
-// Pre-market only ever occupies time that used to be PhaseClosed, and only when
-// PreMarketOpen is set. Everything from the opening bell onwards is untouched, and
-// after the close the day is closed again — the post-market session is deliberately
-// not covered, because the forced end-of-day exit has already flattened the book.
+// Extended hours only ever occupy time that used to be PhaseClosed, and only when the
+// corresponding mark is set. Everything between the bells is untouched. After the
+// close the day runs a second EOD window and then closes for good, so a position
+// opened post-market is flattened before the extended close rather than carried
+// overnight — the book has to be flat at the end of the day the agent traded, and
+// post-market is part of that day.
 func PhaseAt(now time.Time, b Boundaries) domain.Phase {
 	switch {
-	case !now.Before(b.Close):
-		return domain.PhaseClosed
 	case now.Before(b.Open):
-		if b.PreMarketOpen.IsZero() || now.Before(b.PreMarketOpen) {
+		if b.ExtendedOpen.IsZero() || now.Before(b.ExtendedOpen) {
 			return domain.PhaseClosed
 		}
-		return domain.PhasePreMarket
-	case !now.Before(b.EODExit):
-		return domain.PhaseEODWindow
-	case now.Before(b.FirstHourEnd):
-		return domain.PhaseFirstHour
+		return domain.PhaseExtended
+	case now.Before(b.Close):
+		switch {
+		case !now.Before(b.EODExit):
+			return domain.PhaseEODWindow
+		case now.Before(b.FirstHourEnd):
+			return domain.PhaseFirstHour
+		default:
+			return domain.PhaseTrading
+		}
 	default:
-		return domain.PhaseTrading
+		if b.ExtendedClose.IsZero() || !now.Before(b.ExtendedClose) {
+			return domain.PhaseClosed
+		}
+		if !now.Before(b.PostEODExit) {
+			return domain.PhaseEODWindow
+		}
+		return domain.PhaseExtended
 	}
+}
+
+// ExtendedHours reports whether an order placed at this instant has to be routed to
+// the extended-hours book.
+//
+// Derived from the phase rather than from the bells alone, so it cannot claim an
+// extended session the agent is not actually in. It is true for both halves of
+// PhaseExtended and for the post-market forced-exit window, which trades on the same
+// book as the session it is flattening.
+func ExtendedHours(now time.Time, b Boundaries) bool {
+	switch PhaseAt(now, b) {
+	case domain.PhaseExtended:
+		return true
+	case domain.PhaseEODWindow:
+		return !now.Before(b.Close)
+	default:
+		return false
+	}
+}
+
+// ExtendedStart is where an extended-hours pass measures its session's volume and
+// reads its chart from: the pre-market open before the bell, the regular close after
+// it. Zero outside extended hours, which is also where no caller reads it.
+func ExtendedStart(now time.Time, b Boundaries) time.Time {
+	if now.Before(b.Open) {
+		return b.ExtendedOpen
+	}
+	return b.Close
+}
+
+// BeforeTheBell distinguishes the two halves of PhaseExtended. They share a phase and
+// every threshold, but not their sentiment authority — a live read before the open,
+// the day's resolved gate after the close — and a watchlist from one must never be
+// acted on in the other.
+func BeforeTheBell(now time.Time, b Boundaries) bool {
+	return now.Before(b.Open)
 }
 
 // SessionDate formats an instant as the ET calendar date used to key a session.

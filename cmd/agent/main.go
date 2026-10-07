@@ -106,24 +106,39 @@ func run() error {
 			"sentiment_window", cfg.Timing.SentimentWindow,
 			"scan_interval", cfg.Timing.ScreenerScanInterval)
 
-		// Pre-market cannot be compressed the way the rest is: its start is a wall
-		// clock time in exchange hours, not an offset from the open. So it is moved to
-		// just before now instead, and seedFake pushes the simulated open a little into
-		// the future — which is what makes the demo start in PRE_MARKET and walk
-		// through the new state rather than skipping straight past it. "Just before"
-		// is the length of DEMO's seeded chart: the setup is read on closed candles
-		// only, so the chart has to have finished by the time the demo starts. Left
-		// alone when the config has pre-market off, so the switch still means
-		// something offline.
-		if cfg.PreMarket.Enabled {
-			cfg.PreMarket.Start = time.Now().Add(-offlineChartLen * cfg.Entry.PatternInterval).
+		// The quiet time before the forced exit is a regular-session number: 30 minutes
+		// against a 20-minute simulated session leaves no entry window at all, in
+		// either the regular or the post-market half. Compressed along with everything
+		// else so the demo actually buys something.
+		cfg.Timing.EntryCutoffBuffer = time.Minute
+
+		// Extended hours cannot be compressed the way the rest is: their start and end
+		// are wall-clock times in exchange hours, not offsets from the bells. So the
+		// start is moved to just before now instead, and seedFake pushes the simulated
+		// open a little into the future — which is what makes the demo start in
+		// EXTENDED_MARKET and walk through the state rather than skipping straight past
+		// it. "Just before" is the length of DEMO's seeded chart: the setup is read on
+		// closed candles only, so the chart has to have finished by the time the demo
+		// starts. The end is pulled back to just after the simulated close for the same
+		// reason in the other direction — at 20:00 ET the demo would sit in
+		// EXTENDED_MARKET for hours instead of reaching MARKET_CLOSED. Left alone when
+		// the config has extended hours off, so the switch still means something
+		// offline.
+		now := time.Now()
+		if cfg.Extended.Enabled {
+			_, simClose := offlineSession(now, cfg)
+			cfg.Extended.Start = now.Add(-offlineChartLen * cfg.Entry.PatternInterval).
 				In(scheduler.ET).Format("15:04")
-			cfg.PreMarket.ScanInterval = 5 * time.Second
-			logger.Warn("offline mode: pre-market opened at the current clock time",
-				"start", cfg.PreMarket.Start, "scan_interval", cfg.PreMarket.ScanInterval)
+			cfg.Extended.End = simClose.
+				Add(time.Duration(cfg.Exit.EODExitOffsetMins)*time.Minute + offlinePostMarketTail).
+				In(scheduler.ET).Format("15:04")
+			cfg.Extended.ScanInterval = 5 * time.Second
+			logger.Warn("offline mode: extended hours compressed around the simulated session",
+				"start", cfg.Extended.Start, "end", cfg.Extended.End,
+				"scan_interval", cfg.Extended.ScanInterval)
 		}
 
-		fake := seedFake(time.Now(), cfg)
+		fake := seedFake(now, cfg)
 		data, trading = fake, fake
 	} else {
 		secrets, err := config.LoadSecrets()
@@ -325,23 +340,38 @@ func isCleanShutdown(err error) bool {
 // offlineChartLen is how many candles broker.Fake.SetSetupBars seeds.
 const offlineChartLen = 16
 
+// offlinePostMarketTail is how much observable post-market screening the demo gets
+// before its second forced exit starts. The simulated extended close is this plus the
+// forced-exit offset after the simulated close, derived rather than written down: a
+// post-market session shorter than that offset leaves no room for its own flattening
+// window, and scheduler.Bounds then reports no post-market at all — which is how the
+// first version of this demo silently skipped the state it was added to show.
+const offlinePostMarketTail = 5 * time.Minute
+
+// offlineSession is the compressed trading day offline mode simulates.
+//
+// Anchored to now rather than 09:30-16:00 so offline mode is demonstrable whatever the
+// wall clock says. With the compressed timings the caller sets, this yields a ~30s
+// sentiment window, a few minutes of trading, then the EOD window.
+//
+// The open is pushed forward when extended hours are on, so the demo opens in
+// EXTENDED_MARKET and the state is actually observable; the caller has already moved
+// the extended start to now, and the extended end to just past the close, for the same
+// reason. It is a function rather than two lines inside seedFake because the caller
+// needs the close to derive that end.
+func offlineSession(now time.Time, cfg *config.Config) (open, close time.Time) {
+	open = now
+	if cfg.Extended.Enabled {
+		open = now.Add(90 * time.Second)
+	}
+	return open, open.Add(20 * time.Minute)
+}
+
 // seedFake builds an offline broker with a plausible session and one candidate
 // that clears every screening criterion, so the daemon and its page can be
 // exercised end to end without credentials.
 func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
-	// Anchored to now rather than 09:30-16:00 so offline mode is demonstrable
-	// whatever the wall clock says. With the compressed timings set by the caller
-	// this yields a ~30s sentiment window, ~4.5 minutes of trading, then the EOD
-	// window.
-	//
-	// The open is pushed forward when pre-market is on, so the demo opens in
-	// PRE_MARKET and the new state is actually observable; the caller has already
-	// moved the pre-market start to now for the same reason.
-	open := now
-	if cfg.PreMarket.Enabled {
-		open = now.Add(90 * time.Second)
-	}
-	close := open.Add(20 * time.Minute)
+	open, close := offlineSession(now, cfg)
 
 	fake := broker.NewFake(domain.Account{
 		PortfolioValue: 100_000, Cash: 100_000, Equity: 100_000,
@@ -366,9 +396,10 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	// A handful of symbols standing in for the tradable universe: one qualifies, one
 	// fails on news only, and one never clears the move threshold — so the screening
 	// table shows each outcome.
-	// Pre-market volume is a separate reading from the snapshot's, because before the
-	// bell the snapshot has none — see broker.SessionVolumes. Seeding it is what makes
-	// the demo's pre-market phase show a candidate table rather than an empty one.
+	// Extended-hours volume is a separate reading from the snapshot's, because before
+	// the bell the snapshot has none and after the close it has the whole day's — see
+	// broker.SessionVolumes. Seeding it is what makes the demo's extended phases show a
+	// candidate table rather than an empty one.
 	fake.SetSnapshot("FLAT", 10.00, 9.95, 800_000)
 	fake.SetSessionVolume("FLAT", 400_000)
 	fake.SetAverageVolume("FLAT", 750_000)
@@ -379,11 +410,11 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	fake.SetNews("DEMO", 2)
 	// Clearing the screen is no longer enough to be bought: the chart has to print a
 	// pullback and resumption. DEMO gets one, so the demo reaches an actual entry. It
-	// has closed by now: pre-market was opened one chart's length ago for it. With
-	// pre-market off it starts at the open and is only complete once that many
+	// has closed by now: the extended session was opened one chart's length ago for it.
+	// With extended hours off it starts at the open and is only complete once that many
 	// candles have passed.
 	chartStart := open
-	if cfg.PreMarket.Enabled {
+	if cfg.Extended.Enabled {
 		chartStart = now.Add(-offlineChartLen * cfg.Entry.PatternInterval).Truncate(cfg.Entry.PatternInterval)
 	}
 	fake.SetSetupBars("DEMO", 4.56, chartStart, cfg.Entry.PatternInterval)

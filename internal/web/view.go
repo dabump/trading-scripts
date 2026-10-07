@@ -29,22 +29,31 @@ type LegendEntry struct {
 // but carry different icons and labels, because docs/web-ui.md requires them to
 // be distinguishable without relying on colour alone.
 //
-// PRE_MARKET has a tone of its own — orange, between the grey of a closed market and
-// the green of a trading one — because it is neither: the agent is working, but on a
-// session where the sentiment gate has not run and, by default, nothing is bought.
-// Showing it as MARKET_CLOSED would misreport a scanning agent as idle, and as
-// SCREENING would imply entries that are not happening.
+// EXTENDED_MARKET has a tone of its own — orange, between the grey of a closed market
+// and the green of a trading one — because it is neither: the agent is working, but on
+// a tape the regular market is not trading on. Showing it as MARKET_CLOSED would
+// misreport a scanning agent as idle, and as SCREENING would imply the regular
+// session's thresholds and, by default, entries that are not happening.
 //
 // The cadences and window lengths come from config for the same reason the strategy
 // panel does: they are tunable, and a legend that says "every 10 minutes" while the
 // agent polls every two describes a different daemon than the one running. Durations
-// print through durationText so a tuned value reads the way it was written.
-func legendFor(cfg *config.Config) []LegendEntry {
+// print through durationText so a tuned value reads the way it was written. The
+// extended-hours times arrive the same way, via extendedWindowText, so the legend
+// states the hours the agent is actually covering rather than the standard ones.
+func legendFor(cfg *config.Config, extendedWindows string) []LegendEntry {
+	extended := "Extended-hours session. Screening the thin tape on its own thresholds; " +
+		"before the bell the sentiment gate has not run yet."
+	if extendedWindows != "" {
+		extended = "Extended-hours session, " + extendedWindows +
+			". Screening the thin tape on its own thresholds; before the bell the " +
+			"sentiment gate has not run yet."
+	}
 	return []LegendEntry{
 		{State: domain.StateMarketClosed, Tone: "idle", Icon: "○",
 			Meaning: "Outside exchange hours. Waiting for the next open."},
-		{State: domain.StatePreMarket, Tone: "pre", Icon: "◔",
-			Meaning: "Pre-market session. Screening the early tape; the sentiment gate has not run yet."},
+		{State: domain.StateExtendedMarket, Tone: "pre", Icon: "◔",
+			Meaning: extended},
 		{State: domain.StateSentimentCheck, Tone: "warn", Icon: "◐",
 			Meaning: "First " + durationText(cfg.Timing.SentimentWindow) +
 				" after the open. Polling market sentiment every " +
@@ -54,7 +63,10 @@ func legendFor(cfg *config.Config) []LegendEntry {
 				durationText(cfg.Timing.ScreenerScanInterval) + "."},
 		{State: domain.StateEODWindow, Tone: "warn", Icon: "◑",
 			Meaning: "Final " + durationText(time.Duration(cfg.Exit.EODExitOffsetMins)*time.Minute) +
-				" before the close. Flattening all positions; no new entries."},
+				" before the close" + map[bool]string{
+				true:  ", and again before the extended close",
+				false: "",
+			}[cfg.Extended.Enabled] + ". Flattening all positions; no new entries."},
 		{State: domain.StateHaltedBearish, Tone: "bad", Icon: "■",
 			Meaning: "Sentiment was overwhelmingly bearish. Halted for the rest of the session."},
 		{State: domain.StateError, Tone: "bad", Icon: "▲",
@@ -149,16 +161,20 @@ type View struct {
 	SessionDate string
 
 	MarketOpen bool
-	// PreMarket is true during the pre-market session. MarketOpen stays false then —
-	// the regular market genuinely is not open — so anything keyed on "is the agent
-	// live" has to read both.
-	PreMarket   bool
-	MarketLabel string
-	// ExchangeTone drives the exchange badge's colour: green open, orange pre-market,
-	// red closed. Computed here rather than in the template so the three-way choice
-	// is not an if/else chain inside markup.
+	// ExtendedMarket is true during either extended-hours session. MarketOpen stays
+	// false then — the regular market genuinely is not open — so anything keyed on "is
+	// the agent live" has to read both.
+	ExtendedMarket bool
+	MarketLabel    string
+	// ExchangeTone drives the exchange badge's colour: green open, orange extended
+	// hours, red closed. Computed here rather than in the template so the three-way
+	// choice is not an if/else chain inside markup.
 	ExchangeTone string
 	SessionText  string
+	// ExtendedText is the two extended-hours windows, as "04:00 – 09:30 and
+	// 16:00 – 20:00 ET", or empty when the section is off. Shown next to SessionText so
+	// the hours the agent covers are on the page rather than only in the config file.
+	ExtendedText string
 	EarlyClose   bool
 	// Countdown is "closes in 4h 12m" while open, or "opens in 15h 42m" while closed.
 	// Empty when the next boundary is not known — after the close with a failed
@@ -345,13 +361,15 @@ func BuildView(
 	closedOn string,
 ) (*View, error) {
 	date := scheduler.SessionDate(now)
+	extendedWindows := extendedWindowText(cfg, sess, tradingDay)
 	v := &View{
-		GeneratedAt: now.In(scheduler.ET).Format("15:04:05 MST"),
-		SessionDate: date,
-		State:       state,
-		Legend:      legendFor(cfg),
-		PollSeconds: int(cfg.Web.PollInterval.Seconds()),
-		PaperMode:   paperMode,
+		GeneratedAt:  now.In(scheduler.ET).Format("15:04:05 MST"),
+		SessionDate:  date,
+		State:        state,
+		Legend:       legendFor(cfg, extendedWindows),
+		ExtendedText: extendedWindows,
+		PollSeconds:  int(cfg.Web.PollInterval.Seconds()),
+		PaperMode:    paperMode,
 	}
 	if v.PollSeconds < 1 {
 		v.PollSeconds = 12
@@ -378,12 +396,19 @@ func BuildView(
 	} else {
 		v.SessionText = "no session today"
 	}
-	v.PreMarket = tradingDay && scheduler.PhaseAt(now, bounds) == domain.PhasePreMarket
+	v.ExtendedMarket = tradingDay && scheduler.PhaseAt(now, bounds) == domain.PhaseExtended
 	switch {
 	case v.MarketOpen:
 		v.MarketLabel, v.ExchangeTone = "OPEN", "good"
-	case v.PreMarket:
-		v.MarketLabel, v.ExchangeTone = "PRE-MARKET", "pre"
+	case v.ExtendedMarket:
+		// The badge names the exchange's own session rather than the agent's state, so
+		// it says which extended session is running. The agent state beside it is
+		// EXTENDED_MARKET for both, because nothing the agent does differs between them
+		// that a badge could usefully carry.
+		v.MarketLabel, v.ExchangeTone = "POST-MARKET", "pre"
+		if scheduler.BeforeTheBell(now, bounds) {
+			v.MarketLabel = "PRE-MARKET"
+		}
 	default:
 		v.MarketLabel, v.ExchangeTone = "CLOSED", "bad"
 	}
@@ -660,6 +685,27 @@ func adjacentClosedDays(days []string, shown, today string) (prev, next string) 
 	return prev, next
 }
 
+// extendedWindowText states the two extended-hours windows the agent covers, as
+// "04:00 – 09:30 and 16:00 – 20:00 ET". Empty when the section is off, which is what
+// keeps the legend and the session line from advertising hours nothing is scanning.
+//
+// The outer bounds come from config and the inner ones from the session the calendar
+// reported, so an early close is reflected rather than papered over with 16:00. With no
+// session today there is nothing to read, and the standard bells stand in — the page
+// says "no session today" next to it, so the figures read as the usual hours rather
+// than as today's.
+func extendedWindowText(cfg *config.Config, sess scheduler.Session, tradingDay bool) string {
+	if !cfg.Extended.Enabled {
+		return ""
+	}
+	open, close := "09:30", "16:00"
+	if tradingDay {
+		open = sess.Open.In(scheduler.ET).Format("15:04")
+		close = sess.Close.In(scheduler.ET).Format("15:04")
+	}
+	return fmt.Sprintf("%s – %s and %s – %s ET", cfg.Extended.Start, open, close, cfg.Extended.End)
+}
+
 // strategySections describes the running strategy from the loaded configuration.
 //
 // Everything here is derived from cfg. Values that the code computes rather than
@@ -737,62 +783,74 @@ func strategySections(cfg *config.Config) []StrategySection {
 		},
 	}
 
-	// Pre-market appears whether or not it is on, because "off" is the fact an
+	// Extended hours appear whether or not they are on, because "off" is the fact an
 	// operator most needs from this panel: it explains an empty 06:00 page without
 	// requiring them to go and read the config file.
-	preMarket := StrategySection{
-		Title: "2b · Pre-market",
-		Note: "The same three criteria, run before the opening bell against a much " +
-			"thinner tape — so two of the numbers they are measured against differ.",
+	extended := StrategySection{
+		Title: "2b · Extended hours",
+		Note: "The same three criteria, run before the opening bell and after the " +
+			"closing one against a much thinner tape — so two of the numbers they are " +
+			"measured against differ.",
 		Rows: []StrategyRow{{
 			Label: "Screening",
-			Value: map[bool]string{true: "enabled", false: "disabled"}[cfg.PreMarket.Enabled],
+			Value: map[bool]string{true: "enabled", false: "disabled"}[cfg.Extended.Enabled],
 			Note: map[bool]string{
-				true:  "the agent scans before the open and the page fills",
-				false: "the agent is idle until the opening bell",
-			}[cfg.PreMarket.Enabled],
+				true:  "the agent scans outside the bells and the page fills",
+				false: "the agent is idle until the opening bell and from the closing one",
+			}[cfg.Extended.Enabled],
 		}},
 	}
-	if cfg.PreMarket.Enabled {
-		preMarket.Rows = append(preMarket.Rows,
-			StrategyRow{Label: "Session start", Value: cfg.PreMarket.Start + " ET"},
+	if cfg.Extended.Enabled {
+		extended.Rows = append(extended.Rows,
+			StrategyRow{
+				Label: "Pre-market",
+				Value: cfg.Extended.Start + " ET – the open",
+				Note:  "the exchange's own pre-market session",
+			},
+			StrategyRow{
+				Label: "Post-market",
+				Value: "the close – " + cfg.Extended.End + " ET",
+				Note: "flattened " + durationText(time.Duration(cfg.Exit.EODExitOffsetMins)*time.Minute) +
+					" before it ends, so nothing is carried overnight",
+			},
 			StrategyRow{
 				Label: "Scan interval",
-				Value: durationText(cfg.PreMarket.ScanInterval),
+				Value: durationText(cfg.Extended.ScanInterval),
 				Note:  "slower than the regular cadence: one pass is ~130 requests",
 			},
 			StrategyRow{
 				Label: "Minimum traded",
-				Value: "$" + groupNumber(cfg.PreMarket.MinDollarVolume),
+				Value: "$" + groupNumber(cfg.Extended.MinDollarVolume),
 				Note: "replaces the regular $" + groupNumber(cfg.Screening.MinDollarVolume) +
-					" floor, which no pre-market tape clears",
+					" floor, which no extended-hours tape clears",
 			},
 			StrategyRow{
 				Label: "Relative volume",
-				Value: "≥ " + trimNumber(cfg.PreMarket.MinVolumeMultiple) + "x",
+				Value: "≥ " + trimNumber(cfg.Extended.MinVolumeMultiple) + "x",
 				Note: "against the same " + fmt.Sprintf("%d", cfg.Screening.AvgVolumeLookbackDays) +
 					"-session daily average, so a fraction of a day is a far higher bar than it looks",
 			},
 			StrategyRow{
 				Label: "Entries",
-				Value: map[bool]string{true: "allowed", false: "blocked"}[cfg.PreMarket.AllowEntry],
+				Value: map[bool]string{true: "allowed", false: "blocked"}[cfg.Extended.AllowEntry],
 				Note: map[bool]string{
-					true: "extended-hours limit orders, gated on a live sentiment read " +
-						"standing in for the first-hour gate",
-					false: "candidates are shown but nothing is bought before the bell",
-				}[cfg.PreMarket.AllowEntry],
+					true: "extended-hours limit orders — gated before the bell on a live " +
+						"sentiment read standing in for the first-hour gate, and after the " +
+						"close on that gate's own verdict",
+					false: "candidates are shown but nothing is bought outside the bells",
+				}[cfg.Extended.AllowEntry],
 			},
 		)
-		if cfg.PreMarket.AllowEntry {
+		if cfg.Extended.AllowEntry {
 			// Derived the way engine.submit derives it, including the fallback, so the
 			// panel cannot claim an allowance the orders are not actually priced off.
-			slip := cfg.PreMarket.LimitSlipPct
-			note := "pre-market spreads are wider; too tight and orders never fill"
+			slip := cfg.Extended.LimitSlipPct
+			note := "extended-hours spreads are wider; too tight and orders never fill"
 			if slip <= 0 {
 				slip = cfg.Execution.LimitSlipPct
 				note = "inherited from the regular session — " + note
 			}
-			preMarket.Rows = append(preMarket.Rows, StrategyRow{
+			extended.Rows = append(extended.Rows, StrategyRow{
 				Label: "Limit allowance", Value: pctOf(slip), Note: note,
 			})
 		}
@@ -949,7 +1007,7 @@ func strategySections(cfg *config.Config) []StrategySection {
 		},
 	}
 
-	return []StrategySection{gate, screening, preMarket, entry, exits}
+	return []StrategySection{gate, screening, extended, entry, exits}
 }
 
 // trimNumber renders a configured number exactly, dropping only trailing zeros.

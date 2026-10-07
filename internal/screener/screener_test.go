@@ -200,14 +200,14 @@ func TestThresholdsForPreMarket(t *testing.T) {
 	c := cfg()
 	c.Screening.MinDollarVolume = 1_000_000
 	c.Screening.MinVolumeMultiple = 5
-	c.PreMarket.MinDollarVolume = 100_000
-	c.PreMarket.MinVolumeMultiple = 0.5
+	c.Extended.MinDollarVolume = 100_000
+	c.Extended.MinVolumeMultiple = 0.5
 
 	regular := ThresholdsFor(c, false)
 	pre := ThresholdsFor(c, true)
 
-	if regular.PreMarket || !pre.PreMarket {
-		t.Errorf("PreMarket flags = %v / %v, want false / true", regular.PreMarket, pre.PreMarket)
+	if regular.Extended || !pre.Extended {
+		t.Errorf("PreMarket flags = %v / %v, want false / true", regular.Extended, pre.Extended)
 	}
 	if regular.MinDollarVolume != 1_000_000 || regular.MinVolumeMultiple != 5 {
 		t.Errorf("regular thresholds = $%v / %vx, want the screening.* values",
@@ -233,8 +233,8 @@ func TestPreMarketThresholdsAdmitTheEarlyTape(t *testing.T) {
 	c.Screening.MaxPrice = 20
 	c.Screening.MinDollarVolume = 1_000_000
 	c.Screening.MinVolumeMultiple = 5
-	c.PreMarket.MinDollarVolume = 100_000
-	c.PreMarket.MinVolumeMultiple = 0.5
+	c.Extended.MinDollarVolume = 100_000
+	c.Extended.MinVolumeMultiple = 0.5
 
 	in := Input{Symbol: "EARLY", Price: 5, IntradayPct: 22,
 		TodayVolume: 800_000, AvgVolume: 1_000_000, NewsCount: 1}

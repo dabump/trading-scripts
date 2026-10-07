@@ -199,15 +199,16 @@ timing:
   # to 09:35 is still not tradeable, which is a real cost and a deliberate one.
   sentiment_window: 5m
   # New positions are only opened in this window after the open; positions already
-  # held are still managed to the close. 5h30m from a 09:30 open puts the last entry
-  # at 15:00, comfortably ahead of the 15:55 forced exit — at the current
-  # eod_exit_offset_minutes this window binds well before the buffer below does.
+  # held are still managed to the close. 5h55m from a 09:30 open reaches 15:25, which
+  # is exactly where entry_cutoff_buffer puts the last entry ahead of the 15:55 forced
+  # exit — so this covers the whole regular session the buffer allows and the buffer
+  # below is the rule that binds. A longer value changes nothing: Bounds clamps it.
   #
   # Measured caveat, recorded in docs/decisions.md: on the backtested year, later
   # entries were worse. A 2h window ended at $8,871 against 4h at $7,162 and all-day
-  # at $5,582 (t = -4.24). This value trades that away for more opportunity, which is
-  # a deliberate choice and not a measured improvement.
-  entry_window: 5h30m
+  # at $5,582 (t = -4.24). This value trades that away for the full session's
+  # opportunity, which is a deliberate choice and not a measured improvement.
+  entry_window: 5h55m
   # Quiet time between the last entry and the forced exit, so nothing is bought that
   # is about to be sold. Enforced against the forced-exit mark rather than assumed
   # from entry_window, so an early close tightens the window instead of collapsing

@@ -71,7 +71,7 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `exit.candle_trail_bars` | unset (1) | the stop goes under the lowest low of this many completed trail candles |
 | `timing.sentiment_poll_interval` | 2m | `strategy.md` §1 — tightened with the shorter gate window |
 | `timing.sentiment_window` | 5m | `strategy.md` §1 — shortened from 1h so the opening range is tradeable |
-| `timing.entry_window` | 5h30m | `strategy.md` §3 — from a 09:30 open the last entry is 15:00; validated longer than `sentiment_window` |
+| `timing.entry_window` | 5h55m | `strategy.md` §3 — from a 09:30 open it reaches 15:25, where `entry_cutoff_buffer` already puts the last entry, so the buffer is what binds; validated longer than `sentiment_window` |
 | `timing.entry_cutoff_buffer` | 30m | `strategy.md` §3 — quiet time before the forced exit, enforced against the close so a half day tightens the window rather than collapsing the gap |
 | `timing.screener_scan_interval` | 1m | `strategy.md` §2 |
 | `timing.position_poll_interval` | 2s | **PROPOSED** — how often open positions are re-marked (also the engine tick interval) |

@@ -196,14 +196,20 @@ binds on every trade and sizing silently reverts to a fixed fraction.
 
 New positions are only opened while **both** of these hold:
 
-- it is within `timing.entry_window` of the open — 5h30m, so from a 09:30 open the last entry is **15:00**; and
-- it is at least `timing.entry_cutoff_buffer` (30m) before the forced end-of-day exit.
+- it is within `timing.entry_window` of the open — 5h55m, which from a 09:30 open reaches **15:25**; and
+- it is at least `timing.entry_cutoff_buffer` (30m) before the forced end-of-day exit — 15:25, from the 15:55 exit.
 
 The second is not arithmetic on the first, and it matters on a short session: the entry
 window is measured from the open while the forced exit is measured from the close, so on
 a half day (13:00 close, 12:30 forced exit) the buffer becomes the binding limit and the
 last entry moves back to 12:00. Capping at the forced exit alone would let an early close
 open a position a minute before it had to be liquidated.
+
+On a full session the two now coincide by construction, so the buffer is the rule that
+decides and `entry_window` no longer shortens the day on its own. Raising it further
+changes nothing — `scheduler.Bounds` clamps to the cutoff either way. The part of the
+session still not tradeable is the other end: `timing.sentiment_window` (5m) means
+09:30–09:35 is the gate's, so buying runs 09:35–15:25 of a 09:30–16:00 session.
 
 **Screening continues after the window closes and the page keeps showing what is setting
 up** — an empty afternoon table would read as a broken scanner rather than a deliberate

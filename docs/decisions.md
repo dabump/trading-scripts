@@ -1460,6 +1460,36 @@ this time by `exit.breakeven_after_target` rather than by a trailing stop.
   above the entry on a scaled winner — printing only that made a won trade look like
   a stop placed above its own entry.
 
+## 2026-10-08 — The entry window now runs to the cutoff buffer
+
+`timing.entry_window` was 5h30m, which from a 09:30 open put the last entry at **15:00**
+— an hour before the close and 25 minutes before `entry_cutoff_buffer` would have
+stopped it anyway. Raised to **5h55m**, so the last entry is **15:25** and the buffer is
+the rule that decides. Nothing else moved.
+
+| Mark | Was | Now | From |
+| --- | --- | --- | --- |
+| First entry | 09:35 | 09:35 | `timing.sentiment_window` (5m) — the gate owns 09:30–09:35 |
+| Last entry | 15:00 | **15:25** | `entry_window`, then clamped by `entry_cutoff_buffer` |
+| Forced exit | 15:55 | 15:55 | `exit.eod_exit_offset_minutes` (5) |
+
+This settles what the 2026-09-29 pass above left half-done: moving
+`eod_exit_offset_minutes` 30 → 5 pushed the forced exit to 15:55 and left
+`entry_cutoff_buffer` binding on nothing, so the session lost its last 55 minutes of
+entries to a number measured against a 15:30 exit. The two limits now coincide on a full
+session by construction, and a larger `entry_window` would change nothing —
+`scheduler.Bounds` clamps to the cutoff either way. On a half day the buffer still wins,
+which is the case the test in `internal/scheduler` covers; that test sets its own values
+and is unaffected.
+
+**Against the measurement, deliberately.** The entry-window sweep is the clearest
+negative result in this file: 2h ended at $8,871, 4h at $7,162, all-day at $5,582
+(t = −4.24). 5h30m was already most of the way into that, and this goes the rest of the
+way for the sake of covering the session the exchange is actually open. `cmd/backtest
+-grid` still sweeps the window (`reportEntryWindow`), so the cost of this is measurable
+at any time, and shortening the window is the first thing to try if the session's later
+entries turn out to cost what the sweep says they do.
+
 ## Open items (not yet decided)
 
 - **Why the corrected pause rule adds 14 trades a year the old one never took.** They average −0.98% against the kept trades' +0.16% and are most of the fix's measured cost. The suspected cause is `microPause`'s walk-back stopping at the first non-qualifying candle, so a too-long pullback now reads as a short one. Verify before tuning anything else on the entry side.

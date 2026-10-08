@@ -1481,6 +1481,16 @@ backtest cannot check is the one the whole comparison turns on.
 | `screening.max_price` | 20.0 | **10.0** | "liquid stocks under $10" |
 | `entry.min_stop_distance_pct` | 0.5 | **0.05** | the stop is the edge — "tight risk … lets me size up" |
 
+**2026-10-08: `exit.candle_trail` is back to `after_target` on this branch**, on
+request. With the trail off, the runner's only exits were the breakeven stop and the
+bell, so a runner that went well into profit and came all the way back gave up the
+whole move — the giveback this log keeps measuring (MFE far above the realised mean).
+The one-year comparison above has `after_target` within noise of `off`, so this is a
+choice about the runner's behaviour on paper, not a measured improvement.
+`TestAfterTargetTrailsTheRunnerUpAndSellsIt` drives the shipped exit end to end: 12¢
+target, 75% sold, breakeven, then the stop and the broker's resting order climbing
+candle by candle until a new low sells the runner.
+
 Deliberately not changed: `max_retrace_pct` (the article says only "shallow"),
 `max_stop_distance_pct` (silent), the sizing, concurrency and EOD rules (silent),
 and the screen itself — that page describes the pattern, not the scanner. "Not after

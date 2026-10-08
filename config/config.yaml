@@ -202,7 +202,7 @@ exit:
   # candle's low, by raising the stop to each completed candle's low. off |
   # after_target (the runner only) | always (from the entry candle). See
   # docs/decisions.md for how each measured.
-  candle_trail: off # the rest is held for the next breakout level, not trailed
+  candle_trail: after_target # the runner is trailed on each completed candle's low once the target is banked
 
 timing:
   sentiment_poll_interval: 2m # docs/strategy.md §1

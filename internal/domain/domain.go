@@ -8,11 +8,18 @@ type AgentState string
 
 const (
 	StateMarketClosed AgentState = "MARKET_CLOSED"
-	// StatePreMarket is the 04:00-09:30 ET session, when the agent is scanning but
-	// the regular market has not opened. It is distinct from MARKET_CLOSED because
-	// the agent is doing work — and distinct from SCREENING because the sentiment
-	// gate has not run and, unless premarket.allow_entry is set, nothing is bought.
-	StatePreMarket      AgentState = "PRE_MARKET"
+	// StateExtendedMarket covers both extended-hours sessions — 04:00 to the opening
+	// bell, and the closing bell to 20:00 — when the agent is scanning a tape the
+	// regular market is not trading on. It is distinct from MARKET_CLOSED because the
+	// agent is doing work, and distinct from SCREENING because the thresholds are the
+	// extended ones and, unless extended.allow_entry is set, nothing is bought.
+	//
+	// One state rather than two: the two halves of the day differ in where their
+	// sentiment authority comes from (a live read before the bell, the day's resolved
+	// gate after it) but not in anything an operator reads off a badge. What they do
+	// share is the part that matters — a thin book, limit-only routing, and screening
+	// numbers that are not the regular session's.
+	StateExtendedMarket AgentState = "EXTENDED_MARKET"
 	StateSentimentCheck AgentState = "SENTIMENT_CHECK"
 	StateScreening      AgentState = "SCREENING"
 	StateHaltedBearish  AgentState = "HALTED_BEARISH"
@@ -24,12 +31,12 @@ const (
 // agent decided to do about it.
 type Phase int
 
-// The values are in chronological order through the day, which is the order
-// scheduler.PhaseAt tests them in. Nothing compares them ordinally, so inserting
-// PhasePreMarket in its rightful place is safe.
+// Nothing compares these ordinally, which is what lets PhaseExtended and
+// PhaseEODWindow each occur twice in a day — extended hours before the bell and
+// after it, the forced exit before the close and again before the extended close.
 const (
 	PhaseClosed Phase = iota
-	PhasePreMarket
+	PhaseExtended
 	PhaseFirstHour
 	PhaseTrading
 	PhaseEODWindow

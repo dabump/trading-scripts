@@ -462,7 +462,7 @@ setInterval(refresh, POLL_MS);
 <header class="top">
   <div class="brand">
     <h1>Trading Agent</h1>
-    <span class="sub">{{.SessionDate}} · {{.SessionText}}{{if .EarlyClose}} · early close{{end}}</span>
+    <span class="sub">{{.SessionDate}} · {{.SessionText}}{{if .EarlyClose}} · early close{{end}}{{if .ExtendedText}} · extended {{.ExtendedText}}{{end}}</span>
   </div>
   <div class="badges">
     {{if .PaperMode}}<span class="paper-tag">paper</span>{{else}}<span class="paper-tag" style="color:var(--bad);border-color:var(--bad)">live</span>{{end}}

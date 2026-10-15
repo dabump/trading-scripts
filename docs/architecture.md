@@ -15,7 +15,7 @@ There is one Alpaca account/API key set used for both market data and order exec
 
 | Package | Responsibility |
 |---|---|
-| `scheduler` | Pure session arithmetic, including the countdowns the status page shows (`UntilOpen`, `UntilClose`, `FormatCountdown`): given the exchange's calendar day and config, reports which phase the clock is in (closed / pre-market / sentiment-gate window / trading / EOD window) and where the boundaries fall. Holds no state and does no I/O. |
+| `scheduler` | Pure session arithmetic, including the countdowns the status page shows (`UntilOpen`, `UntilClose`, `FormatCountdown`): given the exchange's calendar day and config, reports which phase the clock is in (closed / extended hours / sentiment-gate window / trading / EOD window) and where the boundaries fall. Two of those occur twice a day: extended hours before the open and after the close, and the EOD window before each of the two closes. Holds no state and does no I/O. |
 | `engine` | Drives the daily loop that `scheduler` describes, plus restart reconciliation. One `Tick` decides what is due, and every order is sent from it; there are no per-phase goroutines and no direct `time.Now()` calls (the clock is injected, which is what makes a whole day testable). The one exception to running inline is the screen: under `Run` it runs on a background goroutine and publishes a watchlist, so a pass that takes most of a minute no longer holds up the 2-second position checks or the per-candle setup check. A test calling `Tick` directly gets the screen inline. |
 | `config` | Loads and validates `config/config.yaml`, rejecting configurations that would only fail mid-session — for example sizing × concurrency exceeding 100% of the portfolio. Credentials are read from the environment here, never from YAML. |
 | `domain` | Shared types (positions, snapshots, evaluations, agent states). Exists to keep `store`, `broker`, `strategy`, `risk` and `web` from importing each other. |
@@ -32,10 +32,10 @@ There is one Alpaca account/API key set used for both market data and order exec
 ## Data flow (one trading day)
 
 ```
-scheduler: pre-market opens (premarket.start, only when premarket.enabled)
-  -> screener: find candidates, on pre-market thresholds and cadence
+scheduler: pre-market opens (extended.start, only when extended.enabled)
+  -> screener: find candidates, on extended thresholds and cadence
        -> store: record the pass; the page shows it with "why not bought" per row
-       (premarket.allow_entry only) live sentiment read -> not bearish
+       (extended.allow_entry only) live sentiment read -> not bearish
          -> strategy: setup on pre-market candles -> risk: size
               -> broker: extended-hours limit order -> store: record open position
   -> strategy: evaluate any pre-market position against the exit rules
@@ -52,6 +52,14 @@ scheduler: market opens
   -> strategy: continuously evaluate open positions against exit rules
        -> broker: place sell order -> store: close out position
   -> scheduler: force-exit any remaining open positions at T-30min-before-close
+scheduler: market closes; post-market opens (to extended.end)
+  -> screener: find candidates, on the same extended thresholds and cadence
+       -> store: record the pass; the page shows it with "why not bought" per row
+       (extended.allow_entry only) the day's resolved gate verdict -> not halted
+         -> strategy: setup on post-market candles -> risk: size
+              -> broker: extended-hours limit order -> store: record open position
+  -> strategy: evaluate any post-market position against the exit rules
+  -> scheduler: force-exit again before extended.end; the book is flat overnight
 ```
 
 `web` runs alongside this the whole time, independently reading `store` to render status — it never blocks or is blocked by the trading loop, and it makes no broker calls of its own: the loop persists each position's last mark, so the ~12s page poll costs nothing upstream. The account balance reaches the page the same way. The tick reads `broker.Account` at most every 10s (`accountRefresh`) and publishes the result on the engine (`engine.Account`, alongside `Session` and `NextSession`), so the figure is refreshed on a fixed cadence — bounded by the loop — rather than once per page poll by every open browser.
@@ -72,7 +80,9 @@ candle trail, scale-out — do not. Every path that sells it cancels the resting
 first, confirmed by looking the order up, because an order outliving its holding goes
 short. See [`web-ui.md`](./web-ui.md) and [`risk.md`](./risk.md) for the reasoning.
 
-Pre-market occupies time that was previously `PhaseClosed`, and only that time: everything from the opening bell onwards is unchanged, and with `premarket.enabled: false` the phase never occurs. Post-market is deliberately not covered — the forced exit has already flattened the book, manual positions included, and nothing is held overnight. A manual position opened pre-market is the one case where its stop is enforced on the tick rather than by the resting order: Alpaca accepts a stop order before the bell but will not trigger one until 09:30.
+Extended hours occupy time that was previously `PhaseClosed`, and only that time: everything between the bells is unchanged, and with `extended.enabled: false` the phase never occurs. **The three windows never overlap**, which matters because the extended thresholds are far looser than the regular ones (0.5x relative volume against 5x, a $100,000 turnover floor against $1,000,000) and the extended book takes only limit orders: an overlap in either direction would apply one session's rules to the other. `scheduler.Bounds` clamps each extended mark against the calendar's own open and close rather than a hardcoded 09:30/16:00, and drops a half whose configured clock would overlap rather than clamping it to the bell.
+
+Post-market was added on request (2026-10-08) and brought the forced exit with it: **the EOD window runs twice**, once before the regular close and again `exit.eod_exit_offset_minutes` before `extended.end`, so a position opened at 17:00 is flattened rather than carried overnight. That is what keeps `docs/risk.md`'s flat-overnight rule true now that the agent trades after the close. A manual or automated position held during either extended session is the case where its stop is enforced on the tick rather than by the resting order: Alpaca accepts a stop order outside the bells but will not trigger one there.
 
 On startup, before the loop begins, `engine.Reconcile` compares the broker's positions against the store: anything the broker holds that the store does not know about is adopted, anything the store thinks is open that the broker does not hold is closed as `RECONCILED` — unless it carried a resting stop order that filled, in which case that order's own fill price and `STOP_LOSS` are recorded instead of this morning's mark, which on a gap is a different number entirely — and orders recorded as submitted but never confirmed are resolved. This is what closes the crash-between-submit-and-confirm hole.
 

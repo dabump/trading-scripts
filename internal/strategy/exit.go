@@ -99,6 +99,9 @@ func EvaluateExit(in ExitInput, cfg *config.Config) ExitDecision {
 	// The first target, once, at a multiple of this trade's own initial risk.
 	if !p.TargetHit && p.InitialRisk > 0 {
 		target := p.EntryPrice + p.InitialRisk*cfg.Exit.FirstTargetR
+		if cfg.Exit.FirstTargetCents > 0 {
+			target = p.EntryPrice + cfg.Exit.FirstTargetCents
+		}
 		if atOrAbove(in.Price, target) {
 			shares := scaleShares(p.SharesOpen, cfg.Exit.FirstTargetFraction)
 			if shares > 0 {

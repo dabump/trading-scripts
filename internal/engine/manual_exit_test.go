@@ -328,8 +328,8 @@ func TestARefusedStopOrderLeavesTheEngineHoldingTheStop(t *testing.T) {
 // anything having to remember to place it.
 func TestAPreMarketManualOpenIsCoveredUntilTheBell(t *testing.T) {
 	h := newHarness(t)
-	h.enablePreMarket()
-	h.allowPreMarketEntry()
+	h.enableExtended()
+	h.allowExtendedEntry()
 	h.addScreenedOnly("HAND", 5.00)
 	h.at(8, 0)
 	h.tick()

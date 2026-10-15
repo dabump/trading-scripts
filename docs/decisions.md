@@ -1460,6 +1460,109 @@ this time by `exit.breakeven_after_target` rather than by a trailing stop.
   above the entry on a scaled winner — printing only that made a won trade look like
   a stop placed above its own entry.
 
+## 2026-10-06 — The textbook micro pullback, applied in full and measured
+
+On request, the micro pullback as described in a published pullback-trading
+article is applied in full on a test branch, to be paper-traded for several sessions. **The
+backtest does not support it**; it is on test because the one assumption the
+backtest cannot check is the one the whole comparison turns on.
+
+### What changed
+
+| Setting | Baseline | Here | The article's words |
+| --- | --- | --- | --- |
+| `entry.buy_stop_entry` | — | **true** | "I enter when the first 1-minute candle breaks its own high" |
+| `exit.first_target_cents` | — | **0.12** | "First target is the quick breakout — 10 to 15 cents" |
+| `exit.first_target_fraction` | 0.50 | **0.75** | "I usually sell 75% of my position into strength" |
+| `exit.candle_trail` | after_target | **off** | "hold the rest for the next breakout level" |
+| `entry.max_pullback_bars` | 2 | **3** | "usually just a 1–3 candle pause" |
+| `entry.require_volume_decline` | false | **true** | "Volume tapers off during the pullback" |
+| `screening.max_price` | 20.0 | **10.0** | "liquid stocks under $10" |
+| `entry.min_stop_distance_pct` | 0.5 | **0.05** | the stop is the edge — "tight risk … lets me size up" |
+
+**2026-10-08: `exit.candle_trail` is back to `after_target` on this branch**, on
+request. With the trail off, the runner's only exits were the breakeven stop and the
+bell, so a runner that went well into profit and came all the way back gave up the
+whole move — the giveback this log keeps measuring (MFE far above the realised mean).
+The one-year comparison above has `after_target` within noise of `off`, so this is a
+choice about the runner's behaviour on paper, not a measured improvement.
+`TestAfterTargetTrailsTheRunnerUpAndSellsIt` drives the shipped exit end to end: 12¢
+target, 75% sold, breakeven, then the stop and the broker's resting order climbing
+candle by candle until a new low sells the runner.
+
+Deliberately not changed: `max_retrace_pct` (the article says only "shallow"),
+`max_stop_distance_pct` (silent), the sizing, concurrency and EOD rules (silent),
+and the screen itself — that page describes the pattern, not the scanner. "Not after
+extended runs" is named as the top pitfall but never quantified, so it is not
+implementable as written.
+
+### The engine change this needed
+
+A buy-stop cannot be judged once per candle. `setupState` now carries an `armed` map:
+the chart is still read once per completed candle, but it produces an armed setup
+rather than a decision, and `CheckEntryPrice` is run against the live price on every
+tick until price breaks the pause high or the next candle re-arms it. That check
+would otherwise cost one snapshot request per armed symbol per tick — 30 a minute
+each, on a budget already near Alpaca's 200 — so armed symbols are read in **one
+batched snapshot per pass**. A fired buy-stop disarms before the order goes, so a
+slow fill cannot be entered twice.
+
+### What it measures
+
+A full year, 2025-10-06 → 2026-10-06, same candidate set, no slippage:
+
+| Variant | Trades | Win | Mean | t | Equity | maxDD |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline | 89 | 32.6% | −0.02% | −0.06 | **9,943** | 11.8% |
+| This variant, full | 168 | 32.1% | +0.05% | 0.17 | 9,890 | 15.1% |
+| Variant **entry** only | 176 | 32.4% | −0.26% | −1.04 | 8,511 | 23.5% |
+| Variant **exit** only | 86 | 41.9% | +0.62% | 1.50 | 11,704 | 7.3% |
+
+And across slippage, which is where the entry change really tells:
+
+| per side | Baseline | Full | Entry only | Exit only |
+| --- | --- | --- | --- | --- |
+| 0.00% | 9,943 | 9,890 | 8,511 | 11,704 |
+| 0.25% | 8,451 | 7,753 | 6,441 | 10,052 |
+| 0.50% | 7,721 | 6,431 | 5,031 | 8,488 |
+
+**The entry is the harmful half** and the exit the flattering one; in the full
+variant they cancel. Two months (2026-08-06 → 2026-10-06) disagree with the year —
+18 trades, 38.9% win, mean +0.52%, t 0.71, equity 10,290 against the baseline's
+9,825, still 9,905 at 0.50% slippage. That is the same window length that made the
+retrace cap look good before the year reversed it, so it is not evidence.
+
+**The exit's measured gain is an artifact.** Re-expressed scale-invariantly as 1.0R
+or 0.5R with the same 75% fraction, the win rate reproduces (42.7%, 58.9%) but the
+equity collapses to ~9,100. Broken down by price bucket, the whole +17% is 16 trades
+in the $10–20 band, where 12c is a 0.9% scratch:
+
+| entry price | n | baseline meanR | variant-exit meanR | 12c is |
+| --- | --- | --- | --- | --- |
+| $1–3 | 29 | −0.232 | −0.630 | 6.7% |
+| $3–5 | 22 | +0.817 | +0.758 | 3.2% |
+| $5–10 | 19 | −0.256 | +0.209 | 1.7% |
+| $10–20 | 16 | −0.367 | **+0.713** | 0.9% |
+
+A 1.08R swing across 16 trades at 1% risk is ~17% of equity — the entire result. The
+rule is not "exit better", it is "barely trade the most expensive names". With
+`max_price` now at 10.0 the band it exploited is mostly gone.
+
+### The finding that came out of it anyway
+
+Lowering the price ceiling on the **baseline**, changing nothing else, improves every
+column monotonically and is the most slippage-resistant variant tested:
+
+| `max_price` | Trades | Win | Mean | Equity | maxDD | at 0.50% |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20.0 | 89 | 32.6% | −0.02% | 9,943 | 11.8% | 7,721 |
+| 10.0 | 73 | 34.2% | +0.08% | 10,201 | 10.4% | 8,522 |
+| 5.0 | 54 | 35.2% | +0.19% | **10,368** | **7.1%** | **9,179** |
+
+t = 0.38 at 54 trades is still not significance, and it is one window. But it is the
+one piece of the article's advice that survives scrutiny, it needs no new code, and
+it is the thing to take from this exercise if the paper test disappoints.
+
 ## 2026-10-08 — The entry window now runs to the cutoff buffer
 
 `timing.entry_window` was 5h30m, which from a 09:30 open put the last entry at **15:00**
@@ -1487,11 +1590,47 @@ negative result in this file: 2h ended at $8,871, 4h at $7,162, all-day at $5,58
 (t = −4.24). 5h30m was already most of the way into that, and this goes the rest of the
 way for the sake of covering the session the exchange is actually open. `cmd/backtest
 -grid` still sweeps the window (`reportEntryWindow`), so the cost of this is measurable
-at any time, and shortening the window is the first thing to try if the session's later
-entries turn out to cost what the sweep says they do.
+at any time — and if the paper test disappoints, shortening the window is the first
+thing to try, not the last.
+
+## 2026-10-08 — `PRE_MARKET` becomes `EXTENDED_MARKET`, and post-market trades
+
+Requested directly: rename the agent state, widen it to cover post-market trading hours, and put the extended-hours times into the page's description box.
+
+| Decision | Rationale |
+|---|---|
+| `PRE_MARKET` → `EXTENDED_MARKET`, covering 04:00 → the open **and** the close → 20:00 | The state is a claim about what the market is doing. Once the agent covers both extended sessions, a name that says "pre-market" is wrong for half of them. |
+| **One state for both halves, not two** | They differ in exactly one thing — where the authority to buy comes from — and that is not something a badge can usefully carry. What they share is everything an operator reads off one: a thin book, limit-only routing, and screening numbers that are not the regular session's. The *exchange* badge still distinguishes them (`PRE-MARKET` / `POST-MARKET`), because that badge names the exchange's session rather than the agent's state. |
+| Config section `premarket:` → `extended:`, with a new `extended.end` (`20:00`) | The section defines the phase's boundaries and thresholds. Keeping it called `premarket` while it governed post-market is exactly the kind of drift that makes a doc disagree with behaviour. One set of thresholds for both halves: the tape is thin before the bell and after it for the same reason, so there was nothing to split. |
+| **A second forced exit, `exit.eod_exit_offset_minutes` before `extended.end`** | This is the load-bearing part. Post-market entry without it would have quietly converted a day-trading strategy into one carrying overnight gap risk on microcaps — a different risk profile from the one anything in `docs/risk.md` was measured against. `PhaseEODWindow` therefore occurs twice a day, and `timing.entry_cutoff_buffer` gives the post-market entry window the same quiet time the regular one gets. The residual exposure is a limit order that does not fill in a thin 19:55 book, which is the same failure mode as an unfilled extended-hours stop and is governed by the same `extended.limit_slip_pct`. |
+| Post-market entry defers to the day's **resolved gate verdict**; pre-market keeps its live read | By 16:00 the gate has run on real first-hour readings, so a halted day stays halted after the close. Taking a second, differently-sourced opinion at 17:00 would let a live sample overturn what the gate concluded — the thing `resolveGate` exists to prevent. Before the bell there is no verdict to defer to, which is why the live read remains there and only there. |
+| Post-market volume comes from `SessionVolumes`, not the snapshot | Pre-market the snapshot's volume is zero (no daily bar for today yet). Post-market the daily bar exists and carries the **whole regular session** — at $5 on 800k shares that is $4,000,000 of turnover against a $100,000 extended floor, so every name on the tape would clear it while saying nothing about what is trading now. Both halves therefore sum the extended session's own volume from batched hourly bars, from `scheduler.ExtendedStart`. |
+| `extended.end` is a wall-clock time, and is wrong on a half day | The exchange shortens post-market along with the session, but Alpaca's calendar endpoint reports only the regular open and close, so there is nothing to derive the real extended close from. Inventing a provider or a value for it would be the thing this document exists to prevent. The cost is bounded — orders into a finished session do not fill — but the page overstates coverage on an early-close day. Listed as an open item below. |
+| `scheduler.ExtendedHours` replaces every `phase == PhasePreMarket` routing check | Four call sites were deciding "does this order go to the extended book" by comparing against the pre-market phase. That answer is now true in three places (both extended halves and the post-market flattening window), and one function is the only way to keep them from disagreeing. |
+
+**The three windows never overlap, and that was verified rather than assumed.** `scheduler.Bounds` clamps `extended.start` against the calendar's own open and `extended.end` against its own close, and **drops** a half whose configured clock would overlap instead of clamping it to the bell. This matters because the extended thresholds are an order of magnitude looser than the regular ones: a window reaching into the regular session would apply a 0.5x relative-volume floor and a $100,000 turnover floor to the regular market, which admits essentially everything, and a regular window reaching outside the bells would send a market order to a book that takes only limit orders. `TestExtendedWindowsDoNotOverlapTheRegularSession` walks a whole day a minute at a time and asserts on what `PhaseAt`, `ExtendedHours` and `ExtendedStart` answer rather than on the boundary fields, because those answers are what every caller reads. The timeline the shipped config produces:
+
+```
+00:00  MARKET_CLOSED    extended-hours routing: no
+04:00  EXTENDED_MARKET  extended-hours routing: yes
+09:30  SENTIMENT_CHECK  extended-hours routing: no
+09:35  SCREENING        extended-hours routing: no
+15:55  EOD_WINDOW       extended-hours routing: no
+16:00  EXTENDED_MARKET  extended-hours routing: yes
+19:55  EOD_WINDOW       extended-hours routing: yes
+20:00  MARKET_CLOSED    extended-hours routing: no
+```
+
+**A watchlist from one extended half must never be acted on in the other.** They share a phase and every threshold, but they are hours apart, and on a halted day the regular session never publishes a watchlist at all — so the morning's would still have been the newest one at 16:00, and post-market would have bought on a screen taken before the bell against prices from another session. `scanWindow` (`windowRegular` / `windowPreBell` / `windowPostBell`) is what `checkSetups` and `setupState.resetFor` key on now, replacing the old `preMarket bool`.
+
+**The offline demo caught a bug in its own compression.** The first version set the simulated `extended.end` five minutes after the simulated close, while offline mode runs a fifteen-minute forced-exit offset — so `Bounds` found no room for the post-market flattening window, reported no post-market at all, and the demo silently skipped the state the change was made to show. The end is now derived as `eod_exit_offset_minutes + offlinePostMarketTail`, which cannot drift from the offset. `timing.entry_cutoff_buffer` is compressed too; at its configured 30 minutes against a 20-minute simulated session, neither the regular nor the post-market entry window existed.
+
+**Nothing here is measured.** `cmd/backtest` fetches 09:30–16:00 bars, so it has no more to say about post-market than it had about pre-market. The post-market thresholds are the pre-market ones, which were already reasoned rather than measured.
 
 ## Open items (not yet decided)
 
+- **Whether the buy-stop entry survives real fills.** The backtest fills it at its trigger price and measures it clearly worse (8,511 against 9,943 over a year, 5,031 at 0.50% slippage); the paper test on the test branch exists to find out whether live fills are better or worse than that assumption. Compare realised fill against `quoted_price` in the audit trail before deciding.
+- **Whether `screening.max_price` should come down on main.** Independently of the micro pullback variant, 20.0 → 10.0 → 5.0 improved equity, win rate, drawdown and slippage robustness monotonically on the baseline. t = 0.38, one window; sweep it alongside the other entry settings, which were all fitted against the $1–20 band.
 - **Why the corrected pause rule adds 14 trades a year the old one never took.** They average −0.98% against the kept trades' +0.16% and are most of the fix's measured cost. The suspected cause is `microPause`'s walk-back stopping at the first non-qualifying candle, so a too-long pullback now reads as a short one. Verify before tuning anything else on the entry side.
 - **(Resolved 2026-10-06 on the year: the cap stays.)** `entry.max_retrace_pct: 50` refused the AIFA 10:06 setup at a retrace of 50.0938%, and that trade would have reached its 2R target three minutes later. On two months "any retrace" measured better on every column, which looked like a reason to drop the cap. Over the full year it is the *worst* entry variant measured: 160 setups / 171 trades, mean −0.84%, **t = −2.80**, equity 6,449 against 8,451 as configured, max drawdown 36.3% against 17.8%. The two-month signal was noise. Recorded because the reversal is the point: a finding from one trade, or from a short window, does not survive the longer measurement.
 - **Whether `exit.breakeven_after_target` truncates the right tail.** This is now the largest unexplained number in the strategy. Over the year on the corrected rule, 88 of 89 trades exited `STOP_LOSS` and exactly one reached the forced EOD exit; mean MFE was +15.22% against a mean realised −0.04%, with 14.97% left behind after the exit. 42.7% of trades reached +10% and 22.5% reached +20%, and the book still finished flat. The winners are all scale-outs whose runner was then taken at breakeven. Measure removing the breakeven move while keeping the scale-out — it is a bigger term than anything on the entry side.
@@ -1514,10 +1653,11 @@ entries turn out to cost what the sweep says they do.
 
 - **The strategy has no demonstrated edge, and this is the load-bearing open item.** Screening floors and the MACD removal address composition and dead weight; neither creates an edge. Before any real money: measure realised slippage in paper trading, since that single number decides the outcome, and decide whether entries must be limit orders.
 
-- **Every `premarket.*` threshold is unmeasured.** `cmd/backtest` has no pre-market bars, so the start time, scan interval, dollar-volume floor and volume multiple are reasoned rather than measured. Extending the backtest to fetch extended-hours bars is what would close this; until then the pre-market screen should be read, not traded.
-- **Pre-market entries make the PDT problem worse, not better.** A pre-market entry that exits the same session is still a day trade, and the rolling five-session count is already **64** against a limit of 3. `premarket.allow_entry` must stay off until the PDT constraint is resolved, and the live-trading guard does not cover it — that guard is about real money, and this is about trade count on paper too. **As of 2026-09-29 the shipped config has it on**, which contradicts this item: either the switch goes back off, or this item is retired deliberately rather than by drift.
-- **`premarket.scan_interval` is set to the regular session's 1m**, so the pre-market morning costs ~330 passes at roughly ~130 requests a minute against Alpaca's 200/min, not the ~26 the key's own comment describes. Nothing measures pass duration or warns on an overrun, so the decision is whether to slow the key back to 5m or to add that measurement first.
-- **Whether a dismissed gate should be replaced by a live sentiment read** rather than by nothing. The machinery exists (`readSentiment`, already used for pre-market entry); the question is whether a mid-session reading is meaningful enough to gate on, given the rule was specified against the first hour.
+- **Every `extended.*` threshold is unmeasured.** `cmd/backtest` has no extended-hours bars, so the start and end times, scan interval, dollar-volume floor and volume multiple are reasoned rather than measured — and the post-market half simply inherits numbers that were reasoned for the pre-market one. Extending the backtest to fetch extended-hours bars is what would close this; until then the extended screen should be read, not traded.
+- **Extended-hours entries make the PDT problem worse, not better, and post-market doubles the surface.** An extended-hours entry that exits the same session is still a day trade, and the rolling five-session count is already **64** against a limit of 3. `extended.allow_entry` must stay off until the PDT constraint is resolved, and the live-trading guard does not cover it — that guard is about real money, and this is about trade count on paper too. **As of 2026-09-29 the shipped config has it on**, and as of 2026-10-08 it governs post-market too, which compounds the contradiction: either the switch goes back off, or this item is retired deliberately rather than by drift.
+- **`extended.scan_interval` is set to the regular session's 1m**, so the pre-market morning costs ~330 passes and the post-market evening ~240 more, each at roughly ~130 requests a minute against Alpaca's 200/min rather than the ~26 the key's own comment describes. Post-market doubled this cost. Nothing measures pass duration or warns on an overrun, so the decision is whether to slow the key back to 5m or to add that measurement first.
+- **`extended.end` overstates coverage on a half day.** It is a wall-clock 20:00, while the exchange shortens post-market along with the session; Alpaca's calendar endpoint reports only the regular open and close, so there is nothing to derive the real extended close from. Orders into a finished session do not fill, so the cost is bounded, but the page shows `EXTENDED_MARKET` through hours in which nothing trades. Closing this needs a verified source for the exchange's own extended bells — the same class of open item as the unverified endpoints above.
+- **Whether a dismissed gate should be replaced by a live sentiment read** rather than by nothing. The machinery exists (`readSentiment`, already used for pre-market entry, though not for post-market, which defers to the resolved verdict instead); the question is whether a mid-session reading is meaningful enough to gate on, given the rule was specified against the first hour.
 - **Whether the setup gate is too strict, now that there is a case.** KNRX is one observation, not a measurement, and the manual Open button is an escape hatch rather than an answer. The things worth sweeping in `cmd/backtest` — one at a time, against the current baseline — are `entry.max_pullback_bars`, reading the pattern on 2-minute candles, and allowing a reclaim of a recent swing high rather than the session high.
 - **The setup reason is only audited once per symbol per session.** `recordSkip` de-duplicates on symbol + `"no setup"`, so a candidate whose reason changes through the day records only the first. Combined with `SaveScreenSnapshot` keeping just the latest pass, there is no way to ask afterwards whether a candidate ever had a valid entry window.
 - **Whether the strategy should still target small caps at all.** There is no size criterion, so the screen admits large caps while the docs still describe a small-cap strategy. Either the naming changes, or a size criterion returns — which needs a data source Alpaca does not provide.

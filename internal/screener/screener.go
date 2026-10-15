@@ -28,9 +28,11 @@ const (
 // The price band and the move threshold are deliberately not split: a name is in the
 // strategy's band, or moving enough, regardless of which session is printing it.
 type Thresholds struct {
-	// PreMarket says which session these came from. Nothing in screening branches on
-	// it; it is carried so callers can label a pass without re-deriving it.
-	PreMarket         bool
+	// Extended says these came from one of the extended-hours sessions rather than
+	// the regular one. Screening itself does not branch on it; it is carried so
+	// callers can label a pass, and so the engine knows to sum the session's volume
+	// itself instead of reading the snapshot's daily bar.
+	Extended          bool
 	MinPrice          float64
 	MaxPrice          float64
 	MinIntradayPct    float64
@@ -38,19 +40,20 @@ type Thresholds struct {
 	MinVolumeMultiple float64
 }
 
-// ThresholdsFor resolves the numbers a pass runs with.
-func ThresholdsFor(cfg *config.Config, preMarket bool) Thresholds {
+// ThresholdsFor resolves the numbers a pass runs with. Both extended-hours sessions
+// use the same set: the tape is thin before the bell and after it for the same reason.
+func ThresholdsFor(cfg *config.Config, extended bool) Thresholds {
 	th := Thresholds{
-		PreMarket:         preMarket,
+		Extended:          extended,
 		MinPrice:          cfg.Screening.MinPrice,
 		MaxPrice:          cfg.Screening.MaxPrice,
 		MinIntradayPct:    cfg.Screening.MinIntradayPct,
 		MinDollarVolume:   cfg.Screening.MinDollarVolume,
 		MinVolumeMultiple: cfg.Screening.MinVolumeMultiple,
 	}
-	if preMarket {
-		th.MinDollarVolume = cfg.PreMarket.MinDollarVolume
-		th.MinVolumeMultiple = cfg.PreMarket.MinVolumeMultiple
+	if extended {
+		th.MinDollarVolume = cfg.Extended.MinDollarVolume
+		th.MinVolumeMultiple = cfg.Extended.MinVolumeMultiple
 	}
 	return th
 }

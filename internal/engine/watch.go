@@ -6,6 +6,7 @@ import (
 
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
+	"github.com/martincoetzee/trading-agent/internal/strategy"
 )
 
 // The screen and the setup answer different questions at different speeds. Whether a
@@ -34,8 +35,8 @@ type watchlist struct {
 }
 
 // startScreen runs one screening pass and publishes its result as the watchlist. The
-// pass is built inside, because the pre-market one takes a sentiment reading and that
-// is a request the tick should not wait on either.
+// pass is built inside, because the extended-hours one reads sentiment or the stored
+// gate, and that is work the tick should not wait on either.
 func (e *Engine) startScreen(ctx context.Context, sess scheduler.Session, op string, build func(context.Context) scanPass) {
 	run := func() {
 		p := build(ctx)
@@ -76,24 +77,28 @@ func (e *Engine) startScreen(ctx context.Context, sess scheduler.Session, op str
 // candidate whose candle has closed since it was last read, buys the ones that have
 // set up, and saves the candidate table with what happened to each.
 //
-// A watchlist from the other session is ignored rather than acted on: pre-market and
-// the regular session judge candidates against different thresholds.
-func (e *Engine) checkSetups(ctx context.Context, sess scheduler.Session, bounds scheduler.Boundaries, preMarket bool) error {
+// A watchlist from another of the day's three windows is ignored rather than acted on.
+// The regular session and the extended ones judge candidates against different
+// thresholds, and the two extended halves are hours apart: on a halted day the regular
+// session never publishes a watchlist at all, so the morning's would otherwise still be
+// the newest one when post-market opened.
+func (e *Engine) checkSetups(ctx context.Context, sess scheduler.Session, bounds scheduler.Boundaries, window scanWindow) error {
 	e.mu.RLock()
 	w, seq := e.watch, e.watchSeq
 	e.mu.RUnlock()
-	if w == nil || w.date != sess.Date || w.pass.preMarket != preMarket {
+	if w == nil || w.date != sess.Date || w.pass.window != window {
 		return nil
 	}
-	e.setups.resetFor(sess.Date, preMarket)
+	e.setups.resetFor(sess.Date, window)
 	fresh := seq != e.setups.seq
 	e.setups.seq = seq
 
 	p := w.pass
-	if !p.preMarket {
-		// Re-judged on every tick rather than taken from the screen, so the window
-		// closes on time even when the watchlist was published just before it.
-		p.blocked = e.regularPass(e.now(), sess, bounds).blocked
+	// Re-judged on every tick rather than taken from the screen, so the window closes
+	// on time even when the watchlist was published just before it. Pre-market has no
+	// deadline of its own: it buys up to the bell, where its session ends anyway.
+	if p.blocked == "" && !p.windowEnd.IsZero() && !e.now().Before(p.windowEnd) {
+		p.blocked = "entry window closed"
 	}
 
 	var outcomes map[string]string
@@ -106,7 +111,7 @@ func (e *Engine) checkSetups(ctx context.Context, sess scheduler.Session, bounds
 			}
 		}
 		e.recordSkip("", p.blocked,
-			map[string]any{"reason": p.blocked, "pre_market": p.preMarket})
+			map[string]any{"reason": p.blocked, "session": p.window.label()})
 	} else {
 		outcomes, entryErr = e.enterPositions(ctx, sess, w.evals, p)
 	}
@@ -142,14 +147,17 @@ type setupState struct {
 	// outcomes is the Action column, per symbol: kept between reads, because a
 	// candidate whose chart has not moved still has the outcome it was last given.
 	outcomes map[string]string
+	// armed holds the buy-stop setups waiting for price to break their pause high
+	// (entry.buy_stop_entry only). A close-triggered setup is judged once, on the
+	// candle that completed it; an armed one has to be judged against the live
+	// price on every tick until it fires or the next candle re-arms it, which is
+	// the whole difference between the two entries.
+	armed map[string]strategy.Setup
 }
 
-// resetFor starts afresh when the session, or which of its two halves, changes.
-func (s *setupState) resetFor(date string, preMarket bool) {
-	key := date
-	if preMarket {
-		key += "/pre"
-	}
+// resetFor starts afresh when the session, or which of its three windows, changes.
+func (s *setupState) resetFor(date string, window scanWindow) {
+	key := date + "/" + window.label()
 	if s.key == key {
 		return
 	}
@@ -157,6 +165,7 @@ func (s *setupState) resetFor(date string, preMarket bool) {
 	s.lastRead = map[string]time.Time{}
 	s.fetchedFor = map[string]time.Time{}
 	s.outcomes = map[string]string{}
+	s.armed = map[string]strategy.Setup{}
 }
 
 // due reports whether symbol's chart is worth requesting: the candle that most

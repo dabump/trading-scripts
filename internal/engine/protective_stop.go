@@ -318,9 +318,9 @@ func (e *Engine) restoreProtectiveStop(ctx context.Context, sess scheduler.Sessi
 // Two cases, and neither is the normal one. There may be no order — placing it
 // failed, or the broker ended it without a fill — and a manual position with no stop
 // at all is the one outcome this must never produce, since the stop is what sized it.
-// Or the clock may be before the opening bell, where a stop order is accepted and
-// inert: it cannot trigger in the extended session, so between a pre-market open and
-// 09:30 the floor is the engine's to hold.
+// Or the clock may be outside the bells, where a stop order is accepted and inert: it
+// cannot trigger in either extended session, so from the pre-market open to 09:30 and
+// from the close to the extended close the floor is the engine's to hold.
 //
 // This is not a second stop running alongside the first. The two are mutually
 // exclusive by construction, which is what keeps them from both selling the same
@@ -329,5 +329,5 @@ func (e *Engine) stopIsUnenforced(pos domain.Position, bounds scheduler.Boundari
 	if pos.StopOrderID == "" {
 		return true
 	}
-	return scheduler.PhaseAt(e.now(), bounds) == domain.PhasePreMarket
+	return scheduler.ExtendedHours(e.now(), bounds)
 }

@@ -1460,11 +1460,10 @@ this time by `exit.breakeven_after_target` rather than by a trailing stop.
   above the entry on a scaled winner — printing only that made a won trade look like
   a stop placed above its own entry.
 
-## 2026-10-06 — The Warrior Trading micro pullback, applied in full and measured
+## 2026-10-06 — The textbook micro pullback, applied in full and measured
 
-On request, the micro pullback as described at
-https://www.warriortrading.com/pull-back-trading-strategy/ is applied in full on
-branch `test/warrior-comparison`, to be paper-traded for several sessions. **The
+On request, the micro pullback as described in a published pullback-trading
+article is applied in full on a test branch, to be paper-traded for several sessions. **The
 backtest does not support it**; it is on test because the one assumption the
 backtest cannot check is the one the whole comparison turns on.
 
@@ -1516,8 +1515,8 @@ A full year, 2025-10-06 → 2026-10-06, same candidate set, no slippage:
 | --- | --- | --- | --- | --- | --- | --- |
 | Baseline | 89 | 32.6% | −0.02% | −0.06 | **9,943** | 11.8% |
 | This variant, full | 168 | 32.1% | +0.05% | 0.17 | 9,890 | 15.1% |
-| Warrior **entry** only | 176 | 32.4% | −0.26% | −1.04 | 8,511 | 23.5% |
-| Warrior **exit** only | 86 | 41.9% | +0.62% | 1.50 | 11,704 | 7.3% |
+| Variant **entry** only | 176 | 32.4% | −0.26% | −1.04 | 8,511 | 23.5% |
+| Variant **exit** only | 86 | 41.9% | +0.62% | 1.50 | 11,704 | 7.3% |
 
 And across slippage, which is where the entry change really tells:
 
@@ -1538,7 +1537,7 @@ or 0.5R with the same 75% fraction, the win rate reproduces (42.7%, 58.9%) but t
 equity collapses to ~9,100. Broken down by price bucket, the whole +17% is 16 trades
 in the $10–20 band, where 12c is a 0.9% scratch:
 
-| entry price | n | baseline meanR | warrior-exit meanR | 12c is |
+| entry price | n | baseline meanR | variant-exit meanR | 12c is |
 | --- | --- | --- | --- | --- |
 | $1–3 | 29 | −0.232 | −0.630 | 6.7% |
 | $3–5 | 22 | +0.817 | +0.758 | 3.2% |
@@ -1630,8 +1629,8 @@ Requested directly: rename the agent state, widen it to cover post-market tradin
 
 ## Open items (not yet decided)
 
-- **Whether the Warrior buy-stop entry survives real fills.** The backtest fills it at its trigger price and measures it clearly worse (8,511 against 9,943 over a year, 5,031 at 0.50% slippage); the paper test on `test/warrior-comparison` exists to find out whether live fills are better or worse than that assumption. Compare realised fill against `quoted_price` in the audit trail before deciding.
-- **Whether `screening.max_price` should come down on main.** Independently of the Warrior work, 20.0 → 10.0 → 5.0 improved equity, win rate, drawdown and slippage robustness monotonically on the baseline. t = 0.38, one window; sweep it alongside the other entry settings, which were all fitted against the $1–20 band.
+- **Whether the buy-stop entry survives real fills.** The backtest fills it at its trigger price and measures it clearly worse (8,511 against 9,943 over a year, 5,031 at 0.50% slippage); the paper test on the test branch exists to find out whether live fills are better or worse than that assumption. Compare realised fill against `quoted_price` in the audit trail before deciding.
+- **Whether `screening.max_price` should come down on main.** Independently of the micro pullback variant, 20.0 → 10.0 → 5.0 improved equity, win rate, drawdown and slippage robustness monotonically on the baseline. t = 0.38, one window; sweep it alongside the other entry settings, which were all fitted against the $1–20 band.
 - **Why the corrected pause rule adds 14 trades a year the old one never took.** They average −0.98% against the kept trades' +0.16% and are most of the fix's measured cost. The suspected cause is `microPause`'s walk-back stopping at the first non-qualifying candle, so a too-long pullback now reads as a short one. Verify before tuning anything else on the entry side.
 - **(Resolved 2026-10-06 on the year: the cap stays.)** `entry.max_retrace_pct: 50` refused the AIFA 10:06 setup at a retrace of 50.0938%, and that trade would have reached its 2R target three minutes later. On two months "any retrace" measured better on every column, which looked like a reason to drop the cap. Over the full year it is the *worst* entry variant measured: 160 setups / 171 trades, mean −0.84%, **t = −2.80**, equity 6,449 against 8,451 as configured, max drawdown 36.3% against 17.8%. The two-month signal was noise. Recorded because the reversal is the point: a finding from one trade, or from a short window, does not survive the longer measurement.
 - **Whether `exit.breakeven_after_target` truncates the right tail.** This is now the largest unexplained number in the strategy. Over the year on the corrected rule, 88 of 89 trades exited `STOP_LOSS` and exactly one reached the forced EOD exit; mean MFE was +15.22% against a mean realised −0.04%, with 14.97% left behind after the exit. 42.7% of trades reached +10% and 22.5% reached +20%, and the book still finished flat. The winners are all scale-outs whose runner was then taken at breakeven. Measure removing the breakeven move while keeping the scale-out — it is a bigger term than anything on the entry side.

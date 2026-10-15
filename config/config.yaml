@@ -1,8 +1,7 @@
-# WARRIOR TRADING VARIANT -- branch test/warrior-comparison, under evaluation.
+# MICRO PULLBACK VARIANT -- test branch, under evaluation.
 #
-# The micro pullback as described at
-# https://www.warriortrading.com/pull-back-trading-strategy/, applied in full so it
-# can be paper-traded. Each difference from the measured baseline is commented at
+# The micro pullback as commonly described for small-cap momentum trading, applied
+# in full so it can be paper-traded. Each difference from the measured baseline is commented at
 # its key. Backtested results are in docs/decisions.md: over a year this variant
 # ends at 9,890 against the baseline's 9,943, and is worse at every slippage level.
 # It is on test because the backtest fills a buy-stop at its trigger price, which is
@@ -125,7 +124,7 @@ entry:
   # The setup is a micro pullback (docs/strategy.md §3): a surge to the high of day,
   # a 1-2 candle pause, then a close above the last pause candle's high. These values
   # are the ones measured in docs/decisions.md; they have not been tuned.
-  max_pullback_bars: 3 # "usually just a 1-3 candle pause" (Warrior Trading)
+  max_pullback_bars: 3 # "usually just a 1-3 candle pause"
   surge_bars: 3 # candles, ending just before the pause, that the surge spans
   min_surge_pct: 3.0 # rise across those candles, lowest low to the top
   max_retrace_pct: 50 # most of the surge's range the pause may give back
@@ -139,7 +138,7 @@ entry:
   require_macd: false # MACD(12,26,9) above its signal line
   require_volume_decline: true # pause lighter on volume than the surge
   stop_buffer_pct: 0.1 # placed just under the pullback low, not on it
-  # Warrior places the stop just under the pullback low and sizes up on how tight that
+  # The variant places the stop just under the pullback low and sizes up on how tight that
   # is, so a tight stop is the point rather than a hazard. Effectively disabled.
   min_stop_distance_pct: 0.05
   # If the chart stop is further away than this, the trade is not taken at all. This

@@ -25,7 +25,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ---------- runtime ----------
 FROM alpine:3.21
 
-# ca-certificates only: required for TLS to Alpaca; without it every API call fails.
+# ca-certificates: required for TLS to Alpaca; without it every API call fails.
+# bash/curl/libgcc/libstdc++/ripgrep: runtime dependencies of the Claude Code CLI's
+# native binary, installed below — it is not Node-based, but it is not dependency-free
+# either, and apk is the only place left to add them before the image drops root.
 #
 # tzdata is deliberately NOT installed. Go consults the system zoneinfo database before
 # the time/tzdata embed, so installing it here would mask the embed and leave the
@@ -33,7 +36,7 @@ FROM alpine:3.21
 # the embed is the only source, so if someone drops the import the container is
 # immediately and visibly wrong rather than silently correct until it is deployed
 # somewhere leaner. wget is likewise unnecessary: the healthcheck uses the binary.
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates bash curl libgcc libstdc++ ripgrep \
     && addgroup -g 10001 agent \
     && adduser -D -u 10001 -G agent agent
 
@@ -52,6 +55,24 @@ RUN mkdir -p /app/data /app/logs && chown -R agent:agent /app
 VOLUME ["/app/data", "/app/logs"]
 
 USER agent
+# adduser -D creates /home/agent, but Docker's USER instruction does not itself set
+# $HOME from /etc/passwd — the installer below, and the Claude CLI afterwards, both
+# need it to land their files under the unprivileged user's own home rather than root's.
+ENV HOME=/home/agent
+ENV PATH="${HOME}/.local/bin:${PATH}"
+
+# The Claude Code CLI: a standalone native binary, not an npm package, so it needs no
+# Node.js. Installed as `agent` (not root) so the login flow started from the status
+# page — which runs as this same user — writes its session credentials
+# (~/.claude/.credentials.json) into a directory it actually owns, under the volume
+# declared below. There is deliberately no API key or token baked in here: an active
+# Claude session is something the operator creates from the status page, not something
+# that ships with the image.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Only the credentials/session directory needs to survive a restart — the CLI binary
+# itself is reinstalled by every rebuild above.
+VOLUME ["/home/agent/.claude"]
 
 EXPOSE 8080
 

@@ -9,10 +9,12 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/martincoetzee/trading-agent/internal/claudelogin"
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
@@ -53,6 +55,18 @@ type Actions interface {
 	OpenPosition(ctx context.Context, symbol string) (domain.ManualOpen, error)
 }
 
+// ClaudeLogin is what the page's Claude card needs. It is implemented by
+// *claudelogin.Session; the interface exists so web tests can fake a login
+// attempt without spawning a real process.
+type ClaudeLogin interface {
+	Available() bool
+	LoggedIn() bool
+	Status() claudelogin.Status
+	Start() error
+	SendLine(text string) error
+	Cancel() error
+}
+
 type Server struct {
 	cfg     *config.Config
 	store   *store.Store
@@ -60,11 +74,12 @@ type Server struct {
 	tmpl    *template.Template
 	log     *slog.Logger
 	actions Actions
+	claude  ClaudeLogin
 	now     func() time.Time
 	paper   bool
 }
 
-func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Actions, logger *slog.Logger, now func() time.Time, paper bool) (*Server, error) {
+func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Actions, claude ClaudeLogin, logger *slog.Logger, now func() time.Time, paper bool) (*Server, error) {
 	tmpl, err := template.ParseFS(templatesFS, "templates/*.html")
 	if err != nil {
 		return nil, err
@@ -75,7 +90,7 @@ func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Act
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, store: st, engine: eng, actions: actions, tmpl: tmpl,
+	return &Server{cfg: cfg, store: st, engine: eng, actions: actions, claude: claude, tmpl: tmpl,
 		log: logger, now: now, paper: paper}, nil
 }
 
@@ -90,6 +105,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/actions/screen", s.handleScreenNow)
 	mux.HandleFunc("/actions/close", s.handleClosePosition)
 	mux.HandleFunc("/actions/open", s.handleOpenPosition)
+	mux.HandleFunc("/claude/status", s.handleClaudeStatus)
+	mux.HandleFunc("/claude/start", s.handleClaudeStart)
+	mux.HandleFunc("/claude/input", s.handleClaudeInput)
+	mux.HandleFunc("/claude/cancel", s.handleClaudeCancel)
 	return mux
 }
 
@@ -380,6 +399,139 @@ func (s *Server) handleOpenPosition(w http.ResponseWriter, r *http.Request) {
 		m.SetupReason = res.SetupReason
 	}
 	s.renderModal(w, "openModal", m)
+}
+
+// claudeCardView is what the Claude card renders. It is built straight from
+// claudelogin.Status on every request rather than cached, so the card always
+// reflects whatever the Session actually holds — including, via LoggedIn,
+// credentials left over from a login done before this process started.
+type claudeCardView struct {
+	Available bool
+	LoggedIn  bool
+	Running   bool
+	Succeeded bool
+	Failed    bool
+	Output    string
+	// LoginURL is pulled out of Output and rendered as a real link, because the
+	// card re-renders on every 2s poll — selecting text out of the <pre> to copy
+	// it is a race against that poll wiping the selection before a copy lands. A
+	// click is immune to that; the URL only needs to still be in Output by then.
+	LoginURL string
+	Error    string
+	Meta     string
+}
+
+// loginURLPattern pulls the CLI's own auth URL out of its captured output. The
+// CLI prints exactly one (ansiEscape in claudelogin already strips the OSC 8
+// hyperlink wrapper it would otherwise be wrapped in), so the first match is it.
+var loginURLPattern = regexp.MustCompile(`https?://\S+`)
+
+// maxClaudeInputLen bounds a pasted line of login input. The flow only ever asks
+// for a short code or confirms a URL; a limit here is just a backstop against
+// something much larger being posted by mistake.
+const maxClaudeInputLen = 2048
+
+func (s *Server) claudeCard() claudeCardView {
+	v := claudeCardView{}
+	if s.claude == nil {
+		v.Meta = "not configured"
+		return v
+	}
+	v.Available = s.claude.Available()
+	v.LoggedIn = s.claude.LoggedIn()
+	st := s.claude.Status()
+	v.Output = st.Output
+	v.LoginURL = loginURLPattern.FindString(st.Output)
+	switch st.State {
+	case claudelogin.StateRunning:
+		v.Running = true
+		v.Meta = "waiting for you to finish signing in"
+	case claudelogin.StateSucceeded:
+		v.Succeeded = true
+		v.Meta = "session active"
+	case claudelogin.StateFailed:
+		v.Failed = true
+		v.Error = st.Error
+		v.Meta = "login failed"
+	default:
+		if v.LoggedIn {
+			v.Meta = "session active"
+		} else {
+			v.Meta = "not logged in"
+		}
+	}
+	return v
+}
+
+func (s *Server) renderClaudeCard(w http.ResponseWriter) {
+	var buf bytes.Buffer
+	if err := s.tmpl.ExecuteTemplate(&buf, "claudeCard", s.claudeCard()); err != nil {
+		s.log.Error("render claude card", "err", err)
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	buf.WriteTo(w)
+}
+
+// handleClaudeStatus is polled by the page to keep the card live while a login is
+// in progress, and to pick up credentials left by a previous container run.
+func (s *Server) handleClaudeStatus(w http.ResponseWriter, r *http.Request) {
+	s.renderClaudeCard(w)
+}
+
+// handleClaudeStart begins a login attempt. POST only, like the other actions
+// that trigger upstream work: a prefetch or a crawler following a link must not
+// be able to set one off.
+func (s *Server) handleClaudeStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.claude != nil {
+		if err := s.claude.Start(); err != nil {
+			s.log.Warn("claude login start failed", "err", err)
+		}
+	}
+	s.renderClaudeCard(w)
+}
+
+// handleClaudeInput relays a pasted line — a URL confirmation, an auth code — to
+// the CLI waiting for it. It never touches credentials itself; it only forwards
+// text to the subprocess's own terminal, exactly as if it had been typed there.
+func (s *Server) handleClaudeInput(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.claude != nil {
+		text := strings.TrimSpace(r.FormValue("text"))
+		if len(text) > maxClaudeInputLen {
+			text = text[:maxClaudeInputLen]
+		}
+		if text != "" {
+			if err := s.claude.SendLine(text); err != nil {
+				s.log.Warn("claude login input failed", "err", err)
+			}
+		}
+	}
+	s.renderClaudeCard(w)
+}
+
+// handleClaudeCancel kills a login attempt in progress.
+func (s *Server) handleClaudeCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.claude != nil {
+		_ = s.claude.Cancel()
+	}
+	s.renderClaudeCard(w)
 }
 
 func (s *Server) renderModal(w http.ResponseWriter, name string, data any) {

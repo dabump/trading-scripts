@@ -205,13 +205,14 @@ tbody tr.foldout:hover { background: none; }
   font-family: ui-monospace, Menlo, monospace; }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-button.act {
+button.act, a.act {
   font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
   padding: 7px 14px; border-radius: 8px; color: var(--text);
   background: var(--panel-2); border: 1px solid var(--line);
   display: inline-flex; align-items: center; gap: 7px;
+  text-decoration: none;
 }
-button.act:hover:not(:disabled) {
+button.act:hover:not(:disabled), a.act:hover {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
   color: var(--accent);
 }
@@ -263,11 +264,25 @@ dialog.modal .close:hover { color: var(--text); }
 
 footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px;
   display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+
+.claude-output {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; font-size: 12.5px; line-height: 1.5; color: var(--text);
+  max-height: 220px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  margin: 0 0 12px;
+}
+.claude-input-row { display: flex; gap: 8px; }
+.claude-input-row input[type="text"] {
+  flex: 1; font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+}
+.claude-input-row input[type="text"]:focus { outline: none; border-color: var(--accent); }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div id="content">{{template "content" .}}</div>
+  <div id="claude-card" style="margin-top:16px"></div>
   <footer class="foot">
     <span>The agent trades on its own schedule; the buttons above only inspect, they never order.</span>
     <span>Refreshing every {{.PollSeconds}}s</span>
@@ -289,7 +304,11 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('click', async (e) => {
-  const btn = e.target.closest('button.act');
+  // [data-action] matters here, not just the act class: the Claude card's buttons
+  // reuse .act for styling but carry data-claude instead, and without this guard
+  // this handler matched them too — fetch(undefined) resolves to a literal
+  // "/undefined" URL, which 404s straight into the modal.
+  const btn = e.target.closest('button.act[data-action]');
   if (!btn) return;
   const endpoint = btn.dataset.action;
 
@@ -456,6 +475,77 @@ async function refresh() {
   } catch (e) { /* a transient failure just leaves the last good render up */ }
 }
 setInterval(refresh, POLL_MS);
+
+// The Claude card is entirely separate from the trading status above: its own
+// fragment, its own poll, its own element. It polls faster than the main status
+// (trading state changes on the order of minutes; a login waiting on a human
+// pasting a code benefits from feeling responsive) and costs nothing to poll —
+// rendering it touches no broker or store call, just whatever claudelogin.Session
+// already holds in memory.
+const claudeCard = document.getElementById('claude-card');
+
+// The poll below swaps the card's whole markup every 2s, same as the main fragment
+// poll — which would otherwise wipe out an in-progress paste every time it fires,
+// since the server has no notion of what's half-typed in the box. Saved just before
+// the swap and reapplied just after, same technique as the scroll positions above.
+function saveClaudeInput() {
+  const input = claudeCard.querySelector('input[name="text"]');
+  if (!input) return null;
+  return {
+    value: input.value,
+    focused: document.activeElement === input,
+    selStart: input.selectionStart,
+    selEnd: input.selectionEnd,
+  };
+}
+function restoreClaudeInput(saved) {
+  if (!saved) return;
+  const input = claudeCard.querySelector('input[name="text"]');
+  if (!input) return;
+  input.value = saved.value;
+  if (saved.focused) {
+    input.focus();
+    try { input.setSelectionRange(saved.selStart, saved.selEnd); } catch (e) { /* ignored */ }
+  }
+}
+async function claudeRefresh() {
+  try {
+    const saved = saveClaudeInput();
+    const res = await fetch('claude/status', { headers: { 'Accept': 'text/html' } });
+    if (!res.ok) return;
+    claudeCard.innerHTML = await res.text();
+    restoreClaudeInput(saved);
+  } catch (e) { /* a transient failure just leaves the last good render up */ }
+}
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-claude]');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch('claude/' + btn.dataset.claude, { method: 'POST', headers: { 'Accept': 'text/html' } });
+    claudeCard.innerHTML = await res.text();
+  } catch (e) { /* leave the last good render up */ } finally {
+    btn.disabled = false;
+  }
+});
+document.addEventListener('submit', async (e) => {
+  const form = e.target.closest('[data-claude-form]');
+  if (!form) return;
+  e.preventDefault();
+  const input = form.querySelector('input[name="text"]');
+  const text = input.value;
+  input.value = '';
+  try {
+    const res = await fetch('claude/input', {
+      method: 'POST',
+      headers: { 'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'text=' + encodeURIComponent(text),
+    });
+    claudeCard.innerHTML = await res.text();
+  } catch (e) { /* leave the last good render up */ }
+});
+claudeRefresh();
+setInterval(claudeRefresh, 2000);
 </script>
 </body>
 </html>{{end}}
@@ -826,6 +916,44 @@ setInterval(refresh, POLL_MS);
   <p class="note" style="margin-top:12px">The movers list came back empty, so there was nothing to evaluate.</p>
   {{end}}
 </div>
+{{end}}
+
+{{define "claudeCard"}}
+<section class="card">
+  <h2>Claude <span class="meta">{{.Meta}}</span></h2>
+  <div class="body">
+    {{if not .Available}}
+    <p class="note">The Claude CLI is not installed in this image.</p>
+    {{else if .Running}}
+    <p class="note">
+      {{if .LoginURL}}Sign in on the page this opens, then paste back whatever it shows you.
+      {{else}}Finish signing in on claude.ai, then paste back whatever it shows you.{{end}}
+    </p>
+    {{if .LoginURL}}
+    <p style="margin:0 0 12px">
+      <a class="act" href="{{.LoginURL}}" target="_blank" rel="noopener noreferrer">Open claude.ai to sign in ↗</a>
+    </p>
+    {{end}}
+    <pre class="claude-output">{{.Output}}</pre>
+    <form data-claude-form>
+      <div class="claude-input-row">
+        <input type="text" name="text" placeholder="paste the code or URL here" autocomplete="off">
+        <button class="act" type="submit">Send</button>
+        <button class="act" type="button" data-claude="cancel">Cancel</button>
+      </div>
+    </form>
+    {{else}}
+      {{if .Failed}}
+      <div class="alert soft">Login did not complete: {{.Error}}</div>
+      {{end}}
+      {{if .Succeeded}}<p class="note good">Logged in.</p>{{end}}
+      {{if and .LoggedIn (not .Succeeded) (not .Failed)}}<p class="note">Already logged in.</p>{{end}}
+      <button class="act" type="button" data-claude="start">
+        {{if .LoggedIn}}Log in again{{else}}Login to Claude{{end}}
+      </button>
+    {{end}}
+  </div>
+</section>
 {{end}}
 
 {{define "actionError"}}

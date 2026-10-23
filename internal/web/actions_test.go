@@ -203,7 +203,7 @@ func TestActionErrorsRenderInModal(t *testing.T) {
 // panicking on a nil interface.
 func TestActionsUnavailable(t *testing.T) {
 	f := newFixture(t)
-	srv, err := NewServer(f.cfg, f.store, f.eng, nil, nil, func() time.Time { return f.now }, true)
+	srv, err := NewServer(f.cfg, f.store, f.eng, nil, nil, nil, func() time.Time { return f.now }, true)
 	if err != nil {
 		t.Fatal(err)
 	}

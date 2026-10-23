@@ -25,6 +25,9 @@ services:
       # the container.
       - agent-data:/app/data
       - agent-logs:/app/logs
+      # The Claude CLI's login session (~/.claude/.credentials.json) — without this,
+      # logging in from the status page would have to be redone on every restart.
+      - agent-claude-config:/home/agent/.claude
       # Config is bind-mounted read-only so thresholds can be changed and the
       # container restarted without a rebuild.
       - ./config/config.yaml:/app/config/config.yaml:ro
@@ -75,11 +78,14 @@ services:
       # the real database or the real audit trail.
       - agent-demo-data:/app/data
       - agent-demo-logs:/app/logs
+      - agent-demo-claude-config:/home/agent/.claude
       - ./config/config.yaml:/app/config/config.yaml:ro
     restart: "no"
 
 volumes:
   agent-data:
   agent-logs:
+  agent-claude-config:
   agent-demo-data:
   agent-demo-logs:
+  agent-demo-claude-config:

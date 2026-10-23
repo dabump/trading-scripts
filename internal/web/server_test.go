@@ -142,7 +142,7 @@ func newFixture(t *testing.T) *fixture {
 		},
 	}
 
-	srv, err := NewServer(f.cfg, st, f.eng, f.actions, slog.New(slog.NewTextHandler(io.Discard, nil)),
+	srv, err := NewServer(f.cfg, st, f.eng, f.actions, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		func() time.Time { return f.now }, true)
 	if err != nil {
 		t.Fatal(err)

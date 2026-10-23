@@ -20,6 +20,7 @@ import (
 
 	"github.com/martincoetzee/trading-agent/internal/audit"
 	"github.com/martincoetzee/trading-agent/internal/broker"
+	"github.com/martincoetzee/trading-agent/internal/claudelogin"
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/engine"
@@ -206,7 +207,12 @@ func run() error {
 		return fmt.Errorf("record startup audit event: %w", err)
 	}
 
-	srv, err := web.NewServer(cfg, st, eng, eng, logger, time.Now, paper)
+	// The login flow is independent of trading: it is the same Claude CLI session
+	// whether the agent is running offline, paper or live, so it is wired up
+	// unconditionally here rather than inside either branch above.
+	claude := claudelogin.New()
+
+	srv, err := web.NewServer(cfg, st, eng, eng, claude, logger, time.Now, paper)
 	if err != nil {
 		return err
 	}

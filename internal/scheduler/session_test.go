@@ -10,7 +10,6 @@ import (
 
 func testCfg() *config.Config {
 	c := &config.Config{}
-	c.Timing.SentimentWindow = time.Hour
 	c.Exit.EODExitOffsetMins = 30
 	return c
 }
@@ -36,10 +35,8 @@ func TestPhaseAt(t *testing.T) {
 		want domain.Phase
 	}{
 		{"before the open with pre-market off", at(9, 0), domain.PhaseClosed},
-		{"at the open", at(9, 30), domain.PhaseFirstHour},
-		{"mid first hour", at(10, 0), domain.PhaseFirstHour},
-		{"one minute before gate", at(10, 29), domain.PhaseFirstHour},
-		{"at the gate", at(10, 30), domain.PhaseTrading},
+		{"at the open", at(9, 30), domain.PhaseTrading},
+		{"shortly after the open", at(10, 0), domain.PhaseTrading},
 		{"midday", at(13, 0), domain.PhaseTrading},
 		{"one minute before EOD mark", at(15, 29), domain.PhaseTrading},
 		{"at EOD exit mark", at(15, 30), domain.PhaseEODWindow},
@@ -56,9 +53,9 @@ func TestPhaseAt(t *testing.T) {
 	}
 }
 
-// An early close squeezes the day so hard that the EOD exit mark lands inside
-// the first hour. Flattening must win over the sentiment poll.
-func TestPhaseAtEarlyCloseOverlapsFirstHour(t *testing.T) {
+// An early close squeezes the day so hard that the EOD exit mark lands minutes
+// after the open. Flattening must still take over right on time.
+func TestPhaseAtEarlyCloseEntersEODWindowOnTime(t *testing.T) {
 	s := Session{
 		Date:  "2026-11-27",
 		Open:  time.Date(2026, 11, 27, 9, 30, 0, 0, ET),
@@ -66,12 +63,12 @@ func TestPhaseAtEarlyCloseOverlapsFirstHour(t *testing.T) {
 	}
 	b := Bounds(s, testCfg())
 
-	// EOD mark is 09:45, inside the 09:30-10:30 first hour.
+	// EOD mark is 09:45, 15 minutes after the open.
 	if got := PhaseAt(time.Date(2026, 11, 27, 9, 50, 0, 0, ET), b); got != domain.PhaseEODWindow {
 		t.Errorf("got %v, want PhaseEODWindow: flattening must take precedence", got)
 	}
-	if got := PhaseAt(time.Date(2026, 11, 27, 9, 35, 0, 0, ET), b); got != domain.PhaseFirstHour {
-		t.Errorf("got %v, want PhaseFirstHour before the EOD mark", got)
+	if got := PhaseAt(time.Date(2026, 11, 27, 9, 35, 0, 0, ET), b); got != domain.PhaseTrading {
+		t.Errorf("got %v, want PhaseTrading before the EOD mark", got)
 	}
 }
 
@@ -98,7 +95,7 @@ func TestPhaseAtWithExtendedHours(t *testing.T) {
 		{"exactly at the pre-market start", at(7, 0), domain.PhaseExtended},
 		{"mid pre-market", at(8, 15), domain.PhaseExtended},
 		{"a minute before the bell", at(9, 29), domain.PhaseExtended},
-		{"at the bell, the regular day resumes", at(9, 30), domain.PhaseFirstHour},
+		{"at the bell, the regular day resumes", at(9, 30), domain.PhaseTrading},
 		{"midday is unaffected", at(13, 0), domain.PhaseTrading},
 		{"at the EOD mark", at(15, 30), domain.PhaseEODWindow},
 		{"a minute before the close", at(15, 59), domain.PhaseEODWindow},
@@ -319,9 +316,6 @@ func TestIsEarlyClose(t *testing.T) {
 
 func TestBounds(t *testing.T) {
 	b := Bounds(normalSession(t), testCfg())
-	if got, want := b.FirstHourEnd.Format("15:04"), "10:30"; got != want {
-		t.Errorf("FirstHourEnd = %s, want %s", got, want)
-	}
 	if got, want := b.EODExit.Format("15:04"), "15:30"; got != want {
 		t.Errorf("EODExit = %s, want %s (30 min before close)", got, want)
 	}
@@ -341,7 +335,6 @@ func TestSessionDateUsesExchangeTimezone(t *testing.T) {
 // session means buying something the agent is about to be required to sell.
 func TestEntryWindowLeavesQuietTimeBeforeTheForcedExit(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Timing.SentimentWindow = 5 * time.Minute
 	cfg.Timing.EntryWindow = 5*time.Hour + 30*time.Minute
 	cfg.Timing.EntryCutoffBuffer = 30 * time.Minute
 	cfg.Exit.EODExitOffsetMins = 30
@@ -450,7 +443,7 @@ func TestExtendedWindowsDoNotOverlapTheRegularSession(t *testing.T) {
 			t.Fatalf("PhaseAt(%s) = PhaseExtended inside the regular session",
 				now.Format("15:04"))
 		}
-		if !inRegular && (phase == domain.PhaseFirstHour || phase == domain.PhaseTrading) {
+		if !inRegular && phase == domain.PhaseTrading {
 			t.Fatalf("PhaseAt(%s) = %v outside the regular session", now.Format("15:04"), phase)
 		}
 		// The same question the order path asks. Inside the bells an extended-hours

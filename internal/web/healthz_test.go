@@ -19,7 +19,6 @@ func TestHealthzReflectsAgentHealth(t *testing.T) {
 	}{
 		{"screening is healthy", domain.StateScreening, "", http.StatusOK},
 		{"market closed is healthy", domain.StateMarketClosed, "", http.StatusOK},
-		{"sentiment check is healthy", domain.StateSentimentCheck, "", http.StatusOK},
 		{"eod window is healthy", domain.StateEODWindow, "", http.StatusOK},
 		{
 			// Deliberate: the agent decided not to trade, which is it working correctly.

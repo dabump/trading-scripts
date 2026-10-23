@@ -527,8 +527,18 @@ func (e *Engine) Tick(ctx context.Context) {
 
 	bounds := scheduler.Bounds(sess, e.cfg)
 	now := e.now()
+	phase := scheduler.PhaseAt(now, bounds)
 
-	switch scheduler.PhaseAt(now, bounds) {
+	// The sentiment poll runs continuously through both the regular session and
+	// extended hours, not in a blocking window ahead of either — see pollSentiment.
+	if phase == domain.PhaseExtended || phase == domain.PhaseTrading {
+		if err := e.pollSentiment(ctx, sess); err != nil {
+			e.fail("poll sentiment", err)
+			return
+		}
+	}
+
+	switch phase {
 	case domain.PhaseClosed:
 		e.setState(domain.StateMarketClosed)
 
@@ -553,29 +563,23 @@ func (e *Engine) Tick(ctx context.Context) {
 			e.fail(window.label()+" entry", err)
 		}
 
-	case domain.PhaseFirstHour:
-		e.setState(domain.StateSentimentCheck)
-		if err := e.pollSentiment(ctx, sess); err != nil {
-			e.fail("poll sentiment", err)
-		}
-
 	case domain.PhaseTrading:
-		halted, err := e.resolveGate(sess)
-		if err != nil {
-			e.fail("resolve sentiment gate", err)
-			return
-		}
-		// Positions are monitored even when halted: the kill switch stops new
-		// entries, it does not abandon anything already held.
+		// Positions are monitored regardless of the sentiment verdict: the gate stops
+		// new entries, it does not abandon anything already held.
 		if err := e.managePositions(ctx, sess, bounds, false); err != nil {
 			e.fail("manage positions", err)
 			return
 		}
-		if halted {
-			e.setState(domain.StateHaltedBearish)
+		verdict, _, err := e.entryVerdict(sess)
+		if err != nil {
+			e.fail("resolve sentiment gate", err)
 			return
 		}
-		e.setState(domain.StateScreening)
+		if verdict == domain.VerdictBearish {
+			e.setState(domain.StateHaltedBearish)
+		} else {
+			e.setState(domain.StateScreening)
+		}
 		if e.claimScan(e.now(), e.cfg.Timing.ScreenerScanInterval) {
 			e.startScreen(ctx, sess, "screen", func(context.Context) scanPass {
 				return e.regularPass(sess, bounds)
@@ -596,7 +600,13 @@ func (e *Engine) Tick(ctx context.Context) {
 	}
 }
 
-// pollSentiment records a reading if one is due.
+// pollSentiment records a reading if one is due and updates the session's current
+// entry verdict from it.
+//
+// This runs continuously through the trading and extended-hours day rather than in
+// a blocking window ahead of either, so the verdict it produces is a live,
+// reversible read of the most recent reading — not a one-time decision for the
+// day. A later bullish reading lifts an earlier bearish block, and vice versa.
 func (e *Engine) pollSentiment(ctx context.Context, sess scheduler.Session) error {
 	readings, err := e.store.SentimentReadings(sess.Date)
 	if err != nil {
@@ -604,7 +614,7 @@ func (e *Engine) pollSentiment(ctx context.Context, sess scheduler.Session) erro
 	}
 	now := e.now()
 	// Derived from stored readings rather than an in-memory timestamp so a restart
-	// mid-hour does not double-poll or skip the remaining polls.
+	// mid-session does not double-poll or skip the remaining polls.
 	if len(readings) > 0 {
 		last := readings[len(readings)-1].TakenAt
 		if now.Sub(last) < e.cfg.Timing.SentimentPollInterval {
@@ -623,72 +633,77 @@ func (e *Engine) pollSentiment(ctx context.Context, sess scheduler.Session) erro
 		}
 	}
 
+	verdict := sentiment.Classify(pcts, e.cfg)
 	reading := domain.SentimentReading{
 		TakenAt: now, SessionDate: sess.Date, Percentages: pcts,
-		Classification: sentiment.Classify(pcts, e.cfg),
+		Classification: verdict,
 	}
 	e.log.Info("sentiment reading", "session", sess.Date,
-		"classification", reading.Classification, "percentages", pcts)
-	e.record(audit.SentimentRead, "", fmt.Sprintf("sentiment reads %s", reading.Classification),
-		map[string]any{"classification": string(reading.Classification), "percentages": pcts})
-	return e.store.AddSentimentReading(reading)
+		"classification", verdict, "percentages", pcts)
+	e.record(audit.SentimentRead, "", fmt.Sprintf("sentiment reads %s", verdict),
+		map[string]any{"classification": string(verdict), "percentages": pcts})
+	if err := e.store.AddSentimentReading(reading); err != nil {
+		return err
+	}
+	return e.updateEntryVerdict(sess, verdict, pcts)
 }
 
-// resolveGate decides the session once the first hour is over, and reports
-// whether trading is halted.
-func (e *Engine) resolveGate(sess scheduler.Session) (bool, error) {
+// updateEntryVerdict persists the current verdict on every reading, but audits the
+// moment entries become blocked or unblocked only on a transition. Every reading is
+// already audited by pollSentiment, so the audit trail stays quiet while the verdict
+// does not change rather than repeating the same halt event every poll.
+//
+// The store write itself is unconditional — not just on a transition — so a stored
+// reason always reflects this build's wording. A session already sitting bearish
+// when the daemon restarts onto new code (or a reworded message) self-heals on the
+// very next poll instead of showing whatever text an earlier build wrote and never
+// touching it again.
+func (e *Engine) updateEntryVerdict(sess scheduler.Session, verdict domain.Verdict, pcts map[string]float64) error {
 	rec, err := e.store.Session(sess.Date)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if rec.Verdict != domain.VerdictPending {
-		return rec.Halted, nil
-	}
-
-	readings, err := e.store.SentimentReadings(sess.Date)
-	if err != nil {
-		return false, err
-	}
-	if len(readings) == 0 {
-		// The daemon was started after the first hour, so the gate has no data to
-		// judge. Trading requires a sentiment check to have happened, so stay out
-		// for the day rather than assuming conditions are fine.
-		reason := "no sentiment readings were taken during the first hour"
-		e.log.Warn("no sentiment readings for this session; halting for the day",
-			"session", sess.Date)
-		if err := e.store.SetVerdict(sess.Date, domain.VerdictBearish, reason); err != nil {
-			return false, err
-		}
-		e.record(audit.TradingHalted, "", "halted for the session: "+reason,
-			map[string]any{"reason": reason, "readings": 0})
-		return true, nil
-	}
-
-	verdict := sentiment.GateVerdict(readings, e.cfg)
 	reason := ""
 	if verdict == domain.VerdictBearish {
-		reason = fmt.Sprintf("first-hour sentiment %v", readings[len(readings)-1].Percentages)
-	}
-	e.log.Info("sentiment gate resolved", "session", sess.Date, "verdict", verdict)
-	last := readings[len(readings)-1]
-	detail := map[string]any{
-		"verdict":     string(verdict),
-		"readings":    len(readings),
-		"percentages": last.Percentages,
+		reason = "sentiment is overwhelmingly bearish"
 	}
 	if err := e.store.SetVerdict(sess.Date, verdict, reason); err != nil {
-		return false, err
+		return err
 	}
+	if rec.Verdict == verdict {
+		return nil
+	}
+	detail := map[string]any{
+		"verdict": string(verdict), "percentages": pcts, "previous": string(rec.Verdict),
+	}
+	switch verdict {
+	case domain.VerdictBearish:
+		e.log.Warn("sentiment turned bearish; new entries blocked", "session", sess.Date)
+		e.record(audit.TradingHalted, "", "new entries blocked: sentiment turned overwhelmingly bearish", detail)
+	case domain.VerdictProceed:
+		e.log.Info("sentiment cleared; new entries allowed", "session", sess.Date)
+		e.record(audit.GateResolved, "", "new entries allowed: sentiment is no longer bearish", detail)
+	}
+	return nil
+}
 
-	halted := verdict == domain.VerdictBearish
-	if halted {
-		e.record(audit.TradingHalted, "",
-			"halted for the session: first-hour sentiment was overwhelmingly bearish", detail)
-	} else {
-		e.record(audit.GateResolved, "",
-			"gate passed; screening may begin", detail)
+// entryVerdict reads the session's current sentiment verdict and, when it is not
+// PROCEED, why new entries are refused right now. It never calls out for data
+// itself — pollSentiment is the only writer — so it is cheap enough to call from
+// every pass that needs to know.
+func (e *Engine) entryVerdict(sess scheduler.Session) (verdict domain.Verdict, reason string, err error) {
+	rec, err := e.store.Session(sess.Date)
+	if err != nil {
+		return "", "", err
 	}
-	return halted, nil
+	switch rec.Verdict {
+	case domain.VerdictBearish:
+		return rec.Verdict, rec.HaltReason, nil
+	case domain.VerdictProceed:
+		return rec.Verdict, "", nil
+	default:
+		return rec.Verdict, "no sentiment reading yet", nil
+	}
 }
 
 // scanWindow names which of the day's three screening windows a pass belongs to.
@@ -795,33 +810,32 @@ func (e *Engine) claimScan(now time.Time, interval time.Duration) bool {
 // After the entry window closes it keeps screening but stops buying. The page is the
 // reason: an operator watching the afternoon should still see what is setting up and
 // why it was not taken, rather than an empty table that looks like a broken scanner.
+// A bearish sentiment verdict blocks entry the same way: screening continues, only
+// the Action column changes, and the block lifts the moment a later reading clears it.
 func (e *Engine) regularPass(sess scheduler.Session, bounds scheduler.Boundaries) scanPass {
-	return scanPass{
+	p := scanPass{
 		window:     windowRegular,
 		thresholds: screener.ThresholdsFor(e.cfg, false),
 		barsSince:  sess.Open,
 		windowEnd:  bounds.EntryWindowEnd,
 	}
+	if _, reason, err := e.entryVerdict(sess); err != nil {
+		e.log.Warn("could not read the sentiment verdict; screening only", "err", err)
+		p.blocked = "the sentiment verdict could not be read"
+	} else {
+		p.blocked = reason
+	}
+	return p
 }
 
 // extendedPass is the scan for the two extended-hours sessions — the pre-market open
 // to the bell, and the close to the post-market end — including whether it may buy.
 //
-// The two halves differ in exactly one thing: where the authority to buy comes from.
-//
-// Before the bell the first-hour sentiment gate has not run and cannot have, since its
-// readings are taken after the open. So pre-market entry has no kill switch to
-// inherit. Rather than trade without one, this takes a live reading of the same basket
-// through the same classifier and withholds entry on an overwhelmingly bearish tape —
-// and withholds it just as readily when the reading is unavailable, because no answer
-// is not a passing answer. That reading is deliberately not persisted: resolveGate
-// decides the session from the stored readings, and a 06:00 sample must not be able to
-// settle the day before the market has opened.
-//
-// After the close the gate has already resolved on real first-hour readings, so
-// post-market defers to the day's verdict exactly as the regular session does rather
-// than taking a second, differently-sourced opinion. A day the kill switch halted
-// stays halted through post-market.
+// The sentiment gate behind entry is the same continuous, reversible one the regular
+// session reads: a live classification of the most recent poll, updated every
+// timing.sentiment_poll_interval through both halves of the day. The two halves no
+// longer differ in where that authority comes from — only in their thresholds, their
+// chart start and their order routing.
 func (e *Engine) extendedPass(ctx context.Context, sess scheduler.Session, bounds scheduler.Boundaries) scanPass {
 	now := e.now()
 	window := windowAt(now, bounds)
@@ -839,27 +853,11 @@ func (e *Engine) extendedPass(ctx context.Context, sess scheduler.Session, bound
 		return p
 	}
 
-	if window == windowPostBell {
-		halted, err := e.resolveGate(sess)
-		switch {
-		case err != nil:
-			e.log.Warn("could not resolve the sentiment gate; screening only", "err", err)
-			p.blocked = "the session's sentiment gate could not be read"
-		case halted:
-			p.blocked = "halted for the session"
-		}
-		return p
-	}
-
-	check, err := e.readSentiment(ctx)
-	switch {
-	case err != nil:
-		e.log.Warn("pre-market sentiment unavailable; screening only", "err", err)
-		p.blocked = "pre-market sentiment unavailable"
-	case check.Classification == domain.VerdictBearish:
-		e.log.Info("pre-market sentiment is bearish; screening only",
-			"percentages", check.Percentages)
-		p.blocked = "pre-market sentiment is overwhelmingly bearish"
+	if _, reason, err := e.entryVerdict(sess); err != nil {
+		e.log.Warn("could not read the sentiment verdict; screening only", "err", err)
+		p.blocked = "the sentiment verdict could not be read"
+	} else {
+		p.blocked = reason
 	}
 	return p
 }

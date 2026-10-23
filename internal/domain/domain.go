@@ -20,7 +20,6 @@ const (
 	// share is the part that matters — a thin book, limit-only routing, and screening
 	// numbers that are not the regular session's.
 	StateExtendedMarket AgentState = "EXTENDED_MARKET"
-	StateSentimentCheck AgentState = "SENTIMENT_CHECK"
 	StateScreening      AgentState = "SCREENING"
 	StateHaltedBearish  AgentState = "HALTED_BEARISH"
 	StateEODWindow      AgentState = "EOD_WINDOW"
@@ -37,25 +36,20 @@ type Phase int
 const (
 	PhaseClosed Phase = iota
 	PhaseExtended
-	PhaseFirstHour
 	PhaseTrading
 	PhaseEODWindow
 )
 
-// Verdict is the outcome of the first-hour sentiment gate.
+// Verdict is the current sentiment-gate reading: live and reversible, since the
+// poll behind it now runs continuously through the trading and extended-hours day
+// rather than once in a blocking first-hour window. A later bullish reading lifts
+// an earlier bearish block, and vice versa.
 type Verdict string
 
 const (
 	VerdictPending Verdict = "PENDING"
 	VerdictProceed Verdict = "PROCEED"
 	VerdictBearish Verdict = "OVERWHELMINGLY_BEARISH"
-	// VerdictOverridden is an operator dismissing a halt the gate could not actually
-	// judge — the daemon started after the first hour, so no readings exist and
-	// resolveGate halts rather than trading without the safety check. Distinct from
-	// PROCEED for the same reason ExitManual is distinct from a strategy exit: the
-	// gate did not pass, it was stood down, and the page and the trail should not
-	// later claim otherwise.
-	VerdictOverridden Verdict = "GATE_OVERRIDDEN"
 )
 
 // ExitReason records why a position was closed. Mirrors the exit triggers in
@@ -241,9 +235,9 @@ type Evaluation struct {
 }
 
 // SentimentCheck is the result of a manually triggered sentiment read. It is
-// deliberately not a SentimentReading: a manual check is never persisted, because
-// the gate verdict is decided by the most recent stored reading and a mid-session
-// manual check would otherwise be able to overturn what the first hour concluded.
+// deliberately not a SentimentReading: a manual check can be run at any moment,
+// including outside the hours the automatic poll covers, and persisting it would
+// feed an arbitrarily-timed sample into the continuous series the gate reads.
 type SentimentCheck struct {
 	TakenAt        time.Time
 	Percentages    map[string]float64
@@ -278,7 +272,8 @@ type ManualOpen struct {
 	FromSetup bool
 	// SetupReason is why there was no setup, when there was not.
 	SetupReason string
-	// Halted records that the session's kill switch was on and this overrode it.
+	// Halted records that the live sentiment gate was currently blocking new entries
+	// and this overrode it.
 	Halted bool
 	// Qualified is whether the symbol passed the screen on the latest pass, and
 	// ScreenReason is why not when it did not. A manual open is allowed either way;
@@ -295,7 +290,8 @@ type ManualOpen struct {
 	StopOrderNote   string
 }
 
-// SentimentReading is one 10-minute poll during the first hour.
+// SentimentReading is one poll of the sentiment basket, taken every
+// timing.sentiment_poll_interval throughout the trading and extended-hours day.
 type SentimentReading struct {
 	TakenAt        time.Time
 	SessionDate    string

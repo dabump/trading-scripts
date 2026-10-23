@@ -57,7 +57,7 @@ func TestSentimentModalRendersReading(t *testing.T) {
 		"Sentiment check",
 		"OVERWHELMINGLY_BEARISH",
 		"-1.42%", "-1.61%", "-1.90%",
-		"would halt trading",
+		"would block new entries",
 		// The modal must say the check changed nothing.
 		"cannot change the session's gate",
 		"bearish at avg ≤ -0.8%",

@@ -137,7 +137,8 @@ func parseTime(s string) time.Time {
 	return t
 }
 
-// SessionRecord is the per-day state the gate and kill switch depend on.
+// SessionRecord is the session's current sentiment-gate state: the most recent
+// verdict, live and reversible, not a one-time decision for the day.
 type SessionRecord struct {
 	Date       string
 	Verdict    domain.Verdict
@@ -166,7 +167,9 @@ func (s *Store) Session(date string) (SessionRecord, error) {
 	return rec, nil
 }
 
-// SetVerdict records the gate outcome, halting the session when bearish.
+// SetVerdict records the current verdict, halting new entries when bearish and
+// clearing that halt when a later call reports otherwise — called every time
+// pollSentiment's latest reading changes the verdict, not once for the day.
 func (s *Store) SetVerdict(date string, v domain.Verdict, haltReason string) error {
 	halted := 0
 	if v == domain.VerdictBearish {
@@ -184,7 +187,7 @@ func (s *Store) SetVerdict(date string, v domain.Verdict, haltReason string) err
 	return nil
 }
 
-// AddSentimentReading appends one first-hour poll.
+// AddSentimentReading appends one poll of the sentiment basket.
 func (s *Store) AddSentimentReading(r domain.SentimentReading) error {
 	payload, err := json.Marshal(r.Percentages)
 	if err != nil {

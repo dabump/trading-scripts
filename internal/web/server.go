@@ -51,9 +51,6 @@ type Actions interface {
 	ScreenNow(ctx context.Context) (domain.ScreenPreview, error)
 	ClosePosition(ctx context.Context, id int64) (domain.Position, error)
 	OpenPosition(ctx context.Context, symbol string) (domain.ManualOpen, error)
-	// IgnoreHalt dismisses a halt the gate could not judge. It does not trade; it
-	// only lets the automated path resume.
-	IgnoreHalt(ctx context.Context) error
 }
 
 type Server struct {
@@ -93,7 +90,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/actions/screen", s.handleScreenNow)
 	mux.HandleFunc("/actions/close", s.handleClosePosition)
 	mux.HandleFunc("/actions/open", s.handleOpenPosition)
-	mux.HandleFunc("/actions/ignore-halt", s.handleIgnoreHalt)
 	return mux
 }
 
@@ -180,9 +176,9 @@ func (s *Server) handleCheckSentiment(w http.ResponseWriter, r *http.Request) {
 	}
 	switch check.Classification {
 	case domain.VerdictBearish:
-		m.Tone, m.Verdict = "bad", "Overwhelmingly bearish — this would halt trading for the session."
+		m.Tone, m.Verdict = "bad", "Overwhelmingly bearish — this would block new entries right now."
 	case domain.VerdictProceed:
-		m.Tone, m.Verdict = "good", "Not overwhelmingly bearish — this would allow screening to proceed."
+		m.Tone, m.Verdict = "good", "Not overwhelmingly bearish — this would allow new entries."
 	default:
 		m.Tone, m.Verdict = "idle", "Not enough data to classify."
 	}
@@ -384,32 +380,6 @@ func (s *Server) handleOpenPosition(w http.ResponseWriter, r *http.Request) {
 		m.SetupReason = res.SetupReason
 	}
 	s.renderModal(w, "openModal", m)
-}
-
-// handleIgnoreHalt dismisses a halt that exists only because no readings were taken.
-func (s *Server) handleIgnoreHalt(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if s.actions == nil {
-		s.renderActionError(w, "Manual actions are not available.", http.StatusServiceUnavailable)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), actionTimeout)
-	defer cancel()
-
-	if err := s.actions.IgnoreHalt(ctx); err != nil {
-		s.log.Warn("halt override refused", "err", err)
-		s.renderActionError(w, err.Error(), http.StatusOK)
-		return
-	}
-	s.renderModal(w, "ignoreHaltModal", struct{ Title, TakenAt string }{
-		Title:   "Halt dismissed",
-		TakenAt: s.now().In(scheduler.ET).Format("15:04:05 MST"),
-	})
 }
 
 func (s *Server) renderModal(w http.ResponseWriter, name string, data any) {

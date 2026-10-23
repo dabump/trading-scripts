@@ -76,9 +76,10 @@ func (g *manualGuards) releaseOpen(symbol string) {
 // CheckSentiment runs the sentiment classification on demand and returns the
 // result without storing it.
 //
-// Nothing is persisted on purpose: the gate verdict is decided by the most recent
-// stored reading, so writing a manual check would let a click at any hour
-// overturn what the first hour concluded.
+// Nothing is persisted on purpose: this is a read-only convenience for the page's
+// button, callable at any hour including outside the automatic poll's cadence, and
+// writing it would feed an arbitrarily-timed sample into the continuous series the
+// live entry gate reads.
 func (e *Engine) CheckSentiment(ctx context.Context) (domain.SentimentCheck, error) {
 	if !e.manual.sentiment.TryLock() {
 		return domain.SentimentCheck{}, ErrBusy
@@ -95,12 +96,8 @@ func (e *Engine) CheckSentiment(ctx context.Context) (domain.SentimentCheck, err
 }
 
 // readSentiment classifies the basket as it stands right now, without storing
-// anything.
-//
-// Two callers share it and both depend on it not persisting: the page's button,
-// which must not be able to overturn the session's gate with a click, and the
-// pre-market pass, which stands this in for a gate that has not run yet. Storing
-// either would change what resolveGate judges the session on.
+// anything. The page's "Check sentiment" button is the only caller; storing this
+// would change what the automatic poll's cadence and the live entry gate see.
 func (e *Engine) readSentiment(ctx context.Context) (domain.SentimentCheck, error) {
 	snaps, err := e.data.Snapshots(ctx, e.cfg.Sentiment.Symbols)
 	if err != nil {
@@ -520,68 +517,4 @@ func (e *Engine) OpenPosition(ctx context.Context, symbol string) (domain.Manual
 
 	res.Position = stored
 	return res, nil
-}
-
-// ErrNotHalted and ErrHaltWasJudged explain a refused override.
-var (
-	ErrNotHalted = errors.New("this session is not halted")
-	// ErrHaltWasJudged marks the case this button deliberately does not cover: a halt
-	// the gate reached on real readings.
-	ErrHaltWasJudged = errors.New(
-		"this halt came from actual sentiment readings, not from missing ones — it is the kill " +
-			"switch working, and it is not dismissed from here")
-)
-
-// IgnoreHalt dismisses a halt that exists only because the gate had nothing to judge.
-//
-// resolveGate halts the day when no first-hour readings exist, which happens whenever
-// the daemon is started after the first hour. That is the right default — trading
-// without the safety check ever having run is worse than sitting out — but it is not a
-// risk decision, it is an absence of data, and a restart at 11:00 should not
-// automatically cost the rest of the day.
-//
-// It deliberately does not dismiss a halt the gate actually reached. A bearish verdict
-// on real readings is the kill switch doing its job; overriding that is a different
-// decision with different consequences, and it is not this button. The two are told
-// apart structurally — by whether any readings exist — rather than by matching the
-// halt's wording, which would break the moment the message was reworded.
-//
-// The verdict becomes GATE_OVERRIDDEN rather than PROCEED, so neither the page nor the
-// trail can later claim the gate passed. It is persisted, so a further restart does not
-// re-halt the day.
-func (e *Engine) IgnoreHalt(ctx context.Context) error {
-	sess, tradingDay := e.Session()
-	if !tradingDay {
-		return ErrNotHalted
-	}
-
-	rec, err := e.store.Session(sess.Date)
-	if err != nil {
-		return err
-	}
-	if !rec.Halted {
-		return ErrNotHalted
-	}
-	readings, err := e.store.SentimentReadings(sess.Date)
-	if err != nil {
-		return err
-	}
-	if len(readings) > 0 {
-		return ErrHaltWasJudged
-	}
-
-	if err := e.store.SetVerdict(sess.Date, domain.VerdictOverridden, ""); err != nil {
-		return err
-	}
-	e.log.Warn("session halt dismissed by hand; screening resumes without a sentiment gate",
-		"session", sess.Date, "previous_reason", rec.HaltReason)
-	e.record(audit.GateResolved, "",
-		"halt dismissed by hand: no first-hour readings existed, so the gate had nothing to judge",
-		map[string]any{
-			"verdict":         string(domain.VerdictOverridden),
-			"manual":          true,
-			"readings":        0,
-			"previous_reason": rec.HaltReason,
-		})
-	return nil
 }

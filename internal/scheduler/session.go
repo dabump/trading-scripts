@@ -61,7 +61,6 @@ type Boundaries struct {
 	// on that side of the bell, exactly as before.
 	ExtendedOpen time.Time
 	Open         time.Time
-	FirstHourEnd time.Time
 	// EntryWindowEnd is the last moment a new position may be opened in the regular
 	// session. Screening continues after it — the page still shows what is setting up —
 	// but nothing is bought. It is the earlier of `open + entry_window` and
@@ -133,7 +132,6 @@ func extendedBounds(s Session, cfg *config.Config, b *Boundaries) {
 func Bounds(s Session, cfg *config.Config) Boundaries {
 	b := Boundaries{
 		Open:           s.Open,
-		FirstHourEnd:   s.Open.Add(cfg.Timing.SentimentWindow),
 		EntryWindowEnd: s.Open.Add(cfg.Timing.EntryWindow),
 		EODExit:        s.Close.Add(-time.Duration(cfg.Exit.EODExitOffsetMins) * time.Minute),
 		Close:          s.Close,
@@ -156,11 +154,10 @@ func Bounds(s Session, cfg *config.Config) Boundaries {
 
 // PhaseAt reports where the given instant sits within the session.
 //
-// An early close can push the EOD exit mark before the first hour has even
-// finished (a 13:00 close with a 09:30 open leaves only 3.5 hours). In that case
-// the EOD window wins: flattening positions before the close matters more than
-// completing the sentiment poll, and entering trades with less than the normal
-// runway was never the intent.
+// An early close can push the EOD exit mark right up against the open (a 13:00
+// close with a 09:30 open leaves only 3.5 hours). In that case the EOD window
+// wins: flattening positions before the close matters more than entering trades
+// with less than the normal runway, which was never the intent.
 //
 // Extended hours only ever occupy time that used to be PhaseClosed, and only when the
 // corresponding mark is set. Everything between the bells is untouched. After the
@@ -179,8 +176,6 @@ func PhaseAt(now time.Time, b Boundaries) domain.Phase {
 		switch {
 		case !now.Before(b.EODExit):
 			return domain.PhaseEODWindow
-		case now.Before(b.FirstHourEnd):
-			return domain.PhaseFirstHour
 		default:
 			return domain.PhaseTrading
 		}
@@ -223,10 +218,9 @@ func ExtendedStart(now time.Time, b Boundaries) time.Time {
 	return b.Close
 }
 
-// BeforeTheBell distinguishes the two halves of PhaseExtended. They share a phase and
-// every threshold, but not their sentiment authority — a live read before the open,
-// the day's resolved gate after the close — and a watchlist from one must never be
-// acted on in the other.
+// BeforeTheBell distinguishes the two halves of PhaseExtended. They share a phase,
+// every threshold and the same continuous sentiment gate, but a watchlist from one
+// must never be acted on in the other.
 func BeforeTheBell(now time.Time, b Boundaries) bool {
 	return now.Before(b.Open)
 }

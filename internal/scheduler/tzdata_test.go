@@ -70,11 +70,10 @@ func TestSessionBoundariesIgnoreHostTimezone(t *testing.T) {
 		Close: time.Date(2026, 7, 15, 16, 0, 0, 0, ET),
 	}
 	cfg := &config.Config{}
-	cfg.Timing.SentimentWindow = time.Hour
 	cfg.Exit.EODExitOffsetMins = 30
 
 	want := map[string]string{
-		"open": "09:30", "first hour end": "10:30", "eod exit": "15:30", "close": "16:00",
+		"open": "09:30", "eod exit": "15:30", "close": "16:00",
 	}
 
 	for _, zone := range []string{"UTC", "Australia/Sydney", "America/Los_Angeles"} {
@@ -89,10 +88,9 @@ func TestSessionBoundariesIgnoreHostTimezone(t *testing.T) {
 
 			b := Bounds(sess, cfg)
 			got := map[string]string{
-				"open":           b.Open.In(ET).Format("15:04"),
-				"first hour end": b.FirstHourEnd.In(ET).Format("15:04"),
-				"eod exit":       b.EODExit.In(ET).Format("15:04"),
-				"close":          b.Close.In(ET).Format("15:04"),
+				"open":     b.Open.In(ET).Format("15:04"),
+				"eod exit": b.EODExit.In(ET).Format("15:04"),
+				"close":    b.Close.In(ET).Format("15:04"),
 			}
 			for name, wantAt := range want {
 				if got[name] != wantAt {
@@ -107,7 +105,7 @@ func TestSessionBoundariesIgnoreHostTimezone(t *testing.T) {
 				want domain.Phase
 			}{
 				{at(9, 0), domain.PhaseClosed},
-				{at(9, 30), domain.PhaseFirstHour},
+				{at(9, 30), domain.PhaseTrading},
 				{at(10, 30), domain.PhaseTrading},
 				{at(15, 30), domain.PhaseEODWindow},
 				{at(16, 0), domain.PhaseClosed},

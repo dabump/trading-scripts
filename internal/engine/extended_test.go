@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -225,19 +226,19 @@ func TestPreMarketEntryIsGatedOnLiveSentiment(t *testing.T) {
 	if len(evals) != 1 || !evals[0].Qualifies {
 		t.Fatalf("screening must continue through a bearish read: %+v", evals)
 	}
-	if evals[0].Outcome != "pre-market sentiment is overwhelmingly bearish" {
+	if !strings.Contains(evals[0].Outcome, "overwhelmingly bearish") {
 		t.Errorf("Outcome = %q, want the bearish read named", evals[0].Outcome)
 	}
 
-	// That read must not have been persisted: the session's verdict belongs to the
-	// first hour, and a 07:30 sample cannot be allowed to settle the day.
+	// The gate is the same continuous, reversible one the regular session reads, so
+	// unlike the old live-and-unpersisted pre-market read, this one is stored —
+	// exactly what lets a later bullish reading lift the block.
 	readings, err := h.store.SentimentReadings(h.date)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(readings) != 0 {
-		t.Errorf("stored %d pre-market readings, want 0 — resolveGate judges the first hour",
-			len(readings))
+	if len(readings) != 1 {
+		t.Errorf("stored %d pre-market readings, want 1", len(readings))
 	}
 }
 
@@ -597,7 +598,12 @@ func TestPostMarketRespectsTheSessionHalt(t *testing.T) {
 	h := newHarness(t)
 	h.enableExtended()
 	h.allowExtendedEntry()
-	// A bearish first hour, judged into a halt by the regular session.
+	// Registered before the regular session's first scan: screening continues
+	// through a blocked session now, so the universe it caches has to include this
+	// symbol for the post-market pass to find it later.
+	h.addExtendedCandidate("LATE", 5.00, 800_000, time.Date(2026, 9, 28, 17, 30, 0, 0, scheduler.ET))
+
+	// A bearish regular session, blocking entries on the live gate.
 	h.setBearish()
 	h.at(10, 0)
 	h.tick()
@@ -605,7 +611,6 @@ func TestPostMarketRespectsTheSessionHalt(t *testing.T) {
 	h.tick()
 	h.wantState(domain.StateHaltedBearish)
 
-	h.addExtendedCandidate("LATE", 5.00, 800_000, time.Date(2026, 9, 28, 17, 30, 0, 0, scheduler.ET))
 	h.at(17, 30)
 	h.tick()
 	h.wantState(domain.StateExtendedMarket)
@@ -614,7 +619,7 @@ func TestPostMarketRespectsTheSessionHalt(t *testing.T) {
 		t.Fatalf("placed %d orders after the close on a halted day, want 0", got)
 	}
 	evals := h.latestScreen()
-	if len(evals) != 1 || evals[0].Outcome != "halted for the session" {
+	if len(evals) != 1 || !strings.Contains(evals[0].Outcome, "overwhelmingly bearish") {
 		t.Errorf("post-market outcome = %+v, want the page to say the day is halted", evals)
 	}
 }

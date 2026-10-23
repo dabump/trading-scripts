@@ -99,6 +99,16 @@ section.card {
   color: var(--warn);
 }
 
+/* A table that must not grow its card past a fixed height — the sentiment table
+   keeps up to an hour of 5-minute readings (12 rows), which would otherwise push
+   the card taller than its fixed-height sibling in the two-column grid every time
+   a new reading lands. The header stays put while the body scrolls. 392px is 8 full
+   rows plus the header at this font size — sized to a row boundary so the last
+   visible row is never cut off mid-line. */
+.scroll-body { max-height: 392px; overflow-y: auto; }
+.scroll-body table { width: 100%; }
+.scroll-body thead th { position: sticky; top: 0; background: var(--panel-2); z-index: 1; }
+
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th {
   text-align: left; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
@@ -302,33 +312,6 @@ document.addEventListener('click', async (e) => {
   }
 });
 
-// Dismissing a halt the gate could not judge. It places no order — it only lets the
-// automated path resume — but it does mean the session runs without a kill switch, so
-// it says so rather than asking a bland "are you sure".
-document.addEventListener('click', async (e) => {
-  const btn = e.target.closest('button[data-ignore-halt]');
-  if (!btn) return;
-  if (!confirm('Resume screening for this session?\n\nNo first-hour sentiment readings exist, ' +
-               'so the gate never ran and cannot run. The rest of the day will trade without a ' +
-               'sentiment kill switch behind it.')) return;
-
-  btn.disabled = true;
-  try {
-    const res = await fetch('actions/ignore-halt', {
-      method: 'POST', headers: { 'Accept': 'text/html' },
-    });
-    modalContent.innerHTML = await res.text();
-    if (!modal.open) modal.showModal();
-  } catch (err) {
-    modalContent.innerHTML = '<div class="mhead"><h3>Failed</h3></div>' +
-      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
-    if (!modal.open) modal.showModal();
-  } finally {
-    btn.disabled = false;
-    refresh();
-  }
-});
-
 // Opening a position by hand. It buys on the click, with no browser confirmation
 // (on request, 2026-09-30): the result modal says what was overridden, the size
 // and the stop. The server still refuses what the risk rules refuse.
@@ -440,6 +423,22 @@ document.addEventListener('click', (e) => {
   applyFolds();
 });
 
+// Scroll position inside a bounded box (e.g. the sentiment history) would
+// otherwise snap back to the top on every poll, because the poll replaces the
+// whole content block wholesale. Saved by a stable key just before the swap,
+// restored just after — the same reasoning as the tab and fold state above.
+const scrollPositions = {};
+function saveScrolls() {
+  document.querySelectorAll('[data-scroll-id]').forEach(el => {
+    scrollPositions[el.dataset.scrollId] = el.scrollTop;
+  });
+}
+function applyScrolls() {
+  document.querySelectorAll('[data-scroll-id]').forEach(el => {
+    el.scrollTop = scrollPositions[el.dataset.scrollId] || 0;
+  });
+}
+
 // Re-fetches the rendered fragment and swaps it in, so the markup is produced in
 // exactly one place (the Go template) rather than duplicated in JS.
 const POLL_MS = {{.PollSeconds}} * 1000;
@@ -448,9 +447,12 @@ async function refresh() {
     const url = closedDay ? 'fragment?closed=' + encodeURIComponent(closedDay) : 'fragment';
     const res = await fetch(url, { headers: { 'Accept': 'text/html' } });
     if (!res.ok) return;
-    document.getElementById('content').innerHTML = await res.text();
+    const html = await res.text();
+    saveScrolls();
+    document.getElementById('content').innerHTML = html;
     applyTab();
     applyFolds();
+    applyScrolls();
   } catch (e) { /* a transient failure just leaves the last good render up */ }
 }
 setInterval(refresh, POLL_MS);
@@ -489,11 +491,7 @@ setInterval(refresh, POLL_MS);
 {{end}}
 {{if .HaltReason}}
 <div class="alert soft">
-  <strong>■ Halted for the session:</strong> {{.HaltReason}}
-  {{if .CanIgnoreHalt}}
-  <button type="button" class="mini" data-ignore-halt style="margin-left:10px"
-          title="Resume screening without a sentiment gate for this session">Ignore</button>
-  {{end}}
+  <strong>■ New entries blocked:</strong> {{.HaltReason}}
 </div>
 {{end}}
 
@@ -511,8 +509,9 @@ setInterval(refresh, POLL_MS);
   </section>
 
   <section class="card">
-    <h2>Sentiment gate <span class="meta"><span class="{{.GateTone}}">{{.GateVerdict}}</span></span></h2>
+    <h2>Sentiment <span class="meta"><span class="{{.GateTone}}">{{.GateVerdict}}</span></span></h2>
     {{if .Sentiment}}
+    <div class="scroll-body" data-scroll-id="sentiment">
     <table>
       <thead><tr><th>Time</th>{{range .SentimentLabels}}<th class="num">{{.}}</th>{{end}}<th>Reading</th></tr></thead>
       <tbody>
@@ -525,8 +524,9 @@ setInterval(refresh, POLL_MS);
         {{end}}
       </tbody>
     </table>
+    </div>
     {{else}}
-    <div class="body"><p class="note">No sentiment readings yet for this session.</p></div>
+    <div class="body"><p class="note">No sentiment readings in the last hour.</p></div>
     {{end}}
   </section>
 </div>
@@ -731,25 +731,13 @@ setInterval(refresh, POLL_MS);
 </div>
 {{end}}
 
-{{define "ignoreHaltModal"}}
-{{template "modalHead" .}}
-<div class="mbody">
-  <p class="kv">Screening resumes for the rest of this session.</p>
-  <p class="note" style="margin-top:12px">
-    The gate is recorded as <strong>GATE_OVERRIDDEN</strong> rather than passed, because it never
-    ran — the daemon started after the first hour, so there were no readings to judge. This
-    session therefore trades with no sentiment kill switch behind it. Every other rule is
-    unchanged.
-  </p>
-</div>
-{{end}}
-
 {{define "openModal"}}
 {{template "modalHead" .}}
 <div class="mbody">
   {{if .Halted}}
   <div class="alert soft">
-    The session's kill switch is on. This overrode it, and the trail records that it did.
+    The sentiment gate is currently blocking new entries. This overrode it, and the trail
+    records that it did.
   </div>
   {{end}}
   {{if .NotQualified}}

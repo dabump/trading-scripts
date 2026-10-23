@@ -15,15 +15,15 @@ There is one Alpaca account/API key set used for both market data and order exec
 
 | Package | Responsibility |
 |---|---|
-| `scheduler` | Pure session arithmetic, including the countdowns the status page shows (`UntilOpen`, `UntilClose`, `FormatCountdown`): given the exchange's calendar day and config, reports which phase the clock is in (closed / extended hours / sentiment-gate window / trading / EOD window) and where the boundaries fall. Two of those occur twice a day: extended hours before the open and after the close, and the EOD window before each of the two closes. Holds no state and does no I/O. |
+| `scheduler` | Pure session arithmetic, including the countdowns the status page shows (`UntilOpen`, `UntilClose`, `FormatCountdown`): given the exchange's calendar day and config, reports which phase the clock is in (closed / extended hours / trading / EOD window) and where the boundaries fall. Two of those occur twice a day: extended hours before the open and after the close, and the EOD window before each of the two closes. There is no separate sentiment-gate phase any more — the gate is checked continuously within trading and extended hours rather than owning a blocking window of its own. Holds no state and does no I/O. |
 | `engine` | Drives the daily loop that `scheduler` describes, plus restart reconciliation. One `Tick` decides what is due, and every order is sent from it; there are no per-phase goroutines and no direct `time.Now()` calls (the clock is injected, which is what makes a whole day testable). The one exception to running inline is the screen: under `Run` it runs on a background goroutine and publishes a watchlist, so a pass that takes most of a minute no longer holds up the 2-second position checks or the per-candle setup check. A test calling `Tick` directly gets the screen inline. |
 | `config` | Loads and validates `config/config.yaml`, rejecting configurations that would only fail mid-session — for example sizing × concurrency exceeding 100% of the portfolio. Credentials are read from the environment here, never from YAML. |
 | `domain` | Shared types (positions, snapshots, evaluations, agent states). Exists to keep `store`, `broker`, `strategy`, `risk` and `web` from importing each other. |
-| `sentiment` | Polls market data every `timing.sentiment_poll_interval` (2m) through the gate window after the open — `timing.sentiment_window`, 5m, shortened from the hour originally specified — and produces a bullish/overwhelmingly-bearish/neutral reading. See [`strategy.md`](./strategy.md) for what feeds this. |
+| `sentiment` | Polls market data every `timing.sentiment_poll_interval` (5m), continuously through the trading and extended-hours day, and classifies each reading bullish/overwhelmingly-bearish/neutral. The latest reading is a live, reversible verdict rather than a one-time decision for the day. See [`strategy.md`](./strategy.md) for what feeds this. |
 | `screener` | Scans the candidate universe (every tradable US equity, cached per session) using config-driven thresholds: a news-catalyst presence check, intraday price move, and volume multiple (all three required — see [`strategy.md`](./strategy.md)). |
 | `cmd/backtest` | Measures the configured strategy against real Alpaca history. Imports `screener`, `sentiment`, `risk` and `strategy` so the rules measured are the rules the daemon runs; GET-only, cannot place an order. See `docs/decisions.md` for the results. |
 | `strategy` | The entry setup and the exit decisions. `FindSetup` looks for a pullback and resumption and returns the stop the pattern defines, which is what makes risk knowable before sizing; `EvaluateExit` returns the *first* action due, in priority order: forced EOD, then the stop, then the first profit target. Threshold comparisons carry a tiny epsilon because a threshold like `entry*0.9` is not exactly representable in binary floating point, and without it a price sitting exactly on a documented threshold would miss its exit. |
-| `risk` | Position sizing from the stop (`SizeForRisk`: 1% of the account at risk per trade, capped at 33% notional), max concurrent positions (3), per-trade stop-loss, and the daily kill switch when sentiment reads overwhelmingly bearish. |
+| `risk` | Position sizing from the stop (`SizeForRisk`: 1% of the account at risk per trade, capped at 33% notional), max concurrent positions (3), and per-trade stop-loss. The sentiment-driven block on new entries lives in `engine`/`sentiment` rather than here — see [`risk.md`](./risk.md). |
 | `broker` | Alpaca client, wrapped behind an interface so market data and/or execution could be swapped to a different provider later without touching strategy/risk code. |
 | `store` | SQLite persistence — positions, trade history, sentiment readings, session verdicts, screening snapshots and submitted orders. Migrations are embedded from `internal/store/migrations/` (not the repo root: `go:embed` cannot reach outside its package, and the deployment target is one self-contained binary). A partial unique index makes a second open position in the same symbol impossible at the schema level. |
 | `audit` | Append-only JSON-lines trail of decisions and actions, one file per session date, flushed on every event. Deliberately independent of `store`: the database holds current state, this holds the narrative of how that state came to be. |
@@ -33,29 +33,31 @@ There is one Alpaca account/API key set used for both market data and order exec
 
 ```
 scheduler: pre-market opens (extended.start, only when extended.enabled)
+  -> sentiment: poll every 5min, write readings to store; verdict is live and reversible
   -> screener: find candidates, on extended thresholds and cadence
        -> store: record the pass; the page shows it with "why not bought" per row
-       (extended.allow_entry only) live sentiment read -> not bearish
+       (extended.allow_entry only) current sentiment verdict -> not bearish
          -> strategy: setup on pre-market candles -> risk: size
               -> broker: extended-hours limit order -> store: record open position
   -> strategy: evaluate any pre-market position against the exit rules
 scheduler: market opens
-  -> sentiment: poll every 10min for 1 hour, write readings to store
-  -> scheduler: read sentiment history from store, decide bullish/bearish
-       bearish -> risk: trigger daily kill switch, done for the day
-       bullish -> screener (background, ~1/min): publish a watchlist
-                  tick, once per closed candle per watchlist name:
-                    -> strategy: setup on closed candles -> live price re-checked
-                    -> risk: size from the live price, check exposure cap
-                         -> broker: place order -> store: record open position
-                    (repeat through the day as candidates and exits occur)
+  -> sentiment: poll every 5min, write readings to store; verdict is live and reversible
+  -> screener (background, ~1/min): publish a watchlist regardless of the verdict
+     tick, once per closed candle per watchlist name:
+       current sentiment verdict bearish -> enterPositions skipped; screening continues
+       not bearish ->
+         -> strategy: setup on closed candles -> live price re-checked
+         -> risk: size from the live price, check exposure cap
+              -> broker: place order -> store: record open position
+       (repeat through the day as candidates, the verdict and exits change)
   -> strategy: continuously evaluate open positions against exit rules
        -> broker: place sell order -> store: close out position
   -> scheduler: force-exit any remaining open positions at T-30min-before-close
 scheduler: market closes; post-market opens (to extended.end)
+  -> sentiment: poll every 5min, write readings to store; same verdict as the regular session
   -> screener: find candidates, on the same extended thresholds and cadence
        -> store: record the pass; the page shows it with "why not bought" per row
-       (extended.allow_entry only) the day's resolved gate verdict -> not halted
+       (extended.allow_entry only) current sentiment verdict -> not bearish
          -> strategy: setup on post-market candles -> risk: size
               -> broker: extended-hours limit order -> store: record open position
   -> strategy: evaluate any post-market position against the exit rules

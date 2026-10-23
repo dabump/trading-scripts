@@ -37,9 +37,13 @@ type setupPath struct {
 func collectPaths(cfg *config.Config, days []*preparedDay) []setupPath {
 	var out []setupPath
 	for _, day := range days {
-		if day.GateBearish || day.NoGateData {
+		if day.NoGateData {
 			continue
 		}
+		// day.qualifiers is already empty for any boundary the sentiment gate was
+		// blocking at the time, so no separate day.GateBearish check is needed here
+		// — a day bearish only at the open still contributes whatever it qualified
+		// once a later reading cleared it.
 		seen := map[string]bool{}
 		for i, t := range day.Boundaries {
 			if !t.Before(day.EntryEndAt) {
@@ -148,7 +152,7 @@ func reportResearch(cfg *config.Config, days []*preparedDay) {
 	// One split date for every study, so each rule is judged on the same two halves.
 	var dates []string
 	for _, d := range days {
-		if !d.GateBearish && !d.NoGateData {
+		if !d.NoGateData {
 			dates = append(dates, d.Date)
 		}
 	}
@@ -469,7 +473,7 @@ var entryRules = []entryRule{
 func collectRule(days []*preparedDay, find func(*preparedDay, []Bar, firstQualification) (time.Time, float64, int, bool)) []setupPath {
 	var out []setupPath
 	for _, day := range days {
-		if day.GateBearish || day.NoGateData {
+		if day.NoGateData {
 			continue
 		}
 		for sym, fq := range day.firstQualified {

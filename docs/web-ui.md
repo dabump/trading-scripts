@@ -54,48 +54,62 @@ These are distinct and shouldn't be visually merged, since the agent's status do
 | State | Color | Meaning |
 |---|---|---|
 | `MARKET_CLOSED` | Gray | Outside exchange hours. Daemon idle, waiting for next open. |
-| `EXTENDED_MARKET` | Orange | Either extended-hours session — `extended.start` → the open, or the close → `extended.end`. Screening the thin tape on `extended.*` thresholds; nothing is bought unless `extended.allow_entry` is set. Before the bell the sentiment gate has not run yet; after the close the day's resolved verdict applies. |
-| `SENTIMENT_CHECK` | Amber | Market open, inside the gate window (`timing.sentiment_window`). Polling every `timing.sentiment_poll_interval`. No trades placed. |
-| `SCREENING` | Green | First-hour sentiment came back bullish. Actively screening for candidates, every `timing.screener_scan_interval`, and may hold open positions. |
+| `EXTENDED_MARKET` | Orange | Either extended-hours session — `extended.start` → the open, or the close → `extended.end`. Screening the thin tape on `extended.*` thresholds; nothing is bought unless `extended.allow_entry` is set, and even then only while the live sentiment verdict is not bearish. |
+| `SCREENING` | Green | The live sentiment verdict is not overwhelmingly bearish. Actively screening for candidates, every `timing.screener_scan_interval`, sentiment re-checked every `timing.sentiment_poll_interval`, and may hold open positions. |
 | `EOD_WINDOW` | Amber | The last `exit.eod_exit_offset_minutes` before the close — and, with extended hours on, again before `extended.end`. Flattening open positions; no new entries. |
-| `HALTED_BEARISH` | Red | The gate's sentiment came back overwhelmingly bearish, **or** the daemon started after the gate window and had no readings to judge. No trades for the rest of the session. The second case can be dismissed from the page — see "Dismissing a halt the gate could not judge". |
+| `HALTED_BEARISH` | Red | The live sentiment verdict is overwhelmingly bearish right now. New entries blocked until a later reading clears it — reversible, not a halt for the rest of the session. Positions already held are unaffected. |
 | `ERROR` | Red (distinct label from `HALTED_BEARISH`, not just color) | The daemon hit an unhandled error (e.g. data source failure). Needs attention — this is not a normal trading-halt state. |
 
-`EXTENDED_MARKET` was added when extended-hours coverage was, for the same reason `EOD_WINDOW` exists: neither of the neighbouring states is true. `MARKET_CLOSED` would report a scanning agent as idle, and `SCREENING` would imply the regular session's thresholds and entries that by default are not being taken. It gets its own orange, sitting between the grey of a closed market and the green of a trading one — and a warmer orange than the amber `SENTIMENT_CHECK`/`EOD_WINDOW` use, so the two are not read as variations of each other. With `extended.enabled: false` the state never appears and the hours outside the bells are `MARKET_CLOSED` exactly as before.
+`EXTENDED_MARKET` was added when extended-hours coverage was, for the same reason `EOD_WINDOW` exists: neither of the neighbouring states is true. `MARKET_CLOSED` would report a scanning agent as idle, and `SCREENING` would imply the regular session's thresholds and entries that by default are not being taken. It gets its own orange, sitting between the grey of a closed market and the green of a trading one — and a warmer orange than the amber `EOD_WINDOW` uses, so the two are not read as variations of each other. With `extended.enabled: false` the state never appears and the hours outside the bells are `MARKET_CLOSED` exactly as before.
 
-It shipped as `PRE_MARKET`, covering 04:00 → 09:30 only, and was renamed and widened on request (2026-10-08) when post-market coverage was added. **One state for both halves, not two.** They differ in exactly one thing — where the authority to buy comes from, a live sentiment read before the bell and the day's resolved gate after the close — and that is not something a badge can usefully carry. What they share is everything an operator reads off one: a thin book, limit-only routing, and screening numbers that are not the regular session's. The page's **description box** (the text beside the state, and the legend row) names the hours it covers, e.g. *Extended-hours session, 04:00 – 09:30 and 16:00 – 20:00 ET*; the inner bounds come from the session the calendar reported, so an early close is reflected rather than papered over with 16:00. The same string appears on the header's session line as `· extended 04:00 – 09:30 and 16:00 – 20:00 ET`.
+It shipped as `PRE_MARKET`, covering 04:00 → 09:30 only, and was renamed and widened on request (2026-10-08) when post-market coverage was added. **One state for both halves, not two.** Before 2026-10-17 they differed in where the authority to buy came from — a live sentiment read before the bell, the day's resolved gate after the close — but the gate is now the same continuous, reversible one on both sides, so there is nothing left for a badge to distinguish there either. What they share is everything an operator reads off one: a thin book, limit-only routing, and screening numbers that are not the regular session's. The page's **description box** (the text beside the state, and the legend row) names the hours it covers, e.g. *Extended-hours session, 04:00 – 09:30 and 16:00 – 20:00 ET*; the inner bounds come from the session the calendar reported, so an early close is reflected rather than papered over with 16:00. The same string appears on the header's session line as `· extended 04:00 – 09:30 and 16:00 – 20:00 ET`.
 
-The market-hours badge stays on the *regular* session's countdown throughout: during pre-market it reads `PRE-MARKET` and still counts down to 09:30, because that bell is when the sentiment gate and ordinary entries begin; after the close it reads `POST-MARKET` and counts down to the next open.
+The market-hours badge stays on the *regular* session's countdown throughout: during pre-market it reads `PRE-MARKET` and still counts down to 09:30, because that bell is when the regular session's own thresholds and entry window begin; after the close it reads `POST-MARKET` and counts down to the next open.
 
 **The three windows never overlap**, and that is load-bearing rather than incidental. An extended window reaching into the regular session would apply the thin-tape thresholds — a 0.5x relative-volume floor and a $100,000 turnover floor — to the regular market, which admits essentially everything; a regular window reaching outside the bells would send a market order to a book that takes only limit orders. `scheduler.Bounds` clamps each extended mark against the calendar's *own* open and close rather than the usual 09:30/16:00, and **drops** a half whose configured clock would overlap instead of clamping it to the bell. `TestExtendedWindowsDoNotOverlapTheRegularSession` walks a whole day a minute at a time and checks the answer `PhaseAt` gives, not the boundary fields, because that answer is what every caller reads.
 
 `EOD_WINDOW` was added during implementation. The original five states had no way to describe the window between the forced-exit mark and the close: the market is still open, so `MARKET_CLOSED` would be untrue, and `SCREENING` would imply entries were still possible. Rather than misreport either, the window got its own state.
 
 The legend's own text is built from config (`legendFor` in `internal/web/view.go`),
-not written out: the gate window, its poll cadence, the scan cadence and the
-forced-exit offset are all tunable, and the legend shipped once with the originally
-specified hour / 10-minute / 30-minute wording long after all three had changed. Keys
-are named in the table above because this document is read against the config; the
+not written out: the sentiment poll cadence, the scan cadence and the forced-exit
+offset are all tunable, and the legend shipped once with the originally specified
+hour / 10-minute / 30-minute wording long after all three had changed. Keys are
+named in the table above because this document is read against the config; the
 page renders the values, because its reader wants the minutes.
 
 `ERROR` must be visually distinguishable from `HALTED_BEARISH` beyond color alone (e.g. a different icon or label text) since both are red but mean very different things — one is a deliberate risk decision, the other is a fault.
 
-## Dismissing a halt the gate could not judge
+## The halt banner (live, reversible, no dismiss button)
 
-When the daemon starts *after* the gate window, no sentiment readings exist, so `resolveGate` has nothing to judge and halts the day:
+**Status: changed 2026-10-17.** The sentiment gate used to be judged once, a short
+way into the session, and a bearish verdict then halted trading for the rest of the
+day — dismissible only in the one case where no readings existed at all (the daemon
+started after the gate window), via an **Ignore** button that stood the gate down
+for the session. That whole mechanism is gone: the gate is now checked continuously,
+and the halt banner simply mirrors the live verdict.
 
-> ■ Halted for the session: no sentiment readings were taken during the first hour
+> ■ New entries blocked: sentiment is overwhelmingly bearish
 
-(The wording is quoted as the engine prints it; it predates `timing.sentiment_window` being shortened from the hour originally specified.)
+The banner appears exactly when `HALTED_BEARISH` is the agent's state, and disappears
+the moment a later reading is not overwhelmingly bearish — there is nothing to
+dismiss, because there is no longer a decision that outlives the reading behind it.
+A daemon started mid-session takes its first reading on the next tick rather than
+sitting out for lack of one, so the no-data halt this used to cover does not arise
+in a form that needs a button either.
 
-That is the right default — trading with the safety check never having run is worse than sitting out — but it is an **absence of data, not a risk decision**, and a restart at 11:00 should not automatically cost the rest of the session. The halt banner therefore carries an **Ignore** button, which resumes screening for the rest of the day.
+Every other rule — sizing, the stop, the position cap, the exits — is unchanged;
+the gate only ever decides whether a *new* position may be opened.
 
-Two things about it:
+## Sentiment section
 
-- **It only appears on that halt.** A halt the gate actually *reached*, on real readings, is the kill switch working, and it is not dismissible from the page. The two are told apart structurally — halted with zero readings — rather than by matching the message text, which would break the moment the wording changed.
-- **The verdict becomes `GATE_OVERRIDDEN`, not `PROCEED`.** The gate did not pass, it was stood down, and neither the page nor the audit trail should later claim otherwise. It renders amber rather than green for the same reason. The decision is persisted, so a further restart does not re-halt the day.
+A table of the basket's readings — symbol, time, classification — for the **last
+hour**, **newest first**. The current verdict heads the card.
 
-The confirmation says plainly that the session then trades with no sentiment kill switch behind it. Every other rule — sizing, the stop, the position cap, the exits — is unchanged.
+Newest first because the most recent reading is the one actually deciding whether
+entries are allowed right now; an operator checking why the banner just appeared or
+disappeared should not have to scroll past a growing full-session history to find
+it. Capped to an hour for the same reason the status it reflects is live rather than
+cumulative — older readings no longer affect anything, so they are not shown.
 
 ## Positions
 

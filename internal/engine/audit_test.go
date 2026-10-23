@@ -163,16 +163,18 @@ func TestAuditRecordsMeaningfulSkipsOnly(t *testing.T) {
 		h.fake.SetAverageVolume(c.symbol, c.avgVol)
 	}
 
-	h.at(9, 30)
-	h.tick()
-	h.at(10, 25)
-	h.tick()
-	h.at(10, 35)
+	// One tick, once both seeded charts' trigger candles have closed, decides the
+	// race for the single slot.
+	h.at(9, 46)
 	h.tick()
 
-	// Several more scans: the "already holding" skip repeats every minute and must
-	// not be recorded each time.
-	for _, m := range []int{40, 45, 50} {
+	// Several more scans: the repeating skip on the cap must not be recorded every
+	// time, for the loser or for the symbol that already holds the slot.
+	for _, m := range []int{50, 55} {
+		h.at(9, m)
+		h.tick()
+	}
+	for _, m := range []int{0, 5} {
 		h.at(10, m)
 		h.tick()
 	}

@@ -51,7 +51,7 @@ func newHarness(t *testing.T) *harness {
 		MaxPullbackBars: 2, SurgeBars: 3, MinSurgePct: 3, MaxRetracePct: 50, StopBufferPct: 0.1,
 		MinStopDistancePct: 0.5, MaxStopDistancePct: 4, MaxEntryDriftPct: 1}
 	cfg.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute,
-		SentimentWindow: time.Hour, EntryWindow: 4 * time.Hour,
+		EntryWindow:          4 * time.Hour,
 		ScreenerScanInterval: time.Minute, PositionPollInterval: 15 * time.Second}
 	cfg.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"},
 		BearishAvgPct: -0.8, RequireAllNegative: true}
@@ -153,33 +153,20 @@ func TestFullBullishDay(t *testing.T) {
 		t.Fatalf("placed %d orders before the open, want 0", got)
 	}
 
-	// First hour: sentiment polls only, never a trade.
-	for _, m := range []int{30, 40, 50} {
-		h.at(9, m)
-		h.tick()
-		h.wantState(domain.StateSentimentCheck)
-	}
-	h.at(10, 20)
+	// At the open: sentiment is read immediately, with no blocking window ahead of
+	// screening. The candidate's chart (seeded from the open) has not printed its
+	// trigger candle yet, so there is nothing to buy on this very first tick.
+	h.at(9, 30)
 	h.tick()
+	h.wantState(domain.StateScreening)
 
 	readings, err := h.store.SentimentReadings(h.date)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(readings) != 4 {
-		t.Errorf("got %d sentiment readings across the first hour, want 4", len(readings))
+	if len(readings) != 1 {
+		t.Errorf("got %d sentiment readings at the open, want 1", len(readings))
 	}
-	if got := len(h.fake.Placed()); got != 0 {
-		t.Fatalf("placed %d orders during the first hour, want 0 (docs/strategy.md §1)", got)
-	}
-	if len(h.openPositions()) != 0 {
-		t.Fatal("no positions may be open during the first hour")
-	}
-
-	// Gate opens: the candidate is bought.
-	h.at(10, 31)
-	h.tick()
-	h.wantState(domain.StateScreening)
 
 	rec, err := h.store.Session(h.date)
 	if err != nil {
@@ -188,10 +175,18 @@ func TestFullBullishDay(t *testing.T) {
 	if rec.Verdict != domain.VerdictProceed || rec.Halted {
 		t.Fatalf("gate = %q halted=%v, want PROCEED", rec.Verdict, rec.Halted)
 	}
+	if len(h.openPositions()) != 0 {
+		t.Fatal("nothing to buy until the setup's trigger candle has completed")
+	}
+
+	// Once the seeded chart's trigger candle has closed, the setup fires and the
+	// candidate is bought — on the live gate's say, not a one-time morning decision.
+	h.at(9, 46)
+	h.tick()
 
 	pos := h.openPositions()
 	if len(pos) != 1 {
-		t.Fatalf("got %d positions after the gate opened, want 1", len(pos))
+		t.Fatalf("got %d positions once the setup completed, want 1", len(pos))
 	}
 	// Sized from the stop, then capped: 1% of $100k is $1,000 of risk, and the
 	// setup's stop is about $0.146 below the $5.00 entry, which asks for ~6,800
@@ -311,20 +306,15 @@ func TestFullBullishDay(t *testing.T) {
 	h.wantState(domain.StateMarketClosed)
 }
 
-// An overwhelmingly bearish first hour must halt the day with no entries.
-func TestBearishGateHaltsTheDay(t *testing.T) {
+// An overwhelmingly bearish reading blocks new entries, but screening still runs —
+// only enterPositions is skipped — so the candidate table keeps showing what is
+// setting up even while nothing is bought.
+func TestBearishVerdictBlocksEntries(t *testing.T) {
 	h := newHarness(t)
 	h.setBearish()
 	h.addCandidate("ABCD", 5.00)
 
-	for _, m := range []int{30, 45} {
-		h.at(9, m)
-		h.tick()
-	}
-	h.at(10, 25)
-	h.tick()
-
-	h.at(10, 35)
+	h.at(9, 30)
 	h.tick()
 	h.wantState(domain.StateHaltedBearish)
 
@@ -336,48 +326,67 @@ func TestBearishGateHaltsTheDay(t *testing.T) {
 		t.Error("halt reason must be recorded for the status page")
 	}
 
-	// Screening must not run for the rest of the day, even hours later.
+	// Blocked for as long as the reading stays bearish, even hours later.
 	for _, hh := range []int{11, 13, 15} {
 		h.at(hh, 0)
 		h.tick()
 		h.wantState(domain.StateHaltedBearish)
 	}
 	if got := len(h.fake.Placed()); got != 0 {
-		t.Errorf("placed %d orders on a halted day, want 0", got)
+		t.Errorf("placed %d orders while blocked, want 0", got)
 	}
 }
 
-// A recovery during the first hour must not halt the day: the gate reads the
-// final poll, not the worst one.
-func TestGateUsesFinalReading(t *testing.T) {
+// The sentiment gate is live and reversible: a later bullish reading lifts an
+// earlier bearish block, and a later bearish reading blocks entries again — it is
+// never a one-time decision for the day.
+func TestBearishVerdictIsReversible(t *testing.T) {
 	h := newHarness(t)
+	h.addCandidate("ABCD", 5.00)
 
 	h.setBearish()
 	h.at(9, 30)
 	h.tick()
+	h.wantState(domain.StateHaltedBearish)
+	if len(h.openPositions()) != 0 {
+		t.Fatal("no positions may open while the verdict is bearish")
+	}
 
+	// By 9:46 the seeded chart's trigger candle has closed, so a bullish reading
+	// here is what actually decides whether ABCD gets bought.
 	h.setBullish()
-	h.at(10, 25)
-	h.tick()
-
-	h.at(10, 35)
+	h.at(9, 46)
 	h.tick()
 	h.wantState(domain.StateScreening)
+	if len(h.openPositions()) != 1 {
+		t.Fatal("the block must lift the moment a later reading clears it")
+	}
+
+	h.addCandidate("EFGH", 5.00)
+	h.setBearish()
+	h.at(9, 56)
+	h.tick()
+	h.wantState(domain.StateHaltedBearish)
+	for _, p := range h.openPositions() {
+		if p.Symbol == "EFGH" {
+			t.Fatal("a later bearish reading must block further entries again")
+		}
+	}
 }
 
-// Starting the daemon after the first hour leaves the gate with no data. Trading
-// without a sentiment check would skip a documented safety step, so the day must
-// be sat out.
-func TestStartedAfterFirstHourHaltsForSafety(t *testing.T) {
+// A daemon started mid-session has no readings yet, but the poll runs on the very
+// next tick rather than waiting for a blocking window — there is no window any
+// more — so the day is never sat out for lack of one.
+func TestStartedMidSessionPollsImmediately(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
 	h.addCandidate("ABCD", 5.00)
 
 	h.at(13, 0)
 	h.tick()
-	h.wantState(domain.StateHaltedBearish)
-	if got := len(h.fake.Placed()); got != 0 {
-		t.Errorf("placed %d orders without a sentiment check, want 0", got)
+	h.wantState(domain.StateScreening)
+	if got := len(h.fake.Placed()); got != 1 {
+		t.Errorf("placed %d orders, want 1 — a fresh start must not sit the day out", got)
 	}
 }
 

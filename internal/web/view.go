@@ -42,25 +42,22 @@ type LegendEntry struct {
 // extended-hours times arrive the same way, via extendedWindowText, so the legend
 // states the hours the agent is actually covering rather than the standard ones.
 func legendFor(cfg *config.Config, extendedWindows string) []LegendEntry {
-	extended := "Extended-hours session. Screening the thin tape on its own thresholds; " +
-		"before the bell the sentiment gate has not run yet."
+	extended := "Extended-hours session. Screening the thin tape on its own thresholds, " +
+		"under the same live sentiment gate as the regular session."
 	if extendedWindows != "" {
 		extended = "Extended-hours session, " + extendedWindows +
-			". Screening the thin tape on its own thresholds; before the bell the " +
-			"sentiment gate has not run yet."
+			". Screening the thin tape on its own thresholds, under the same live " +
+			"sentiment gate as the regular session."
 	}
 	return []LegendEntry{
 		{State: domain.StateMarketClosed, Tone: "idle", Icon: "○",
 			Meaning: "Outside exchange hours. Waiting for the next open."},
 		{State: domain.StateExtendedMarket, Tone: "pre", Icon: "◔",
 			Meaning: extended},
-		{State: domain.StateSentimentCheck, Tone: "warn", Icon: "◐",
-			Meaning: "First " + durationText(cfg.Timing.SentimentWindow) +
-				" after the open. Polling market sentiment every " +
-				durationText(cfg.Timing.SentimentPollInterval) + ". No trades placed."},
 		{State: domain.StateScreening, Tone: "good", Icon: "●",
-			Meaning: "Sentiment gate passed. Screening for candidates every " +
-				durationText(cfg.Timing.ScreenerScanInterval) + "."},
+			Meaning: "Sentiment is not bearish. Screening for candidates every " +
+				durationText(cfg.Timing.ScreenerScanInterval) + ", sentiment re-checked every " +
+				durationText(cfg.Timing.SentimentPollInterval) + "."},
 		{State: domain.StateEODWindow, Tone: "warn", Icon: "◑",
 			Meaning: "Final " + durationText(time.Duration(cfg.Exit.EODExitOffsetMins)*time.Minute) +
 				" before the close" + map[bool]string{
@@ -68,7 +65,8 @@ func legendFor(cfg *config.Config, extendedWindows string) []LegendEntry {
 				false: "",
 			}[cfg.Extended.Enabled] + ". Flattening all positions; no new entries."},
 		{State: domain.StateHaltedBearish, Tone: "bad", Icon: "■",
-			Meaning: "Sentiment was overwhelmingly bearish. Halted for the rest of the session."},
+			Meaning: "Sentiment is overwhelmingly bearish right now. New entries blocked " +
+				"until a later reading clears it; positions already held are unaffected."},
 		{State: domain.StateError, Tone: "bad", Icon: "▲",
 			Meaning: "A fault needs attention. This is not a deliberate trading halt."},
 	}
@@ -191,16 +189,15 @@ type View struct {
 	ErrorMessage string
 	Legend       []LegendEntry
 
+	// GateVerdict is the current, live sentiment verdict — reversible, not a
+	// one-time decision for the day. HaltReason is only set while it is bearish.
 	GateVerdict string
 	GateTone    string
 	HaltReason  string
-	// CanIgnoreHalt offers the dismiss button, and only for the halt that exists
-	// because the gate had nothing to judge. It is decided structurally — halted with
-	// zero readings — rather than by matching the halt's wording, which would break
-	// the moment the message was reworded. A halt the gate actually reached on real
-	// readings is the kill switch working and is not dismissed from the page.
-	CanIgnoreHalt bool
 
+	// Sentiment is the last hour of readings, newest first, so the most recent
+	// reading — the one actually deciding whether entries are allowed right now —
+	// is the one an operator sees without scrolling.
 	Sentiment       []SentimentRow
 	SentimentLabels []string
 
@@ -425,9 +422,6 @@ func BuildView(
 		v.GateTone = "good"
 	case domain.VerdictBearish:
 		v.GateTone = "bad"
-	case domain.VerdictOverridden:
-		// Not green: the gate did not pass, it was stood down.
-		v.GateTone = "warn"
 	default:
 		v.GateTone = "idle"
 	}
@@ -437,7 +431,15 @@ func BuildView(
 		return nil, err
 	}
 	v.SentimentLabels = cfg.Sentiment.Symbols
-	for _, r := range readings {
+	// Last hour only, newest first: the most recent reading is the one actually
+	// deciding whether entries are allowed right now, so it belongs on top rather
+	// than scrolled past a growing full-session history.
+	cutoff := now.Add(-time.Hour)
+	for i := len(readings) - 1; i >= 0; i-- {
+		r := readings[i]
+		if r.TakenAt.Before(cutoff) {
+			break
+		}
 		row := SentimentRow{
 			Time:           r.TakenAt.In(scheduler.ET).Format("15:04"),
 			Classification: string(r.Classification),
@@ -458,7 +460,6 @@ func BuildView(
 		}
 		v.Sentiment = append(v.Sentiment, row)
 	}
-	v.CanIgnoreHalt = rec.Halted && len(readings) == 0
 
 	open, err := st.OpenPositions()
 	if err != nil {
@@ -717,14 +718,15 @@ func strategySections(cfg *config.Config) []StrategySection {
 
 	gate := StrategySection{
 		Title: "1 · Sentiment gate",
-		Note: fmt.Sprintf("No trades are placed during the first %s after the open.",
-			durationText(cfg.Timing.SentimentWindow)),
+		Note: fmt.Sprintf("Checked every %s, continuously through the trading and "+
+			"extended-hours day. New entries are blocked while the latest reading is "+
+			"overwhelmingly bearish, and allowed again the moment a later one is not.",
+			durationText(cfg.Timing.SentimentPollInterval)),
 		Rows: []StrategyRow{
-			{Label: "Window after open", Value: durationText(cfg.Timing.SentimentWindow)},
 			{Label: "Poll interval", Value: durationText(cfg.Timing.SentimentPollInterval)},
 			{Label: "Basket", Value: strings.Join(cfg.Sentiment.Symbols, ", ")},
 			{
-				Label: "Halts the day when",
+				Label: "Blocks new entries when",
 				Value: fmt.Sprintf("average ≤ %s", pctOf(cfg.Sentiment.BearishAvgPct)),
 				Note: map[bool]string{
 					true:  "and no symbol in the basket is positive",
@@ -834,9 +836,8 @@ func strategySections(cfg *config.Config) []StrategySection {
 				Label: "Entries",
 				Value: map[bool]string{true: "allowed", false: "blocked"}[cfg.Extended.AllowEntry],
 				Note: map[bool]string{
-					true: "extended-hours limit orders — gated before the bell on a live " +
-						"sentiment read standing in for the first-hour gate, and after the " +
-						"close on that gate's own verdict",
+					true: "extended-hours limit orders — gated by the same live, continuous " +
+						"sentiment verdict the regular session reads",
 					false: "candidates are shown but nothing is bought outside the bells",
 				}[cfg.Extended.AllowEntry],
 			},

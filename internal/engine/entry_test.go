@@ -64,11 +64,10 @@ func TestOutcomeRecordedPerQualifyingCandidate(t *testing.T) {
 		h.fake.SetAverageVolume(c.symbol, c.avgVol)
 	}
 
-	h.at(9, 30)
-	h.tick()
-	h.at(10, 25)
-	h.tick()
-	h.at(10, 35)
+	// One tick, once the seeded charts' trigger candles have closed: a second scan
+	// here would re-evaluate the cap against positions this same pass just opened,
+	// which is a different thing from what this test is about.
+	h.at(9, 46)
 	h.tick()
 
 	evals, _, err := h.store.LatestScreenSnapshot(h.date)

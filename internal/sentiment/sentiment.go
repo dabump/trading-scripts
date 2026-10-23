@@ -1,4 +1,4 @@
-// Package sentiment implements the first-hour gate from docs/strategy.md §1.
+// Package sentiment implements the entry gate from docs/strategy.md §1.
 package sentiment
 
 import (
@@ -47,20 +47,6 @@ func Classify(pcts map[string]float64, cfg *config.Config) domain.Verdict {
 		return domain.VerdictBearish
 	}
 	return domain.VerdictProceed
-}
-
-// GateVerdict decides the session from the first hour's readings.
-//
-// docs/strategy.md §1 says the classification happens "at the end of the hour",
-// so the most recent reading decides: the earlier polls exist to be recorded and
-// displayed, not to be averaged into the decision. A tape that sold off at 09:40
-// and recovered by 10:30 should not halt the day.
-func GateVerdict(readings []domain.SentimentReading, cfg *config.Config) domain.Verdict {
-	if len(readings) == 0 {
-		return domain.VerdictPending
-	}
-	last := readings[len(readings)-1]
-	return Classify(last.Percentages, cfg)
 }
 
 // PercentChange is the move from a previous close to the current price.

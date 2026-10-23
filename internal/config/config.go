@@ -98,9 +98,9 @@ type Screening struct {
 // force.
 //
 // One section covers both halves because they need the same numbers for the same
-// reason — the tape is thin in both. What differs between them is not configured here
-// but derived: before the bell there is no sentiment gate to inherit, so the engine
-// substitutes a live read; after it, the day's resolved verdict already applies.
+// reason — the tape is thin in both. The sentiment gate is the same continuous,
+// reversible one on both sides of the bell, and the same one the regular session
+// reads.
 //
 // Everything in this section is off or conservative by default. Turning Enabled on
 // costs API calls and shows candidates; turning AllowEntry on trades them.
@@ -153,11 +153,9 @@ type Extended struct {
 	// with this off; only orders are withheld.
 	//
 	// It is a second switch rather than part of Enabled because the two carry
-	// completely different consequences: the fill comes from a thin book, and before
-	// the bell the first-hour sentiment gate has not run yet. The engine substitutes a
-	// live sentiment read for that last one — see docs/strategy.md §1 — but it is a
-	// weaker guarantee than the gate it stands in for, which is why this defaults to
-	// false.
+	// completely different consequences: the fill comes from a thin book. The
+	// sentiment gate itself applies exactly as it does during the regular session —
+	// see docs/strategy.md §1 — this switch is about the thin book, not the gate.
 	AllowEntry bool `yaml:"allow_entry"`
 	// LimitSlipPct is the limit-price allowance on extended-hours orders, in percent
 	// away from the reference price. Zero falls back to execution.limit_slip_pct.
@@ -333,14 +331,13 @@ const (
 )
 
 type Timing struct {
+	// SentimentPollInterval is how often the sentiment basket is sampled — continuously
+	// through the trading and extended-hours day, not confined to a blocking window at
+	// the open. Each reading immediately decides whether new entries are allowed:
+	// bullish or neutral proceeds, overwhelmingly bearish blocks new entries until a
+	// later reading clears it. There is no separate no-trade window any more; screening
+	// and the sentiment poll run from the open together.
 	SentimentPollInterval time.Duration `yaml:"sentiment_poll_interval"`
-	// SentimentWindow is how long the gate takes to resolve after the open.
-	//
-	// It used to be an hour, during which no trading happened at all. That is the
-	// single worst hour to sit out for this strategy: the moves it looks for begin
-	// in the first fifteen minutes. The window is now short enough to keep the
-	// kill switch while giving most of the opening range back.
-	SentimentWindow time.Duration `yaml:"sentiment_window"`
 	// EntryWindow is how long after the open new positions may be opened. Positions
 	// already open are still managed to the close.
 	EntryWindow time.Duration `yaml:"entry_window"`
@@ -590,9 +587,6 @@ func (c *Config) Validate() error {
 	if c.Timing.SentimentPollInterval <= 0 {
 		add("timing.sentiment_poll_interval must be > 0")
 	}
-	if c.Timing.SentimentWindow <= 0 {
-		add("timing.sentiment_window must be > 0")
-	}
 	if c.Timing.EntryWindow <= 0 {
 		add("timing.entry_window must be > 0")
 	}
@@ -604,12 +598,6 @@ func (c *Config) Validate() error {
 	if c.Timing.EntryCutoffBuffer >= 6*time.Hour {
 		add("timing.entry_cutoff_buffer (%s) leaves no usable entry window in a 6h30m session",
 			c.Timing.EntryCutoffBuffer)
-	}
-	// Entries have to be possible after the gate resolves, or the agent would screen
-	// all morning and never buy.
-	if c.Timing.EntryWindow <= c.Timing.SentimentWindow {
-		add("timing.entry_window (%s) must be longer than timing.sentiment_window (%s), or no entry is ever possible",
-			c.Timing.EntryWindow, c.Timing.SentimentWindow)
 	}
 	if c.Timing.ScreenerScanInterval <= 0 {
 		add("timing.screener_scan_interval must be > 0")

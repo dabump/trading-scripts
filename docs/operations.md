@@ -70,9 +70,8 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `exit.candle_trail` | `after_target` | `strategy.md` §4 — `off` / `after_target` / `always`; empty means `off` |
 | `exit.candle_trail_interval` | unset (`entry.pattern_interval`) | the candle the trail is read on, built from `entry.pattern_interval` candles; must be a whole multiple of it. Wider settings measured no better — `decisions.md` 2026-10-03 |
 | `exit.candle_trail_bars` | unset (1) | the stop goes under the lowest low of this many completed trail candles |
-| `timing.sentiment_poll_interval` | 2m | `strategy.md` §1 — tightened with the shorter gate window |
-| `timing.sentiment_window` | 5m | `strategy.md` §1 — shortened from 1h so the opening range is tradeable |
-| `timing.entry_window` | 5h55m | `strategy.md` §3 — from a 09:30 open it reaches 15:25, where `entry_cutoff_buffer` already puts the last entry, so the buffer is what binds; validated longer than `sentiment_window` |
+| `timing.sentiment_poll_interval` | 5m | `strategy.md` §1 — continuous through the trading and extended-hours day; each reading live-decides whether new entries are allowed, no blocking window ahead of screening |
+| `timing.entry_window` | 5h55m | `strategy.md` §3 — from a 09:30 open it reaches 15:25, where `entry_cutoff_buffer` already puts the last entry, so the buffer is what binds |
 | `timing.entry_cutoff_buffer` | 30m | `strategy.md` §3 — quiet time before the forced exit, enforced against the close so a half day tightens the window rather than collapsing the gap |
 | `timing.screener_scan_interval` | 1m | `strategy.md` §2 |
 | `timing.position_poll_interval` | 2s | **PROPOSED** — how often open positions are re-marked (also the engine tick interval) |

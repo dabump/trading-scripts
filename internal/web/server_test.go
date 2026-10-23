@@ -49,15 +49,6 @@ type stubActions struct {
 	opened     []string
 	openResult domain.ManualOpen
 	openErr    error
-
-	ignored   int
-	ignoreErr error
-}
-
-func (a *stubActions) IgnoreHalt(context.Context) error {
-	a.calls++
-	a.ignored++
-	return a.ignoreErr
 }
 
 // opened records the symbols the page asked to buy; openResult is what comes back.
@@ -103,7 +94,7 @@ func testConfig() *config.Config {
 	c.Entry = config.Entry{PatternInterval: time.Minute, EMAPeriod: 9,
 		MaxPullbackBars: 2, SurgeBars: 3, MinSurgePct: 3, MaxRetracePct: 50, StopBufferPct: 0.1,
 		MinStopDistancePct: 0.5, MaxStopDistancePct: 4, MaxEntryDriftPct: 1}
-	c.Timing = config.Timing{SentimentWindow: time.Hour, SentimentPollInterval: 10 * time.Minute,
+	c.Timing = config.Timing{SentimentPollInterval: 10 * time.Minute,
 		EntryWindow: 4 * time.Hour, ScreenerScanInterval: time.Minute,
 		PositionPollInterval: 15 * time.Second}
 	c.Sentiment = config.Sentiment{Symbols: []string{"SPY", "QQQ", "IWM"}, BearishAvgPct: -0.8}
@@ -194,7 +185,7 @@ func TestPageRendersHeaderBadgesAndLegend(t *testing.T) {
 	}
 	// The full legend must always be present, not only the active state.
 	for _, state := range []domain.AgentState{
-		domain.StateMarketClosed, domain.StateSentimentCheck, domain.StateScreening,
+		domain.StateMarketClosed, domain.StateScreening,
 		domain.StateHaltedBearish, domain.StateEODWindow, domain.StateError,
 	} {
 		if !strings.Contains(body, string(state)) {
@@ -230,7 +221,7 @@ func TestErrorIsDistinguishableFromBearishHalt(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, body = f.get(t, "/")
-	if !strings.Contains(body, "Halted for the session") {
+	if !strings.Contains(body, "New entries blocked:") {
 		t.Error("a bearish halt must be labelled as a halt")
 	}
 	if strings.Contains(body, "Fault:") {

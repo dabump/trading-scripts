@@ -204,84 +204,35 @@ func TestOpenPositionShowsTheRefusal(t *testing.T) {
 	}
 }
 
-// The Ignore button appears only on a halt the gate could not judge — halted with no
-// readings — and never on one it reached on real data.
-func TestIgnoreButtonOnlyOnAnUnjudgedHalt(t *testing.T) {
+// The halt banner shows the current block reason, live, without any dismiss
+// button: the gate is reversible, so there is nothing to override — a later
+// bullish reading clears it on its own.
+func TestHaltBannerHasNoIgnoreButton(t *testing.T) {
 	f := newFixture(t)
-	// Session() creates the row; SetVerdict is an UPDATE and would otherwise be a
-	// no-op. The engine always goes through Session first, for the same reason.
 	if _, err := f.store.Session(f.date); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.store.SetVerdict(f.date, domain.VerdictBearish,
-		"no sentiment readings were taken during the first hour"); err != nil {
+		"sentiment is overwhelmingly bearish"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Asserted against the fragment, not the whole page: the click handler in the
-	// page's script mentions the same attribute, so "/" would match either.
 	_, body := f.get(t, "/fragment")
-	if !strings.Contains(body, "data-ignore-halt") {
-		t.Error("a halt with no readings behind it must offer the Ignore button")
+	if !strings.Contains(body, "New entries blocked:") {
+		t.Error("a bearish verdict must show the block reason")
 	}
-
-	// Now give the session a real reading: the same halt is the kill switch working.
-	if err := f.store.AddSentimentReading(domain.SentimentReading{
-		SessionDate: f.date, TakenAt: f.now, Classification: domain.VerdictBearish,
-		Percentages: map[string]float64{"SPY": -1.4},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_, body = f.get(t, "/fragment")
 	if strings.Contains(body, "data-ignore-halt") {
-		t.Error("a halt the gate actually reached must not be dismissible from the page")
+		t.Error("the gate is reversible and has no dismiss button")
 	}
 }
 
-// An unhalted session offers nothing to dismiss.
-func TestNoIgnoreButtonWithoutAHalt(t *testing.T) {
+// An unhalted session shows no banner at all. The legend's own static mention of
+// "New entries blocked" for the HALTED_BEARISH state is always present, so this
+// checks for the banner's distinct "blocked:" phrasing rather than the legend's.
+func TestNoHaltBannerWithoutABlock(t *testing.T) {
 	f := newFixture(t)
 	_, body := f.get(t, "/fragment")
-	if strings.Contains(body, "data-ignore-halt") {
-		t.Error("the Ignore button must not appear when nothing is halted")
-	}
-}
-
-// It changes what the agent does, so POST only.
-func TestIgnoreHaltRefusesGET(t *testing.T) {
-	f := newFixture(t)
-	code, _ := f.get(t, "/actions/ignore-halt")
-	if code != http.StatusMethodNotAllowed {
-		t.Errorf("GET /actions/ignore-halt = %d, want 405", code)
-	}
-	if f.actions.ignored != 0 {
-		t.Error("a GET must not reach the engine")
-	}
-}
-
-// The confirmation has to say the session now runs without a kill switch.
-func TestIgnoreHaltConfirmationIsHonest(t *testing.T) {
-	f := newFixture(t)
-	code, body := f.postForm(t, "/actions/ignore-halt", "")
-	if code != http.StatusOK {
-		t.Fatalf("status = %d", code)
-	}
-	if f.actions.ignored != 1 {
-		t.Fatalf("engine calls = %d, want 1", f.actions.ignored)
-	}
-	for _, want := range []string{"GATE_OVERRIDDEN", "no sentiment kill switch", "Screening resumes"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("confirmation is missing %q", want)
-		}
-	}
-}
-
-// A refusal reaches the operator rather than only the log.
-func TestIgnoreHaltShowsTheRefusal(t *testing.T) {
-	f := newFixture(t)
-	f.actions.ignoreErr = errors.New("this halt came from actual sentiment readings")
-	_, body := f.postForm(t, "/actions/ignore-halt", "")
-	if !strings.Contains(body, "actual sentiment readings") {
-		t.Errorf("the refusal must reach the page: %s", body)
+	if strings.Contains(body, "New entries blocked:") {
+		t.Error("the banner must not appear when nothing is blocked")
 	}
 }

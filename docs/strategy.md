@@ -2,23 +2,63 @@
 
 **Status:** implemented. Values below marked **PROPOSED** were not settled in design; they were filled in during implementation so the agent could run and are awaiting review (see [`decisions.md`](./decisions.md)). All of them live in `config/config.yaml` — change them there, and update this doc to match.
 
-## 1. Sentiment gate (the opening window)
+## 1. Sentiment gate (live and continuous)
 
-- From market open, poll Alpaca market data every `timing.sentiment_poll_interval` (2m) for `timing.sentiment_window` (5m). The window was an hour as originally specified; §3 records why it was shortened and what that costs.
-- No trades are placed during that window regardless of what the data shows.
-- At the end of the window, classify the session as **overwhelmingly bearish** or **not overwhelmingly bearish**:
-  - Overwhelmingly bearish → hand off to `risk`'s daily kill switch; no further trades today.
-  - Anything else (clearly bullish *or* neutral/ambiguous) → proceed to screening for the rest of the day. Only a clear bearish reading halts trading — a neutral/unclear reading is treated the same as bullish, not the same as bearish.
-- **Classification rule (PROPOSED):** the session is overwhelmingly bearish when the average intraday change across SPY, QQQ and IWM is at or below **−0.8%** *and* none of the three is positive. Anything else proceeds. IWM is in the basket deliberately: the strategy trades small caps, so a small-cap index belongs in the read of the tape, not just SPY and QQQ.
-- If the daemon starts *after* the gate window, no readings exist and the gate cannot be judged. It halts for the day rather than trading without the safety check ever having run. This is the one halt that can be dismissed from the status page — it is an absence of data rather than a risk decision, and a restart should not automatically cost the session. Dismissing it sets the verdict to `GATE_OVERRIDDEN` rather than `PROCEED`, so nothing later reads it as the gate having passed. A halt the gate genuinely *reached* on real readings is the kill switch and is not dismissible. See [`web-ui.md`](./web-ui.md).
+**Status: changed 2026-10-17.** The gate used to be a one-time decision made from a
+short window of polls right after the open, during which no trading happened at
+all. It is now a **live, reversible** check, run continuously through the whole
+trading and extended-hours day, with no blocking window ahead of screening. See
+[`decisions.md`](./decisions.md) for the change and what it replaced.
 
-**Pre-market has no gate, and cannot have one.** The gate's readings are taken after the open, so anything the agent does before the bell necessarily predates it. Pre-market screening is unaffected — it never buys anything by itself — but `extended.allow_entry` would be trading with the kill switch not merely off but nonexistent. In its place, each pre-market pass that may buy takes a **live** reading of the same basket through the same classifier (`sentiment.Classify`) and withholds entry on an overwhelmingly bearish tape, or when the reading is unavailable at all. That reading is deliberately **not persisted**: the session's verdict belongs to the gate window, and a 07:30 sample must not be able to settle the day before the market has opened. It is a weaker guarantee than the gate — one sample rather than a window of them — which is one of the reasons `allow_entry` is the switch to leave off until the extended-hours numbers have been watched (§2b).
+- Poll the sentiment basket every `timing.sentiment_poll_interval` (5m), starting
+  at the open (or at `extended.start`, when extended hours are on) and continuing
+  for as long as the agent is in `SCREENING`, `HALTED_BEARISH` or `EXTENDED_MARKET`
+  — i.e. for the whole day the market, regular or extended, is open.
+- Each new reading is classified **overwhelmingly bearish** or **not overwhelmingly
+  bearish**, and that classification directly decides whether new entries are
+  allowed **right now**:
+  - Overwhelmingly bearish → new entries are blocked. Screening keeps running — the
+    candidate table keeps showing what is setting up — only `enterPositions` is
+    skipped, exactly as when the entry window has closed or extended-hours entry is
+    disabled. Positions already held are unaffected; nothing is sold because of this.
+  - Anything else (clearly bullish *or* neutral/ambiguous) → new entries are
+    allowed. Only a clear bearish reading blocks entry — a neutral/unclear reading
+    is treated the same as bullish, not the same as bearish.
+  - **This is reversible.** A later bullish reading lifts an earlier bearish block,
+    and a later bearish reading blocks entries again, all within the same session.
+    It is never a one-time decision for the day — see the open item this replaced
+    in `decisions.md`.
+- Before the very first reading of the day exists (at most one tick, a couple of
+  seconds), new entries are blocked the same way a bearish reading blocks them: no
+  data is not evidence that it is safe to trade. A daemon started mid-session takes
+  its first reading on the very next tick, so this never produces a lasting halt —
+  there is nothing to dismiss, and no dismiss button exists any more.
+- **Classification rule (PROPOSED):** a reading is overwhelmingly bearish when the
+  average intraday change across SPY, QQQ and IWM is at or below **−0.8%** *and*
+  none of the three is positive. Anything else proceeds. IWM is in the basket
+  deliberately: the strategy trades small caps, so a small-cap index belongs in the
+  read of the tape, not just SPY and QQQ.
+- The status page shows the last hour of readings, newest first, under the current
+  verdict. See [`web-ui.md`](./web-ui.md).
 
-**Post-market, by contrast, inherits the gate.** By 16:00 it has resolved on real first-hour readings, so a post-market pass reads the day's stored verdict rather than taking a fresh sample: a halted day stays halted after the close. That asymmetry is the only behavioural difference between the two halves of `EXTENDED_MARKET`.
+**Pre-market and post-market read the same gate.** Before 2026-10-17 the two halves
+of `EXTENDED_MARKET` differed in where their entry authority came from — a live,
+unpersisted read before the bell standing in for a gate that had not run, and a
+deferral to the day's already-resolved verdict after the close. Now that the gate is
+continuous through the whole day rather than confined to a window after the open,
+that asymmetry is gone: pre-market, the regular session and post-market all read the
+same live, reversible verdict from the same continuously-updated readings. This is
+the **only** behavioural difference removed between the two halves of
+`EXTENDED_MARKET` — everything else (thresholds, chart start, order routing) is as
+described in §2b.
 
 ## 2. Screening (momentum candidates)
 
-During the regular session, screening only starts once the sentiment gate has passed (i.e. once `timing.sentiment_window` has elapsed and the gate has resolved) — there is no background screening during the no-trade window. Pre-market screening is separate and is described in §2b.
+Screening starts at the open and runs continuously alongside the sentiment poll —
+there is no blocking window ahead of it any more. A bearish verdict blocks entry,
+not screening: the candidate table keeps filling in even while nothing can be
+bought, for the same reason an empty afternoon table would misread as a broken
+scanner (§3). Pre-market screening is separate and is described in §2b.
 
 Nothing in the screen filters on company size, so it admits large caps as readily as small ones.
 
@@ -72,7 +112,7 @@ With it on, three things change and all three are requirements rather than prefe
 1. **Orders are extended-hours day limit orders**, whatever `execution.order_type` says. Alpaca accepts nothing but a day limit order for the extended sessions, so there is no choice to express — `execution.order_type` keeps governing the regular session alone, and `engine.submit` sends a limit order whenever the clock is outside the bells. It is priced off `extended.limit_slip_pct`, falling back to `execution.limit_slip_pct`. Both entries and exits carry the extended-hours flag.
 
    That allowance is the setting to watch. Extended spreads on these names are several times wider than regular-session ones, so an allowance that is generous at 14:00 may never fill at 06:00 — and on the **exit** side, an unfilled stop leaves the position open. That is a real consequence of `allow_entry`, not a theoretical one, and it is unmeasured like the rest of §2b.
-2. **Entry is gated on the sentiment reading that exists.** Before the bell that is a **live** read through the same classifier (see §1), because the post-open gate has not run and cannot have. After the close the gate *has* run, on real first-hour readings, so the pass defers to the day's resolved verdict exactly as the regular session does: a day the kill switch halted stays halted, and the row reads `halted for the session`. Taking a second, differently-sourced opinion at 17:00 would let a live read overturn what the gate concluded.
+2. **Entry is gated on the same live, continuous sentiment verdict the regular session reads (§1).** Before 2026-10-17 the two halves of `EXTENDED_MARKET` took their entry authority from different places — a live, unpersisted read before the bell, the day's already-resolved verdict after the close. That distinction is gone now that the gate runs continuously through the whole day: both halves simply read the current verdict, exactly as the regular session does, and a bearish reading blocks entry until a later one clears it.
 3. **The setup is read on that session's own candles.** The chart handed to `strategy.FindSetup` starts at `extended.start` before the bell and at the regular **close** after it, so the pullback, the EMA and the VWAP are all computed from the session actually trading — not from a chart that straddles the close.
 
 Everything else is unchanged: the same position cap, the same sizing from the stop, the same exit rules. A position opened outside the bells is managed from the moment it exists — its stop can fire at 08:00 or 17:00 rather than waiting for a bell — and is flattened by a forced end-of-day exit like any other, a manual position included (§4). An extended-hours open is the case where the stop is enforced on the tick rather than by the resting order: Alpaca accepts a stop order outside the bells but will not trigger one there, so the order is placed and the engine holds the floor until the regular session resumes.
@@ -225,9 +265,10 @@ open a position a minute before it had to be liquidated.
 
 On a full session the two now coincide by construction, so the buffer is the rule that
 decides and `entry_window` no longer shortens the day on its own. Raising it further
-changes nothing — `scheduler.Bounds` clamps to the cutoff either way. The part of the
-session still not tradeable is the other end: `timing.sentiment_window` (5m) means
-09:30–09:35 is the gate's, so buying runs 09:35–15:25 of a 09:30–16:00 session.
+changes nothing — `scheduler.Bounds` clamps to the cutoff either way. Buying runs
+09:30–15:25 of a 09:30–16:00 session, limited only by the live sentiment verdict (§1)
+rather than by a blocking window at the open — the gate used to own 09:30–09:35
+outright, and no longer does.
 
 **Screening continues after the window closes and the page keeps showing what is setting
 up** — an empty afternoon table would read as a broken scanner rather than a deliberate
@@ -237,12 +278,6 @@ The window used to be 2h. It was widened deliberately, against the measurement: 
 backtested year later entries were worse, and a 2h window ended at $8,871 where 4h ended
 at $7,162 and all-day at $5,582 (t = −4.24). Trading more of the day buys opportunity at
 a measured cost; see [`decisions.md`](./decisions.md).
-
-The sentiment gate was shortened from an hour to `timing.sentiment_window` for the
-same reason: an hour of kill-switch meant sitting out the single most important hour
-of the day, since the moves this strategy looks for begin in the first fifteen
-minutes. 09:30 to 09:35 is still not tradeable, which is a real cost and a deliberate
-one.
 
 **Qualifying is not the same as being bought.** These gates apply only at entry, and
 candidates are taken in relative-volume order until slots run out:

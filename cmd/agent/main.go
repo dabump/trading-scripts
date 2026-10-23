@@ -91,10 +91,7 @@ func run() error {
 	if *offline {
 		logger.Warn("offline mode: using a fake broker with seeded data; no real orders will be placed")
 		// The simulated session is compressed and anchored to now, so the whole
-		// daily flow is observable in a couple of minutes at any time of day. A real
-		// session's hour-long sentiment window would otherwise make offline mode
-		// show nothing but SENTIMENT_CHECK.
-		cfg.Timing.SentimentWindow = 30 * time.Second
+		// daily flow is observable in a couple of minutes at any time of day.
 		cfg.Timing.SentimentPollInterval = 10 * time.Second
 		cfg.Timing.ScreenerScanInterval = 5 * time.Second
 		cfg.Timing.PositionPollInterval = 2 * time.Second
@@ -103,7 +100,7 @@ func run() error {
 		cfg.Timing.EntryWindow = 10 * time.Minute
 		cfg.Exit.EODExitOffsetMins = 15
 		logger.Warn("offline mode: session timings compressed",
-			"sentiment_window", cfg.Timing.SentimentWindow,
+			"sentiment_poll_interval", cfg.Timing.SentimentPollInterval,
 			"scan_interval", cfg.Timing.ScreenerScanInterval)
 
 		// The quiet time before the forced exit is a regular-session number: 30 minutes

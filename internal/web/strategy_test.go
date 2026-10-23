@@ -137,10 +137,10 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 			wantValue: "$2,500,000",
 		},
 		{
-			name:      "sentiment window",
-			label:     "Window after open",
-			mutate:    func(f *fixture) { f.cfg.Timing.SentimentWindow = 90 * time.Minute },
-			wantValue: "1h 30m",
+			name:      "sentiment poll interval",
+			label:     "Poll interval",
+			mutate:    func(f *fixture) { f.cfg.Timing.SentimentPollInterval = 3 * time.Minute },
+			wantValue: "3m",
 		},
 		{
 			name:      "sentiment basket",
@@ -150,7 +150,7 @@ func TestStrategyPanelReadsFromConfig(t *testing.T) {
 		},
 		{
 			name:      "bearish threshold",
-			label:     "Halts the day when",
+			label:     "Blocks new entries when",
 			mutate:    func(f *fixture) { f.cfg.Sentiment.BearishAvgPct = -1.75 },
 			wantValue: "average ≤ -1.75%",
 		},
@@ -264,17 +264,17 @@ func TestStrategyPanelDerivesValues(t *testing.T) {
 
 // Settings whose meaning is conditional must not be shown as unconditional.
 func TestStrategyPanelReflectsConditionalSettings(t *testing.T) {
-	t.Run("all-negative requirement changes the halt description", func(t *testing.T) {
+	t.Run("all-negative requirement changes the block description", func(t *testing.T) {
 		f := newFixture(t)
 		f.cfg.Sentiment.RequireAllNegative = true
-		_, note := rowValue(t, f, "Halts the day when")
+		_, note := rowValue(t, f, "Blocks new entries when")
 		if !strings.Contains(note, "no symbol") {
 			t.Errorf("note = %q, want it to state the all-negative requirement", note)
 		}
 
 		f2 := newFixture(t)
 		f2.cfg.Sentiment.RequireAllNegative = false
-		_, note2 := rowValue(t, f2, "Halts the day when")
+		_, note2 := rowValue(t, f2, "Blocks new entries when")
 		if strings.Contains(note2, "no symbol") {
 			t.Errorf("note = %q, must not claim an all-negative requirement that is off", note2)
 		}
@@ -420,16 +420,13 @@ func TestGroupNumberSeparatesWithoutRounding(t *testing.T) {
 // nobody was running. Distinct values here, none of them the old defaults.
 func TestLegendQuotesConfiguredCadences(t *testing.T) {
 	f := newFixture(t)
-	f.cfg.Timing.SentimentWindow = 5 * time.Minute
 	f.cfg.Timing.SentimentPollInterval = 2 * time.Minute
 	f.cfg.Timing.ScreenerScanInterval = 90 * time.Second
 	f.cfg.Exit.EODExitOffsetMins = 7
 
-	var sentiment, screening, eod string
+	var screening, eod string
 	for _, l := range legendFor(f.cfg, "") {
 		switch l.State {
-		case domain.StateSentimentCheck:
-			sentiment = l.Meaning
 		case domain.StateScreening:
 			screening = l.Meaning
 		case domain.StateEODWindow:
@@ -437,9 +434,8 @@ func TestLegendQuotesConfiguredCadences(t *testing.T) {
 		}
 	}
 	for _, tt := range []struct{ state, meaning, want string }{
-		{"SENTIMENT_CHECK", sentiment, "First 5m"},
-		{"SENTIMENT_CHECK", sentiment, "every 2m"},
 		{"SCREENING", screening, "every 1m30s"},
+		{"SCREENING", screening, "every 2m"},
 		{"EOD_WINDOW", eod, "Final 7m"},
 	} {
 		if !strings.Contains(tt.meaning, tt.want) {

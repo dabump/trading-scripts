@@ -128,7 +128,7 @@ func valid() *Config {
 		StopLossPct: 10}
 	c.Exit = Exit{FirstTargetR: 2, FirstTargetFraction: 0.5, BreakevenAfterTarget: true,
 		EODExitOffsetMins: 30}
-	c.Timing = Timing{SentimentPollInterval: 120e9, SentimentWindow: 300e9,
+	c.Timing = Timing{SentimentPollInterval: 120e9,
 		EntryWindow: 2 * 3600e9, EntryCutoffBuffer: 1800e9,
 		ScreenerScanInterval: 60e9, PositionPollInterval: 15e9}
 	c.Sentiment = Sentiment{Symbols: []string{"SPY"}, BearishAvgPct: -0.8}
@@ -201,11 +201,6 @@ func TestValidate(t *testing.T) {
 			"a price band with no width is rejected",
 			func(c *Config) { c.Screening.MaxPrice = 1 },
 			"must be greater than screening.min_price",
-		},
-		{
-			"an entry window inside the sentiment window is rejected",
-			func(c *Config) { c.Timing.EntryWindow = 2 * time.Minute },
-			"no entry is ever possible",
 		},
 		{
 			"a negative entry cutoff buffer is rejected",

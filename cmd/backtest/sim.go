@@ -61,12 +61,18 @@ type preparedDay struct {
 	Date  string
 	EODAt time.Time
 	// EntryEndAt is the last instant a new position may be opened.
-	EntryEndAt  time.Time
-	LastBarAt   time.Time
-	Boundaries  []time.Time
+	EntryEndAt time.Time
+	LastBarAt  time.Time
+	Boundaries []time.Time
+	// GateBearish records whether the sentiment basket was already bearish at the
+	// open, for the research reports' coarse day-level split. It no longer decides
+	// whether the day trades: the live daemon's gate is now continuous and
+	// reversible through the day, so simulate re-checks it at every boundary
+	// instead (see bearishAt) and a day bearish at the open can still trade once
+	// a later reading clears it.
 	GateBearish bool
-	// NoGateData marks a session whose sentiment basket could not be read, which
-	// is excluded rather than assumed tradeable.
+	// NoGateData marks a session whose sentiment basket could not be read even
+	// at the open, which is excluded rather than assumed tradeable.
 	NoGateData bool
 
 	// bars is indexed by symbol then bar-start unix seconds, so a lookup while
@@ -150,26 +156,18 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 			p.bars[sym] = idx
 		}
 
-		gateAt := sess.open.Add(cfg.Timing.SentimentWindow)
-		pcts := map[string]float64{}
-		for _, sym := range cfg.Sentiment.Symbols {
-			prev := benchPrev[day.Date][sym]
-			px, ok := priceAt(day.Intraday[sym], gateAt)
-			if !ok || prev <= 0 {
-				continue
-			}
-			pcts[sym] = (px - prev) / prev * 100
-		}
 		// An unreadable basket must not become a trading day. sentiment.Classify
-		// returns PENDING for an empty reading, which the daemon treats as "keep
-		// polling" — here it would silently mean "proceed", turning missing data
-		// into trades the agent would never have made.
-		if len(pcts) == 0 {
+		// returns PENDING for an empty reading, which the daemon treats as "no
+		// reading yet" (blocking, not proceeding) — here, with no later reading
+		// ever available either, it would silently mean "proceed" for the whole
+		// day, turning missing data into trades the agent would never have made.
+		lastBearish, ok := bearishAt(cfg, day, benchPrev[day.Date], sess.open)
+		if !ok {
 			p.NoGateData = true
 			out = append(out, p)
 			continue
 		}
-		p.GateBearish = sentiment.Classify(pcts, cfg) == domain.VerdictBearish
+		p.GateBearish = lastBearish
 
 		cands := make(map[string]CandidateDay, len(day.Candidates))
 		for _, cd := range day.Candidates {
@@ -178,16 +176,12 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 			}
 		}
 		p.funnel.SymbolDays = len(cands)
-		p.Boundaries = boundaries(day, gateAt, sess.close)
+		// Boundaries start at the open, not after a gate window: screening and the
+		// sentiment poll now run together from the open, with no blocking pause
+		// ahead of either.
+		p.Boundaries = boundaries(day, sess.open, sess.close)
 		if n := len(p.Boundaries); n > 0 {
 			p.LastBarAt = p.Boundaries[n-1]
-		}
-
-		if p.GateBearish {
-			// A halted session still contributes its candidate count, but nothing
-			// downstream of the gate ran, so no criterion tallies are recorded.
-			out = append(out, p)
-			continue
 		}
 
 		cumVol := map[string]float64{}
@@ -207,6 +201,15 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 				advanceVolume(p, cands, cumVol, t)
 				advanceCursor(day, cands, cursor, t)
 				continue
+			}
+			// Re-checked at every boundary, mirroring the live daemon's continuous,
+			// reversible gate: a day bearish at the open can still trade once a later
+			// reading clears it, and vice versa. A reading that cannot be classified
+			// at this instant (a thin gap in the benchmark bars) leaves the previous
+			// verdict in force, the same way a failed poll leaves pollSentiment's last
+			// stored verdict untouched.
+			if b, ok := bearishAt(cfg, day, benchPrev[day.Date], t); ok {
+				lastBearish = b
 			}
 			evals := make([]domain.Evaluation, 0, len(cands))
 			prices := make(map[string]float64, len(cands))
@@ -256,9 +259,12 @@ func prepareWith(cfg *config.Config, days []*DayData, benchPrev map[string]map[s
 				moves[sym] = in.IntradayPct
 			}
 			// The setup gate, on bars that had closed by t. Entries are also only
-			// possible inside the entry window; after it the screen still runs, which
-			// is what keeps the funnel counts comparable across the whole session.
-			if t.Before(p.EntryEndAt) {
+			// possible inside the entry window and while sentiment is not bearish;
+			// after the window, or while blocked, the screen still runs, which is
+			// what keeps the funnel counts comparable across the whole session — the
+			// setup itself is never read while blocked, mirroring enterPositions not
+			// running at all on a blocked pass.
+			if t.Before(p.EntryEndAt) && !lastBearish {
 				for _, e := range screener.Qualifying(evals) {
 					closed := day.Intraday[e.Symbol][:cursor[e.Symbol]]
 					var setup strategy.Setup
@@ -366,6 +372,9 @@ type Stats struct {
 	EndEquity     float64
 	MaxDrawdownPc float64
 	TradingDays   int
+	// HaltedDays counts sessions bearish at the open. Informational only — the
+	// gate is continuous and reversible, so these sessions are still fully
+	// simulated and may still have traded once a later reading cleared it.
 	HaltedDays    int
 	SkippedNoData int
 	// RiskPerTradePct is echoed from the config so the report can label the
@@ -416,8 +425,10 @@ func simulate(cfg *config.Config, days []*preparedDay, slippagePct float64) Stat
 		st.Funnel.EverSetUp += day.funnel.EverSetUp
 
 		if day.GateBearish {
+			// Informational only: the gate is re-checked at every boundary inside
+			// day.qualifiers, so a day bearish at the open can still have traded
+			// once a later reading cleared it. This no longer skips the day.
 			st.HaltedDays++
-			continue
 		}
 
 		open := map[string]*domain.Position{}
@@ -866,6 +877,26 @@ func priceAt(bars []Bar, t time.Time) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// bearishAt classifies the sentiment basket as of t, exactly as sentiment.Classify
+// does for a live reading. ok is false when the basket cannot be priced at all at
+// this instant — benchPrev missing a close, or every symbol's bars not yet
+// started — which the caller treats as "no new information" rather than "proceed".
+func bearishAt(cfg *config.Config, day *DayData, benchPrev map[string]float64, t time.Time) (bearish, ok bool) {
+	pcts := map[string]float64{}
+	for _, sym := range cfg.Sentiment.Symbols {
+		prev := benchPrev[sym]
+		px, found := priceAt(day.Intraday[sym], t)
+		if !found || prev <= 0 {
+			continue
+		}
+		pcts[sym] = (px - prev) / prev * 100
+	}
+	if len(pcts) == 0 {
+		return false, false
+	}
+	return sentiment.Classify(pcts, cfg) == domain.VerdictBearish, true
 }
 
 // advanceVolume folds the bar at t into the running total, after every decision at

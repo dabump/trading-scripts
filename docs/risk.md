@@ -23,15 +23,47 @@
 - **Once the first target is banked the stop moves to the entry price**, so a winner cannot become a loser.
 - This is a hard floor, checked independently of — and ahead of — the profit target, so a bug or gap in the target/scale-out logic cannot turn into an unbounded loss on a single position. `strategy.EvaluateExit` checks the forced end-of-day exit, then the stop, then the target, in that order.
 
-## Daily kill switch
+## Sentiment kill switch (live and reversible)
 
-- If the gate's sentiment read comes back overwhelmingly bearish, no trades are placed for the rest of that session. The agent waits for the next trading day. The verdict is persisted, so a restart does not re-open a halted day.
-- Open positions are still monitored while halted: the kill switch stops new entries, it does not abandon anything already held. (In practice nothing can be open when the gate halts, since no entries happen during the gate window — but a restart that adopted a broker position, or an extended-hours entry, are the cases where this matters.)
-- **The kill switch does not cover pre-market, because it cannot.** Its readings are taken after the open, so anything before the bell necessarily predates the verdict. Pre-market screening is unaffected — it buys nothing by itself — but `extended.allow_entry` trades with the switch nonexistent rather than merely off. A live sentiment read through the same classifier stands in for it (`docs/strategy.md` §1 and §2b); one sample is a weaker guarantee than a window of them, which is why `allow_entry` defaults to false. A position opened pre-market is then covered by everything else in this document from the moment it exists: the same stop, the same sizing, the same forced end-of-day exit.
-- **Post-market, by contrast, inherits the switch rather than substituting for it.** By then the gate has resolved on real first-hour readings, so a post-market pass defers to the day's verdict exactly as the regular session does: a day the kill switch halted stays halted after the close, and the page's Action column says so. Taking a second, differently-sourced opinion at 17:00 would let a live read overturn what the gate concluded, which is the thing `resolveGate` exists to prevent.
-- **The book is flat overnight, and post-market did not change that.** Adding post-market trading (2026-10-08) brought a second forced exit with it, `exit.eod_exit_offset_minutes` before `extended.end`, so a position opened at 17:00 is sold before 20:00 rather than carried. Without it, extending coverage past the close would have quietly converted this from a day-trading strategy into one holding overnight gap risk on microcaps — a different risk profile from the one anything in this document was measured against. The residual exposure is a limit order that does not fill in a thin 19:55 book; that is the same failure mode as an unfilled extended-hours stop, and the same `extended.limit_slip_pct` governs it.
-- This is a pre-emptive halt (based on sentiment, before any position is opened) — distinct from the per-trade stop-loss, which protects an already-open position.
-- **A halt is only dismissible when the gate never ran.** Starting the daemon after the gate window leaves no readings, and the resulting halt reports an absence of data rather than a bearish market; the status page can dismiss that one, recording the verdict as `GATE_OVERRIDDEN`. A halt the gate reached on real readings is the kill switch doing its job and cannot be dismissed from the page. The distinction is made on whether any readings exist, not on the halt's wording.
+**Status: changed 2026-10-17.** This used to be a one-time decision made from a
+short window of readings right after the open, after which a bearish verdict halted
+the rest of the session outright. It is now checked continuously, every
+`timing.sentiment_poll_interval` (5m), through the whole trading and extended-hours
+day, and the verdict it produces is live: a bearish reading blocks new entries only
+until a later reading is not bearish, and a bullish reading can be overturned by a
+later bearish one just as readily. See [`strategy.md`](./strategy.md) §1 for the
+classification itself and [`decisions.md`](./decisions.md) for what this replaced.
+
+- Each new reading immediately decides whether a *new* position may be opened,
+  right now. It is a pre-emptive gate on opening — distinct from the per-trade
+  stop-loss, which protects a position already open — and it is re-evaluated on
+  every reading rather than settled once for the day.
+- Open positions are monitored regardless of the current verdict: the gate stops
+  new entries, it does not abandon anything already held. A bearish reading never
+  sells anything.
+- Before the first reading of a session exists, new entries are blocked the same
+  way a bearish reading blocks them — no data is not evidence that it is safe to
+  trade — but this cannot outlast the next tick: a daemon started mid-session takes
+  its first reading immediately rather than waiting for a blocking window that no
+  longer exists. There is nothing here left to dismiss from the status page.
+- **Pre-market, the regular session and post-market all read the same verdict.**
+  Before this change the two extended-hours halves took their entry authority from
+  different places — a live, unpersisted read before the bell standing in for a
+  gate that had not run yet, and a deferral to the day's already-resolved verdict
+  after the close. Now that the gate runs continuously rather than being confined to
+  a window after the open, that asymmetry is gone: all three read the current,
+  continuously-updated verdict the same way. A position opened pre-market is
+  covered by everything else in this document from the moment it exists: the same
+  stop, the same sizing, the same forced end-of-day exit.
+- **The book is flat overnight regardless.** Post-market trading (2026-10-08)
+  brought a second forced exit with it, `exit.eod_exit_offset_minutes` before
+  `extended.end`, so a position opened at 17:00 is sold before 20:00 rather than
+  carried. Without it, extending coverage past the close would have quietly
+  converted this from a day-trading strategy into one holding overnight gap risk on
+  microcaps — a different risk profile from the one anything in this document was
+  measured against. The residual exposure is a limit order that does not fill in a
+  thin 19:55 book; that is the same failure mode as an unfilled extended-hours stop,
+  and the same `extended.limit_slip_pct` governs it.
 
 ## End-of-day exit
 

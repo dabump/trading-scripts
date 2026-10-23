@@ -11,9 +11,9 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/screener"
 )
 
-// The manual sentiment check must not write a reading: the gate verdict is decided
-// by the newest stored reading, so persisting one would let a click overturn what
-// the first hour concluded.
+// The manual sentiment check must not write a reading: it can be run at any
+// moment, and persisting it would feed an arbitrarily-timed sample into the
+// continuous series the live entry gate reads.
 func TestCheckSentimentPersistsNothing(t *testing.T) {
 	h := newHarness(t)
 	h.setBullish()
@@ -263,7 +263,7 @@ func TestManualFailureDoesNotChangeAgentState(t *testing.T) {
 	h.setBullish()
 	h.at(9, 40)
 	h.tick()
-	h.wantState(domain.StateSentimentCheck)
+	h.wantState(domain.StateScreening)
 
 	h.fake.SetError(errors.New("upstream 503"))
 	if _, err := h.eng.CheckSentiment(context.Background()); err == nil {
@@ -273,8 +273,8 @@ func TestManualFailureDoesNotChangeAgentState(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 
-	if state, _ := h.eng.State(); state != domain.StateSentimentCheck {
-		t.Errorf("state = %q, want it unchanged at SENTIMENT_CHECK", state)
+	if state, _ := h.eng.State(); state != domain.StateScreening {
+		t.Errorf("state = %q, want it unchanged at SCREENING", state)
 	}
 }
 

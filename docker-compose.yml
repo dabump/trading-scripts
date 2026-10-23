@@ -8,8 +8,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: trading-agent:latest
-    container_name: trading-agent
+    image: trading-agent-warrior:latest
+    container_name: trading-agent-warrior
 
     # Credentials come from .env, which is gitignored. Copy .env.example and fill it
     # in; never bake keys into the image or into this file.
@@ -17,7 +17,7 @@ services:
       - .env
 
     ports:
-      - "127.0.0.1:8081:8080"
+      - "8086:8080"
 
     volumes:
       # Named volumes, not bind mounts: the SQLite database is what makes a restart

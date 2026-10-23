@@ -96,10 +96,9 @@ extended:
   # more extreme reading than 5.0x is at 15:00.
   min_volume_multiple: 0.5
   # Buying outside the bells. Off by default, and deliberately a separate switch from
-  # `enabled`: extended-hours entry fills from a thin book, and before the bell it runs
-  # before the first-hour sentiment gate exists. The engine substitutes a live sentiment
-  # read for the gate there, which is a weaker guarantee than the gate itself; after the
-  # close the day's own verdict applies, so a halted day stays halted.
+  # `enabled`: extended-hours entry fills from a thin book. The sentiment gate itself
+  # is the same continuous, reversible one the regular session reads — see
+  # docs/strategy.md §1 — this switch is about the thin book, not the gate.
   allow_entry: true
   # Limit-price allowance on extended-hours orders, in percent. Extended-hours orders
   # are always limit orders — Alpaca accepts nothing else for those sessions — so
@@ -204,12 +203,11 @@ exit:
   candle_trail: after_target # the runner is trailed on each completed candle's low once the target is banked
 
 timing:
-  sentiment_poll_interval: 2m # docs/strategy.md §1
-  # Five minutes, not the hour originally specified. The kill switch is worth keeping,
-  # but an hour of it meant sitting out the single most important hour of the day for
-  # this strategy: the moves it looks for begin in the first fifteen minutes. 09:30
-  # to 09:35 is still not tradeable, which is a real cost and a deliberate one.
-  sentiment_window: 5m
+  # Every 5 minutes, continuously through the trading and extended-hours day — not
+  # confined to a blocking window at the open. Each reading immediately decides
+  # whether new entries are allowed: bullish or neutral proceeds, overwhelmingly
+  # bearish blocks new entries until a later reading clears it. docs/strategy.md §1.
+  sentiment_poll_interval: 5m
   # New positions are only opened in this window after the open; positions already
   # held are still managed to the close. 5h55m from a 09:30 open reaches 15:25, which
   # is exactly where entry_cutoff_buffer puts the last entry ahead of the 15:55 forced
@@ -247,7 +245,7 @@ execution:
 
 web:
   listen_addr: ":8080"
-  poll_interval: 12s # docs/web-ui.md: ~10-15s
+  poll_interval: 2s # docs/web-ui.md: ~10-15s
 
 storage:
   database_path: data/agent.db # docs/operations.md

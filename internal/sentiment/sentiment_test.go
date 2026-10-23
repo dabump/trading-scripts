@@ -2,7 +2,6 @@ package sentiment
 
 import (
 	"testing"
-	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
@@ -94,31 +93,6 @@ func TestClassify(t *testing.T) {
 				t.Errorf("Classify = %q, want %q", got, tt.want)
 			}
 		})
-	}
-}
-
-// The gate uses the reading at the end of the hour, so an intraday dip that
-// recovered must not halt the session.
-func TestGateVerdictUsesFinalReading(t *testing.T) {
-	c := cfg()
-	base := time.Date(2026, 9, 28, 9, 40, 0, 0, time.UTC)
-	readings := []domain.SentimentReading{
-		{TakenAt: base, Percentages: map[string]float64{"SPY": -2.0, "QQQ": -2.2, "IWM": -2.4}},
-		{TakenAt: base.Add(20 * time.Minute), Percentages: map[string]float64{"SPY": -1.0, "QQQ": -1.1, "IWM": -1.2}},
-		{TakenAt: base.Add(50 * time.Minute), Percentages: map[string]float64{"SPY": 0.4, "QQQ": 0.6, "IWM": 0.2}},
-	}
-	if got := GateVerdict(readings, c); got != domain.VerdictProceed {
-		t.Errorf("GateVerdict = %q, want PROCEED: the recovery reading decides", got)
-	}
-
-	// And the reverse: a tape that deteriorated into the gate must halt.
-	readings[2].Percentages = map[string]float64{"SPY": -1.4, "QQQ": -1.6, "IWM": -1.9}
-	if got := GateVerdict(readings, c); got != domain.VerdictBearish {
-		t.Errorf("GateVerdict = %q, want OVERWHELMINGLY_BEARISH", got)
-	}
-
-	if got := GateVerdict(nil, c); got != domain.VerdictPending {
-		t.Errorf("GateVerdict(nil) = %q, want PENDING", got)
 	}
 }
 

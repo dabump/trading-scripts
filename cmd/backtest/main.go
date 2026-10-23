@@ -253,8 +253,8 @@ func reportTradeList(s Stats) {
 func reportFunnel(s Stats, sessions int) {
 	fmt.Printf("## Candidate funnel\n\n")
 	fmt.Printf("Sessions with at least one pre-filtered candidate   %d\n", sessions)
-	fmt.Printf("Sessions traded (sentiment gate open)               %d\n", s.TradingDays-s.HaltedDays)
-	fmt.Printf("Sessions halted bearish                             %d\n", s.HaltedDays)
+	fmt.Printf("Sessions simulated                                  %d\n", s.TradingDays)
+	fmt.Printf("  bearish at the open (gate is re-checked all day)  %d\n", s.HaltedDays)
 	fmt.Printf("Sessions skipped (sentiment basket unreadable)       %d\n", s.SkippedNoData)
 	f := s.Funnel
 	fmt.Printf("Symbol-days surviving the daily pre-filter          %d\n", f.SymbolDays)

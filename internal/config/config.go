@@ -26,6 +26,7 @@ type Config struct {
 	Web        Web        `yaml:"web"`
 	Storage    Storage    `yaml:"storage"`
 	Audit      Audit      `yaml:"audit"`
+	Claude     Claude     `yaml:"claude"`
 }
 
 // MarketData selects which Alpaca data feed to use.
@@ -385,6 +386,53 @@ type Audit struct {
 	Directory string `yaml:"directory"`
 }
 
+// Claude configures the review of losing trades: asking the Claude Code CLI why
+// each one lost and what, if anything, should change about the strategy, fed the
+// strategy's own documentation plus the trade's numbers.
+type Claude struct {
+	// ReviewFailedTrades turns the worker on. Off by default makes sense almost
+	// nowhere this ships, since the CLI has to be separately logged in from the
+	// status page first and nothing does that automatically — but it is still a
+	// switch, not an assumption, because a fresh deployment has no session yet.
+	ReviewFailedTrades bool `yaml:"review_failed_trades"`
+	// Model is passed to the CLI as --model for every call this package makes
+	// (trade review and news sentiment alike) — the account's own default is
+	// Opus, and these are unattended, repeated, low-stakes calls that should run
+	// on the cheaper model unless told otherwise. Empty falls back to "sonnet" in
+	// code, not here, so a config predating this field still gets the same
+	// default rather than an empty --model.
+	Model string `yaml:"model"`
+	// ReviewInterval is how often the worker looks for newly closed losing
+	// positions with no review yet. Not time-critical the way a trading decision
+	// is, so this can be minutes, not seconds.
+	ReviewInterval time.Duration `yaml:"review_interval"`
+	// ReviewBatchSize bounds how many are worked through per sweep. Reviews still
+	// run strictly one at a time regardless — this only bounds how long one sweep
+	// runs before the worker goes back to waiting for the next interval.
+	ReviewBatchSize int `yaml:"review_batch_size"`
+	// ReviewTimeout bounds one call to the CLI, so a wedged process cannot stall
+	// every review behind it forever.
+	ReviewTimeout time.Duration `yaml:"review_timeout"`
+	// DocsDir is where the strategy documentation a review is grounded in is read
+	// from, relative to the working directory — same convention as
+	// storage.database_path.
+	DocsDir string `yaml:"docs_dir"`
+
+	// AssessNewsSentiment turns on the news-sentiment worker: for a screened
+	// symbol with a same-day news catalyst, ask Claude once per session whether
+	// that news reads as positive, and star it on the watchlist if so. Off by
+	// default for the same reason ReviewFailedTrades is: it needs the CLI
+	// separately logged in first.
+	AssessNewsSentiment bool `yaml:"assess_news_sentiment"`
+	// SentimentInterval is how often the worker looks for newly screened symbols
+	// needing an assessment.
+	SentimentInterval time.Duration `yaml:"sentiment_interval"`
+	// SentimentBatchSize bounds how many symbols are assessed per sweep.
+	SentimentBatchSize int `yaml:"sentiment_batch_size"`
+	// SentimentTimeout bounds one call to the CLI.
+	SentimentTimeout time.Duration `yaml:"sentiment_timeout"`
+}
+
 // Secrets are the credentials loaded from the environment, never from YAML.
 type Secrets struct {
 	APIKey    string
@@ -634,6 +682,33 @@ func (c *Config) Validate() error {
 	}
 	if c.Audit.Directory == "" {
 		add("audit.directory must be set")
+	}
+
+	if c.Claude.ReviewFailedTrades {
+		if c.Claude.ReviewInterval <= 0 {
+			add("claude.review_interval must be > 0")
+		}
+		if c.Claude.ReviewBatchSize < 1 {
+			add("claude.review_batch_size must be >= 1")
+		}
+		if c.Claude.ReviewTimeout <= 0 {
+			add("claude.review_timeout must be > 0")
+		}
+		if c.Claude.DocsDir == "" {
+			add("claude.docs_dir must be set")
+		}
+	}
+
+	if c.Claude.AssessNewsSentiment {
+		if c.Claude.SentimentInterval <= 0 {
+			add("claude.sentiment_interval must be > 0")
+		}
+		if c.Claude.SentimentBatchSize < 1 {
+			add("claude.sentiment_batch_size must be >= 1")
+		}
+		if c.Claude.SentimentTimeout <= 0 {
+			add("claude.sentiment_timeout must be > 0")
+		}
 	}
 
 	return errors.Join(errs...)

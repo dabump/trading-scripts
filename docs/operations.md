@@ -84,6 +84,16 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `web.poll_interval` | 12s | `web-ui.md` (~10–15s) |
 | `storage.database_path` | `data/agent.db` | Created on start; gitignored |
 | `audit.directory` | `logs` | Append-only JSONL trail, one file per session date; gitignored |
+| `claude.model` | `sonnet` | Passed to the CLI as `--model` for every call both workers below make. The account's own default model is Opus; these are unattended, repeated, low-stakes calls, so the daemon pins the cheaper model explicitly rather than inheriting whatever the account defaults to |
+| `claude.review_failed_trades` | `true` | Turns on the trade review worker — asks the Claude Code CLI why each losing trade lost, fed `claude.docs_dir` plus the trade's numbers. Requires the CLI logged in from the status page's Claude card first; until then every review fails with "not logged in" and is recorded that way, not retried automatically |
+| `claude.review_interval` | 5m | How often the worker looks for newly closed losses with no review yet; not time-critical, so minutes rather than seconds |
+| `claude.review_batch_size` | 5 | How many reviews one sweep works through before waiting for the next interval; reviews still run one at a time regardless |
+| `claude.review_timeout` | 5m | Bounds one Claude CLI call, so a wedged process cannot stall every review behind it |
+| `claude.docs_dir` | `docs` | Where `strategy.md`, `risk.md` and `decisions.md` are read from for the review prompt; the Docker image copies only these three into `/app/docs` |
+| `claude.assess_news_sentiment` | `true` | Turns on the news-sentiment worker — for a screened symbol whose news-catalyst criterion passed, asks the Claude Code CLI whether that news reads as positive and stars it on the watchlist if so, at most once per symbol per session. Also requires the CLI logged in; unlike a trade review, while it is not, a sweep does nothing at all rather than recording a failure, so it is simply assessed once someone does log in |
+| `claude.sentiment_interval` | 5m | How often the worker looks at the latest screening pass for symbols not yet assessed today |
+| `claude.sentiment_batch_size` | 5 | How many symbols one sweep assesses before waiting for the next interval |
+| `claude.sentiment_timeout` | 5m | Bounds one Claude CLI call |
 
 Invalid configurations are rejected at startup rather than mid-session: unknown
 keys, a non-negative bearish threshold, a non-positive screening floor, a chart stop
@@ -202,6 +212,11 @@ subtly wrong:
   mode writes `agent.db-wal` and `agent.db-shm` alongside the database.
 - **Config is bind-mounted read-only**, so thresholds change with a restart rather
   than a rebuild. A copy is baked into the image so it still runs unmounted.
+- **`strategy.md`, `risk.md` and `decisions.md` are copied to `/app/docs`** — not
+  the whole `docs/` folder — for the trade review worker's prompt
+  (`claude.docs_dir`). They are not bind-mounted, so editing them takes a rebuild
+  like the rest of the image; a missing file is skipped with a warning rather than
+  failing startup.
 - **The build stage runs `go vet` and the full test suite**, so a failing test cannot
   produce an image. This daemon places orders; "it compiled" is not the bar.
 - **Runs as an unprivileged user** (uid 10001) with `no-new-privileges`.

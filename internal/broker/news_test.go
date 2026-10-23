@@ -136,3 +136,42 @@ func TestNewsCountsStopsOnRepeatedPageToken(t *testing.T) {
 		t.Errorf("made %d requests; pagination needs a page cap", calls)
 	}
 }
+
+// NewsHeadlines is the single-symbol call the news-sentiment worker uses to get
+// the actual story text behind a catalyst count, which NewsCounts never fetches.
+func TestNewsHeadlinesReturnsHeadlinesForOneSymbol(t *testing.T) {
+	var gotSymbols, gotLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotSymbols = q.Get("symbols")
+		gotLimit = q.Get("limit")
+		io.WriteString(w, `{"news":[
+			{"headline":"QTEX wins major contract"},
+			{"headline":""},
+			{"headline":"QTEX beats on revenue"}
+		]}`)
+	}))
+	defer srv.Close()
+
+	a := NewAlpaca(&config.Secrets{APIKey: "k", APISecret: "s", BaseURL: srv.URL, DataURL: srv.URL}, "sip")
+	got, err := a.NewsHeadlines(context.Background(), "QTEX", time.Now().Add(-4*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"QTEX wins major contract", "QTEX beats on revenue"}
+	if len(got) != len(want) {
+		t.Fatalf("headlines = %v, want %v (empty headlines should be dropped)", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("headline[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if gotSymbols != "QTEX" {
+		t.Errorf("requested symbols = %q, want exactly QTEX", gotSymbols)
+	}
+	if gotLimit == "" || gotLimit == "0" {
+		t.Errorf("limit = %q, want a bounded page size", gotLimit)
+	}
+}

@@ -101,6 +101,11 @@ type ScreenRow struct {
 	// risk rules regardless — this only keeps the page from offering a click that is
 	// certain to be refused.
 	CanOpen bool
+	// PositiveNews stars the symbol: Claude has assessed this session's news
+	// catalyst as positive. Unset (never a star) until the news-sentiment worker
+	// has actually run — see internal/newssentiment — rather than defaulting to
+	// anything about the news itself.
+	PositiveNews bool
 }
 
 type PositionRow struct {
@@ -151,6 +156,11 @@ type EODRow struct {
 	OpenedAt string
 	ClosedAt string
 	Held     string
+	// ReviewState is "" for a winning trade (no review ever runs for one), "pending"
+	// for a loss the review worker has not gotten to yet, or "ready" once Claude's
+	// report is stored — only "ready" shows the button, so a click can never race
+	// an analysis still in flight.
+	ReviewState string
 }
 
 // View is everything the template renders.
@@ -477,6 +487,10 @@ func BuildView(
 	if !takenAt.IsZero() {
 		v.ScreenTakenAt = takenAt.In(scheduler.ET).Format("15:04:05")
 	}
+	positiveNews, err := st.PositiveNewsSentiment(date)
+	if err != nil {
+		return nil, err
+	}
 	for i, e := range evals {
 		if i == 0 {
 			for _, c := range e.Criteria {
@@ -493,6 +507,7 @@ func BuildView(
 			row.Verdict = e.FailReason
 		}
 		row.CanOpen = !held[e.Symbol]
+		row.PositiveNews = positiveNews[e.Symbol]
 		row.Outcome = e.Outcome
 		row.OutcomeTone = "idle"
 		if strings.HasPrefix(e.Outcome, "bought") {
@@ -614,14 +629,21 @@ func BuildView(
 		} else if realized < 0 {
 			losses++
 		}
-		v.ClosedRows = append(v.ClosedRows, EODRow{
+		row := EODRow{
 			ID: p.ID, Symbol: p.Symbol, Shares: p.Shares,
 			Open: money(p.EntryPrice), Close: money(p.ExitPrice),
 			PnLDollars: signedMoney(realized), PnLPct: pct(p.RealizedPct()),
 			Reason: string(p.ExitReason), Tone: toneForPnL(realized),
 			OpenedAt: tradeTime(p.EntryTime), ClosedAt: tradeTime(p.ExitTime),
 			Held: heldText(p.EntryTime, p.ExitTime),
-		})
+		}
+		if realized < 0 {
+			row.ReviewState = "pending"
+			if _, found, err := st.TradeReviewFor(p.ID); err == nil && found {
+				row.ReviewState = "ready"
+			}
+		}
+		v.ClosedRows = append(v.ClosedRows, row)
 	}
 	v.ShowTotals = len(v.ClosedRows) > 0
 	v.EODNetPnL = signedMoney(net)

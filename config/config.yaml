@@ -255,3 +255,29 @@ audit:
   # date. Separate from the operational log on stderr: this is the record you read
   # back weeks later to answer "why did it buy that?".
   directory: logs
+
+claude:
+  # Model passed to the CLI as --model for every call below (trade review and news
+  # sentiment alike). The account's own default is Opus; these are unattended,
+  # repeated, low-stakes calls that have no business running on it.
+  model: sonnet
+
+  # Asks the Claude Code CLI why each losing trade lost and what, if anything,
+  # should change about the strategy, fed the strategy's own docs plus the
+  # trade's numbers. Requires the CLI to be logged in from the status page first
+  # — see the Claude card — or every review fails with "not logged in" and is
+  # recorded that way rather than retried automatically.
+  review_failed_trades: true
+  review_interval: 5m
+  review_batch_size: 5
+  review_timeout: 5m
+  docs_dir: docs
+
+  # For a screened symbol with a same-day news catalyst, asks Claude once per
+  # session whether that news reads as positive and stars it on the watchlist if
+  # so. Also requires the CLI to be logged in; while it is not, a sweep does
+  # nothing and simply retries once it is, rather than recording a failure.
+  assess_news_sentiment: true
+  sentiment_interval: 5m
+  sentiment_batch_size: 5
+  sentiment_timeout: 5m

@@ -1,10 +1,24 @@
 package claudelogin
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// fakeExecutable writes a standalone shell script and returns its path, for
+// testing Logout, which runs its command plainly (not under sh -c the way the
+// login fakes in this file do), so Command has to be a real executable file.
+func fakeExecutable(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-claude")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 // waitForState polls until the session reaches one of the wanted states, or fails
 // the test. The CLI (real or faked) runs as a subprocess on its own schedule, so
@@ -170,5 +184,37 @@ func TestLoggedInIsFalseWithNoCredentialFile(t *testing.T) {
 	s := New()
 	if s.LoggedIn() {
 		t.Error("an empty config dir should not report logged in")
+	}
+}
+
+func TestLogoutRunsTheCommandPlainly(t *testing.T) {
+	script := fakeExecutable(t, `echo "args: $@" >&2; exit 0`+"\n")
+	s := &Session{Command: script}
+	if err := s.Logout(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLogoutSurfacesAFailure(t *testing.T) {
+	script := fakeExecutable(t, `echo "network error" >&2; exit 1`+"\n")
+	s := &Session{Command: script}
+	err := s.Logout()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "network error") {
+		t.Errorf("error = %v, want it to carry the command's stderr", err)
+	}
+}
+
+func TestLogoutIsRefusedWhileALoginIsRunning(t *testing.T) {
+	s := newFakeSession("sleep 30\nexit 0\n")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Cancel()
+
+	if err := s.Logout(); err == nil {
+		t.Error("Logout during a running login attempt should be refused")
 	}
 }

@@ -46,6 +46,11 @@ COPY --from=build /out/agent /app/agent
 # A default config is baked in so the image runs unmodified; mount over
 # /app/config to tune thresholds without rebuilding.
 COPY config/config.yaml /app/config/config.yaml
+# The trade review worker grounds Claude's analysis of a losing trade in these —
+# read from disk at startup (claude.docs_dir), not embedded in the binary, so they
+# stay in sync with whatever is actually checked in rather than whatever was
+# compiled. Only the review-relevant docs are copied, not the whole folder.
+COPY docs/strategy.md docs/risk.md docs/decisions.md /app/docs/
 
 # Created and owned up front: the daemon runs unprivileged, and both of these must
 # be writable. data/ holds the SQLite database that makes a restart recoverable and

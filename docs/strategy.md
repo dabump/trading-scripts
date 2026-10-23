@@ -72,7 +72,7 @@ Nothing in the screen filters on company size, so it admits large caps as readil
 
 A candidate must pass **all three** of the following (AND, not scored/weighted — any one failing disqualifies the candidate):
 
-1. **News catalyst** — at least one news headline for the ticker within the `news_lookback` window (presence check only; no sentiment/NLP scoring — the price/volume move itself is what confirms the catalyst is moving the stock, the headline just confirms one exists).
+1. **News catalyst** — at least one news headline for the ticker within the `news_lookback` window (presence check only; no sentiment/NLP scoring — the price/volume move itself is what confirms the catalyst is moving the stock, the headline just confirms one exists). This criterion itself still does not score sentiment; a separate, optional worker (`internal/newssentiment`, see `docs/decisions.md` 2026-10-24) asks Claude to classify a *passing* catalyst's actual headlines and stars the watchlist row if positive, purely for display — it runs after this criterion has already passed and never feeds back into it or into entry.
 
    The window reaches back **past the market open**, not from it. A gap-up's catalyst almost always breaks overnight or in the pre-market session, so searching from 09:30 would miss the very story that caused the move and report "no news" for precisely the candidates worth trading. The default 18h covers the prior afternoon through this morning's pre-market. Known limitation: over a weekend or holiday, 18h will not reach back to the last session's news — a Monday gap driven by Friday-evening news would be missed unless the lookback is widened.
 2. **Price move** — already up ≥10% intraday.

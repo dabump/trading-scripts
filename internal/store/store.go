@@ -645,3 +645,132 @@ func (s *Store) SymbolsTradedOn(date string) (map[string]bool, error) {
 	}
 	return out, rows.Err()
 }
+
+// TradeReview is Claude's own analysis of one losing trade.
+type TradeReview struct {
+	PositionID int64
+	// Status is "DONE" or "FAILED". There is no in-between persisted state — a row
+	// is written once, after the review worker's Claude call has already returned.
+	Status    string
+	Report    string
+	Error     string
+	CreatedAt time.Time
+}
+
+// FailedTradesNeedingReview returns closed, losing positions with no review yet,
+// oldest first, up to limit. "No review yet" rather than a status column drives
+// this: a row only exists once a review has actually completed (either way), so a
+// daemon restart mid-review just finds the same position again rather than one
+// stuck forever in some "in progress" state.
+func (s *Store) FailedTradesNeedingReview(limit int) ([]domain.Position, error) {
+	rows, err := s.db.Query(
+		`SELECT `+positionColumns+` FROM positions p
+		 WHERE p.is_open = 0 AND p.banked_dollars < 0
+		   AND NOT EXISTS (SELECT 1 FROM trade_reviews r WHERE r.position_id = p.id)
+		 ORDER BY p.exit_time
+		 LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query trades needing review: %w", err)
+	}
+	return s.scanPositions(rows)
+}
+
+// SaveTradeReview records the outcome of reviewing one trade — exactly once, after
+// the Claude call has returned. reviewErr is the failure if the call did not
+// succeed; empty means it did. An existing row is overwritten rather than refused,
+// which is what lets a FAILED review be retried by simply deleting its row.
+func (s *Store) SaveTradeReview(positionID int64, report, reviewErr string) error {
+	status := "DONE"
+	if reviewErr != "" {
+		status = "FAILED"
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO trade_reviews (position_id, status, report, error, created_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(position_id) DO UPDATE SET
+		   status = excluded.status, report = excluded.report,
+		   error = excluded.error, created_at = excluded.created_at`,
+		positionID, status, report, reviewErr, nowUTC())
+	if err != nil {
+		return fmt.Errorf("save trade review: %w", err)
+	}
+	return nil
+}
+
+// TradeReviewFor returns the review for one position, if one has completed.
+func (s *Store) TradeReviewFor(positionID int64) (TradeReview, bool, error) {
+	var tr TradeReview
+	var createdAt string
+	err := s.db.QueryRow(
+		`SELECT position_id, status, report, error, created_at
+		 FROM trade_reviews WHERE position_id = ?`, positionID).
+		Scan(&tr.PositionID, &tr.Status, &tr.Report, &tr.Error, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TradeReview{}, false, nil
+	}
+	if err != nil {
+		return TradeReview{}, false, fmt.Errorf("query trade review %d: %w", positionID, err)
+	}
+	tr.CreatedAt = parseTime(createdAt)
+	return tr, true, nil
+}
+
+// AnalyzedNewsSentiment returns the symbols already assessed for news sentiment on
+// date, regardless of the verdict. "Already analyzed" rather than a status column:
+// the sentiment worker checks this before spending a Claude call, not after, so
+// there is nothing to retry and nothing stuck in progress across a restart.
+func (s *Store) AnalyzedNewsSentiment(date string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT symbol FROM news_sentiment WHERE session_date = ?`, date)
+	if err != nil {
+		return nil, fmt.Errorf("query analyzed news sentiment: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		out[sym] = true
+	}
+	return out, rows.Err()
+}
+
+// SaveNewsSentiment records one symbol's news-sentiment verdict for date. The
+// caller is expected to have already checked AnalyzedNewsSentiment, so a repeat
+// call for the same (date, symbol) is ignored rather than overwriting — the
+// unique key is a backstop against a race, not a retry path.
+func (s *Store) SaveNewsSentiment(date, symbol, sentiment string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO news_sentiment (session_date, symbol, sentiment, created_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(session_date, symbol) DO NOTHING`,
+		date, symbol, sentiment, nowUTC())
+	if err != nil {
+		return fmt.Errorf("save news sentiment: %w", err)
+	}
+	return nil
+}
+
+// PositiveNewsSentiment returns the symbols classified positive on date, for the
+// watchlist's star indicator.
+func (s *Store) PositiveNewsSentiment(date string) (map[string]bool, error) {
+	rows, err := s.db.Query(
+		`SELECT symbol FROM news_sentiment WHERE session_date = ? AND sentiment = ?`,
+		date, "POSITIVE")
+	if err != nil {
+		return nil, fmt.Errorf("query positive news sentiment: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		out[sym] = true
+	}
+	return out, rows.Err()
+}

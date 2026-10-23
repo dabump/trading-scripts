@@ -95,6 +95,13 @@ type MarketData interface {
 	AverageDailyVolume(ctx context.Context, symbol string, days int) (float64, error)
 	// NewsCounts reports how many stories each symbol has since the given time.
 	NewsCounts(ctx context.Context, symbols []string, since time.Time) (map[string]int, error)
+	// NewsHeadlines returns the most recent story headlines for one symbol since
+	// the given time, newest first. It exists only for the optional Claude
+	// news-sentiment feature (internal/newssentiment): that worker runs on at most
+	// a handful of already-screened symbols from its own background ticker, never
+	// from the scan path, so it fetches per symbol rather than needing NewsCounts's
+	// batching — and it needs the story text, not just a count.
+	NewsHeadlines(ctx context.Context, symbol string, since time.Time) ([]string, error)
 	// SessionVolumes reports how many shares each symbol has traded since `since`.
 	//
 	// It exists because the snapshot endpoint cannot answer this before the opening

@@ -477,6 +477,37 @@ func (a *Alpaca) newsBatch(ctx context.Context, batch []string, since time.Time,
 	return nil
 }
 
+// newsHeadlinesLimit bounds one NewsHeadlines call. It runs per symbol from the
+// news-sentiment worker, not the scan path, so there is no batching concern here —
+// just enough recent stories to give Claude the catalyst without an oversized
+// prompt.
+const newsHeadlinesLimit = 20
+
+// NewsHeadlines returns symbol's story headlines since the given time, newest
+// first.
+func (a *Alpaca) NewsHeadlines(ctx context.Context, symbol string, since time.Time) ([]string, error) {
+	u := fmt.Sprintf("%s/v1beta1/news?symbols=%s&start=%s&limit=%d",
+		a.dataURL, url.QueryEscape(symbol),
+		url.QueryEscape(since.UTC().Format(time.RFC3339)), newsHeadlinesLimit)
+
+	var resp struct {
+		News []struct {
+			Headline string `json:"headline"`
+		} `json:"news"`
+	}
+	if err := a.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+		return nil, err
+	}
+
+	out := make([]string, 0, len(resp.News))
+	for _, item := range resp.News {
+		if item.Headline != "" {
+			out = append(out, item.Headline)
+		}
+	}
+	return out, nil
+}
+
 func (a *Alpaca) Account(ctx context.Context) (domain.Account, error) {
 	var resp struct {
 		PortfolioValue string `json:"portfolio_value"`

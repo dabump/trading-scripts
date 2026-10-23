@@ -781,3 +781,182 @@ func TestStopOrderIDRoundTrips(t *testing.T) {
 		t.Errorf("stop order id = %q after clearing, want empty", p.StopOrderID)
 	}
 }
+
+// A winning trade is never offered up for review, a losing one disappears from the
+// list the moment it has a row — "no row yet" is the only notion of "pending" this
+// schema has, deliberately: there is nothing for a crash to leave stuck mid-review.
+func TestFailedTradesNeedingReview(t *testing.T) {
+	s := newStore(t)
+	entry := time.Date(2026, 10, 20, 15, 0, 0, 0, time.UTC)
+
+	winner, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-10-20", Symbol: "WIN", Shares: 100,
+		EntryPrice: 5.00, EntryTime: entry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClosePosition(winner, 5.50, entry.Add(time.Hour), domain.ExitStopLoss); err != nil {
+		t.Fatal(err)
+	}
+
+	loser, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-10-20", Symbol: "LOSE", Shares: 100,
+		EntryPrice: 5.00, EntryTime: entry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClosePosition(loser, 4.80, entry.Add(time.Hour), domain.ExitStopLoss); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-10-20", Symbol: "OPEN", Shares: 100,
+		EntryPrice: 5.00, EntryTime: entry,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := s.FailedTradesNeedingReview(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Symbol != "LOSE" {
+		t.Fatalf("pending = %+v, want exactly the losing, closed trade", pending)
+	}
+
+	if err := s.SaveTradeReview(loser, "it was the stop doing its job", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err = s.FailedTradesNeedingReview(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("pending after review = %+v, want none left", pending)
+	}
+
+	got, found, err := s.TradeReviewFor(loser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got.Status != "DONE" || got.Report != "it was the stop doing its job" {
+		t.Errorf("review = %+v, found=%v", got, found)
+	}
+
+	if _, found, err := s.TradeReviewFor(winner); err != nil {
+		t.Fatal(err)
+	} else if found {
+		t.Error("a winning trade should never have a review row")
+	}
+}
+
+// A failed review is retryable by construction: deleting its row (the schema's own
+// escape hatch, not a UI affordance) makes the trade "pending" again, exactly like
+// a fresh loss.
+func TestSaveTradeReviewRecordsFailureAndCanBeOverwritten(t *testing.T) {
+	s := newStore(t)
+	id, err := s.InsertPosition(domain.Position{
+		SessionDate: "2026-10-20", Symbol: "FAIL", Shares: 100,
+		EntryPrice: 5.00, EntryTime: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClosePosition(id, 4.80, time.Now(), domain.ExitStopLoss); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SaveTradeReview(id, "", "claude: not logged in"); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := s.TradeReviewFor(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got.Status != "FAILED" || got.Error == "" {
+		t.Fatalf("review = %+v, found=%v", got, found)
+	}
+
+	// Saving again for the same position (a retry) overwrites rather than erroring.
+	if err := s.SaveTradeReview(id, "now it worked", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err = s.TradeReviewFor(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got.Status != "DONE" || got.Report != "now it worked" {
+		t.Fatalf("review after retry = %+v, found=%v", got, found)
+	}
+}
+
+func TestSaveNewsSentimentAndPositiveNewsSentiment(t *testing.T) {
+	s := newStore(t)
+
+	if err := s.SaveNewsSentiment("2026-10-24", "GOOD", "POSITIVE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveNewsSentiment("2026-10-24", "BAD", "NEGATIVE"); err != nil {
+		t.Fatal(err)
+	}
+	// A different session date for the same symbol is a separate analysis.
+	if err := s.SaveNewsSentiment("2026-10-23", "GOOD", "NEGATIVE"); err != nil {
+		t.Fatal(err)
+	}
+
+	positive, err := s.PositiveNewsSentiment("2026-10-24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !positive["GOOD"] || positive["BAD"] {
+		t.Fatalf("positive = %+v, want only GOOD starred on 2026-10-24", positive)
+	}
+
+	positiveYesterday, err := s.PositiveNewsSentiment("2026-10-23")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positiveYesterday["GOOD"] {
+		t.Error("GOOD was negative on 2026-10-23; it should not be starred on that date")
+	}
+}
+
+func TestAnalyzedNewsSentimentAndSaveNewsSentimentIsIdempotent(t *testing.T) {
+	s := newStore(t)
+	date := "2026-10-24"
+
+	analyzed, err := s.AnalyzedNewsSentiment(date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analyzed) != 0 {
+		t.Fatalf("analyzed = %+v, want none before anything is saved", analyzed)
+	}
+
+	if err := s.SaveNewsSentiment(date, "QTEX", "POSITIVE"); err != nil {
+		t.Fatal(err)
+	}
+	analyzed, err = s.AnalyzedNewsSentiment(date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !analyzed["QTEX"] {
+		t.Fatalf("analyzed = %+v, want QTEX marked done", analyzed)
+	}
+
+	// The worker checks AnalyzedNewsSentiment before calling SaveNewsSentiment, so
+	// a repeat call (a race, not a retry) must not overwrite the first verdict.
+	if err := s.SaveNewsSentiment(date, "QTEX", "NEGATIVE"); err != nil {
+		t.Fatal(err)
+	}
+	positive, err := s.PositiveNewsSentiment(date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !positive["QTEX"] {
+		t.Error("the second save overwrote the first verdict; it should have been ignored")
+	}
+}

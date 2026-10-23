@@ -1646,6 +1646,31 @@ Requested directly: check sentiment every 5 minutes through the whole trading an
 
 **No store schema change was needed.** The `sessions` table's `verdict`/`halted`/`halt_reason` columns already fit a value that gets overwritten on every change rather than written once; `SetVerdict` was already an `UPDATE`. What changed is when it is called — on every reading that changes the verdict, via `updateEntryVerdict`, rather than once per day guarded by `rec.Verdict != VerdictPending` — and that the audit trail records a transition (`TradingHalted` / `GateResolved`) only when the verdict actually changes, not on every 5-minute poll, which already has its own `SentimentRead` event.
 
+## 2026-10-24 — Claude stars a positive news catalyst on the watchlist, display only
+
+Requested directly: when logged into Claude, and a screened stock has a news catalyst, have Claude assess whether that news is positive or negative sentiment, and star the symbol on the watchlist if positive — limited to one Claude analysis per stock per trading day to keep token usage down.
+
+| Decision | Rationale |
+|---|---|
+| This does not reverse the 2026-09-26 decision that the news-catalyst *criterion* is a presence check only, with no sentiment scoring | That decision was about what gates a trade; this feature never touches `screener.Evaluate` or entry at all. It reads the same evaluations the page and the entry pass already use (`store.LatestScreenSnapshot`) and writes a star onto the display, on its own worker, entirely outside the one evaluation path — the same separation `tradereview` already has from the trading loop. |
+| New `internal/newssentiment` worker, its own ticker (`claude.sentiment_interval`, default 5m), off a `claude.assess_news_sentiment` switch (on by default) | Mirrors `tradereview`'s shape rather than inventing a new one: a CLI call is not time-critical, and must not be able to affect trading even if it hangs. |
+| "Once per stock per trading day" enforced by a `(session_date, symbol)` row in a new `news_sentiment` table, checked before a Claude call is made, not after | The straightforward way to make the limit absolute rather than approximate — a worker restart or a slow sweep can't cause a double-spend the way a time-based throttle could. |
+| A Claude call that fails (for any reason other than being logged out) still counts as the day's one analysis, recorded as NEUTRAL | Directly serves "tokens used sparingly": without this, a transient CLI error would retry every sweep for the rest of the session, which is unbounded spend for a cosmetic feature. |
+| A logged-out CLI is the one case that does *not* spend the day's analysis — the worker skips the sweep and writes nothing | Unlike `tradereview`'s FAILED rows (deliberately permanent until manually deleted — see the Claude card note in `web-ui.md`), a star is cheap to get right eventually: nothing is lost by waiting for a human to log in, and nothing should be stuck saying "not logged in" once they have. |
+| Headlines come from a new `broker.NewsHeadlines(symbol, since)`, one symbol at a time, separate from the scan path's batched `NewsCounts` | The scan only ever needed a count to pass the criterion; this is the first thing in the codebase that needs the actual story text, and it runs on a handful of already-screened symbols from a background worker, not the full-market scan, so per-symbol calls cost nothing comparable. |
+| The star is purely visual (`ScreenRow.PositiveNews`, a `★` beside the symbol) and appears only once Claude has actually assessed the ticker that session | No star is not a negative signal — it can mean not logged in, not reached yet this sweep, or genuinely neutral/negative; the page does not try to distinguish those cases beyond showing or withholding the star. |
+
+## 2026-10-24 — The CLI calls pin `--model sonnet` rather than inheriting the account default
+
+Requested directly: the default model used must be Sonnet, not Opus.
+
+| Decision | Rationale |
+|---|---|
+| `tradereview.CLIAnalyze` and `newssentiment.CLIAnalyze` now take a `model` parameter and pass it through as `--model`, defaulting to `"sonnet"` in code when empty | Both workers run unattended and repeatedly (every closed loss, every screened symbol with a catalyst) on text analysis or a one-word classification — exactly the kind of call that should not be left to whatever model the logged-in account happens to default to, which may be Opus. |
+| New `claude.model` config key (default `sonnet` in `config/config.yaml`), rather than hardcoding the string in both packages | Keeps it next to `claude.review_timeout`/`claude.sentiment_timeout` as one more tunable the operator can change without a code edit, consistent with how every other Claude setting in this config block works. |
+| The default lives in `CLIAnalyze` (empty string falls back to `"sonnet"`), not only in the YAML | A config file from before this change has no `claude.model` key at all; falling back in code means it still gets Sonnet rather than an empty `--model` flag (which the CLI would likely reject or mishandle). |
+| `claudelogin` (the login/logout flow) is untouched | Authenticating or ending a session does no inference and has no model to pick. |
+
 ## Open items (not yet decided)
 
 - **Whether the buy-stop entry survives real fills.** The backtest fills it at its trigger price and measures it clearly worse (8,511 against 9,943 over a year, 5,031 at 0.50% slippage); the paper test on the test branch exists to find out whether live fills are better or worse than that assumption. Compare realised fill against `quoted_price` in the audit trail before deciding.

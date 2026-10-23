@@ -24,8 +24,10 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/engine"
+	"github.com/martincoetzee/trading-agent/internal/newssentiment"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
 	"github.com/martincoetzee/trading-agent/internal/store"
+	"github.com/martincoetzee/trading-agent/internal/tradereview"
 	"github.com/martincoetzee/trading-agent/internal/web"
 )
 
@@ -217,13 +219,60 @@ func run() error {
 		return err
 	}
 
+	// The review worker is its own component, not something engine.Tick drives: a
+	// review is a CLI call that can take tens of seconds, nothing about it is
+	// time-critical the way a trading decision is, and it must not be able to
+	// affect trading even if the CLI hangs or is not logged in.
+	var reviewWorker *tradereview.Worker
+	if cfg.Claude.ReviewFailedTrades {
+		reviewWorker = &tradereview.Worker{
+			Store:     st,
+			Analyze:   tradereview.CLIAnalyze("claude", cfg.Claude.Model, cfg.Claude.ReviewTimeout),
+			Docs:      loadStrategyDocs(cfg.Claude.DocsDir, logger),
+			Interval:  cfg.Claude.ReviewInterval,
+			BatchSize: cfg.Claude.ReviewBatchSize,
+			Log:       logger,
+		}
+	}
+
+	// Likewise its own component, not something engine.Tick drives, for the same
+	// reasons: a CLI call is not time-critical, and it must not be able to affect
+	// trading even if the CLI hangs or is logged out. It only ever annotates the
+	// watchlist the screen already produced (st.LatestScreenSnapshot) — see
+	// docs/architecture.md on why there is one evaluation path, not two.
+	var sentimentWorker *newssentiment.Worker
+	if cfg.Claude.AssessNewsSentiment {
+		sentimentWorker = &newssentiment.Worker{
+			Store:        st,
+			News:         data,
+			Analyze:      newssentiment.CLIAnalyze("claude", cfg.Claude.Model, cfg.Claude.SentimentTimeout),
+			LoggedIn:     claude.LoggedIn,
+			NewsLookback: cfg.Screening.NewsLookback,
+			Interval:     cfg.Claude.SentimentInterval,
+			BatchSize:    cfg.Claude.SentimentBatchSize,
+			Log:          logger,
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	const components = 2
+	components := 2
+	if reviewWorker != nil {
+		components++
+	}
+	if sentimentWorker != nil {
+		components++
+	}
 	errs := make(chan error, components)
 	go func() { errs <- srv.Serve(ctx) }()
 	go func() { errs <- eng.Run(ctx) }()
+	if reviewWorker != nil {
+		go func() { errs <- reviewWorker.Run(ctx) }()
+	}
+	if sentimentWorker != nil {
+		go func() { errs <- sentimentWorker.Run(ctx) }()
+	}
 
 	logger.Info("agent started", "paper", paper, "offline", *offline,
 		"listen", cfg.Web.ListenAddr, "db", cfg.Storage.DatabasePath,
@@ -370,6 +419,31 @@ func offlineSession(now time.Time, cfg *config.Config) (open, close time.Time) {
 	return open, open.Add(20 * time.Minute)
 }
 
+// reviewDocs are the files a trade review is grounded in: the rules themselves,
+// what sizes and protects a position, and why each rule is the way it is — so a
+// review does not propose re-adding something already tried and measured worse.
+var reviewDocs = []string{"strategy.md", "risk.md", "decisions.md"}
+
+// loadStrategyDocs concatenates reviewDocs out of dir for the review worker's
+// prompt. A missing file is skipped with a warning rather than failing startup —
+// the worker still runs, just grounded in whatever it could read; an empty result
+// shows up in the prompt itself (see tradereview.BuildPrompt) rather than silently.
+func loadStrategyDocs(dir string, log *slog.Logger) string {
+	var b strings.Builder
+	for _, name := range reviewDocs {
+		path := filepath.Join(dir, name)
+		body, err := os.ReadFile(path)
+		if err != nil {
+			log.Warn("trade review: could not read a strategy doc", "path", path, "err", err)
+			continue
+		}
+		fmt.Fprintf(&b, "--- %s ---\n", name)
+		b.Write(body)
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
 // seedFake builds an offline broker with a plausible session and one candidate
 // that clears every screening criterion, so the daemon and its page can be
 // exercised end to end without credentials.
@@ -411,6 +485,13 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	fake.SetSessionVolume("DEMO", 900_000)
 	fake.SetAverageVolume("DEMO", 1_000_000)
 	fake.SetNews("DEMO", 2)
+	// Seeded so -offline can demonstrate the news-sentiment star end to end if the
+	// Claude CLI happens to be logged in; harmless if it is not, since the worker
+	// then just skips the sweep.
+	fake.SetHeadlines("DEMO", []string{
+		"DEMO wins exclusive multi-year supply contract",
+		"DEMO beats revenue estimates, raises full-year guidance",
+	})
 	// Clearing the screen is no longer enough to be bought: the chart has to print a
 	// pullback and resumption. DEMO gets one, so the demo reaches an actual entry. It
 	// has closed by now: the extended session was opened one chart's length ago for it.
@@ -428,6 +509,7 @@ func seedFake(now time.Time, cfg *config.Config) *broker.Fake {
 	fake.SetSessionVolume("SETUPLESS", 1_000_000)
 	fake.SetAverageVolume("SETUPLESS", 1_100_000)
 	fake.SetNews("SETUPLESS", 1)
+	fake.SetHeadlines("SETUPLESS", []string{"SETUPLESS files routine 8-K"})
 
 	fake.SetSnapshot("NONEWS", 2.30, 2.06, 5_400_000)
 	fake.SetSessionVolume("NONEWS", 800_000)

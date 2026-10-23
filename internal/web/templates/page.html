@@ -144,6 +144,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
 }
 .pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); }
 
+.news-star { color: var(--warn); font-size: 12px; cursor: default; }
+
 .tabs { display: inline-flex; gap: 4px; margin-left: 12px; vertical-align: middle; }
 .tab {
   font: inherit; font-size: 12px; cursor: pointer; padding: 4px 10px; border-radius: 6px;
@@ -277,6 +279,10 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px;
   background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
 }
 .claude-input-row input[type="text"]:focus { outline: none; border-color: var(--accent); }
+
+.review-report {
+  white-space: pre-wrap; line-height: 1.6; font-size: 13.5px; color: var(--text);
+}
 </style>
 </head>
 <body>
@@ -385,6 +391,27 @@ document.addEventListener('click', async (e) => {
   } finally {
     btn.disabled = false;
     refresh();
+  }
+});
+
+// Showing a trade review. Purely a read of something already stored — the button
+// only exists on a row the fragment poll has marked "ready" (view.ReviewState),
+// so this never races a review still in progress and never triggers one itself.
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-review]');
+  if (!btn) return;
+
+  modalContent.innerHTML = '<div class="mhead"><h3>Loading…</h3></div>' +
+    '<div class="mbody"><p class="note">Fetching the review.</p></div>';
+  if (!modal.open) modal.showModal();
+
+  try {
+    const res = await fetch('actions/trade-review?id=' + encodeURIComponent(btn.dataset.review),
+      { headers: { 'Accept': 'text/html' } });
+    modalContent.innerHTML = await res.text();
+  } catch (err) {
+    modalContent.innerHTML = '<div class="mhead"><h3>Could not load</h3></div>' +
+      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
   }
 });
 
@@ -697,7 +724,7 @@ setInterval(claudeRefresh, 2000);
     <thead>
       <tr>
         <th>Symbol</th><th class="num">Shares</th><th class="num">Opened</th>
-        <th class="num">Closed</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th>Exit</th>
+        <th class="num">Closed</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th>Exit</th><th></th>
       </tr>
     </thead>
     <tbody>
@@ -711,9 +738,16 @@ setInterval(claudeRefresh, 2000);
         <td class="num {{.Tone}}">{{.PnLDollars}}</td>
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
         <td class="muted">{{.Reason}}</td>
+        <td class="num">
+          {{if eq .ReviewState "ready"}}
+          <button type="button" class="mini" data-review="{{.ID}}" title="Ask Claude why this trade lost">Why?</button>
+          {{else if eq .ReviewState "pending"}}
+          <span class="meta" title="The review worker has not gotten to this one yet">analyzing…</span>
+          {{end}}
+        </td>
       </tr>
       <tr class="foldout" id="fold-{{.ID}}" hidden>
-        <td colspan="7">
+        <td colspan="8">
           <span><span class="label">Opened</span>{{.OpenedAt}}</span>
           <span><span class="label">Closed</span>{{.ClosedAt}}</span>
           <span><span class="label">Held</span>{{.Held}}</span>
@@ -746,7 +780,7 @@ setInterval(claudeRefresh, 2000);
     <tbody>
       {{range .ScreenRows}}
       <tr>
-        {{template "symbolCell" .Symbol}}
+        {{template "symbolCellStar" .}}
         {{range .Cells}}
         <td class="num">
           <span class="crit {{if .Pass}}pass{{else}}fail{{end}}">
@@ -792,6 +826,12 @@ setInterval(claudeRefresh, 2000);
 {{end}}
 
 {{define "symbolCell"}}<td class="sym"><a href="https://www.tradingview.com/chart/?symbol={{.}}" target="_blank" rel="noopener noreferrer" title="Open {{.}} on TradingView">{{.}}</a></td>{{end}}
+
+{{/* Screening row only: same cell as symbolCell, plus a star when Claude has
+     assessed this session's news catalyst as positive (.PositiveNews). Kept
+     separate from symbolCell, which the Open/Closed position tables also use and
+     which has no such field to pass. */}}
+{{define "symbolCellStar"}}<td class="sym"><a href="https://www.tradingview.com/chart/?symbol={{.Symbol}}" target="_blank" rel="noopener noreferrer" title="Open {{.Symbol}} on TradingView">{{.Symbol}}</a>{{if .PositiveNews}} <span class="news-star" title="Claude assessed today's news catalyst as positive">&#9733;</span>{{end}}</td>{{end}}
 
 {{define "modalHead"}}
 <div class="mhead">
@@ -881,6 +921,17 @@ setInterval(claudeRefresh, 2000);
 </div>
 {{end}}
 
+{{define "tradeReviewModal"}}
+{{template "modalHead" .}}
+<div class="mbody">
+  {{if .Failed}}
+  <div class="alert">Claude could not review this trade: {{.Error}}</div>
+  {{else}}
+  <div class="review-report">{{.Report}}</div>
+  {{end}}
+</div>
+{{end}}
+
 {{define "screenModal"}}
 {{template "modalHead" .}}
 <div class="mbody">
@@ -951,6 +1002,9 @@ setInterval(claudeRefresh, 2000);
       <button class="act" type="button" data-claude="start">
         {{if .LoggedIn}}Log in again{{else}}Login to Claude{{end}}
       </button>
+      {{if .LoggedIn}}
+      <button class="act" type="button" data-claude="logout">Log out</button>
+      {{end}}
     {{end}}
   </div>
 </section>

@@ -137,6 +137,10 @@ Each row has a **▸ arrow** before the symbol. Clicking it folds out a line und
 
 It is visible from the moment something closes, not only after the bell. It used to be an "End of day" card hidden until the forced-exit mark, which was reasonable while a strategy rule was the only thing that could close a position; once the page can close one by hand, an operator who has just sold something cannot be made to wait four hours to see what it made. After the close it reads the same way the end-of-day summary did.
 
+### The Why? button
+
+A losing row — and only a losing row — gets one of two things in its last column: **analyzing…** while the trade review worker has not gotten to it yet, or a **Why?** button once it has. The button is read-only: it fetches whatever report `tradereview.Worker` already stored for that position and shows it in a popup, nothing more — it cannot trigger a review itself, and there is no path from this button to a Claude CLI call. A winning trade never gets either, because a review never runs for one in the first place (`internal/tradereview`). If the review failed (commonly: the CLI is not logged in — see the Claude card below), the popup shows why instead of a report.
+
 ### Stepping back through earlier days
 
 The list is headed by **‹ date ›** arrows, so the whole trade history is reachable from the page rather than only the current session. A few things about them:
@@ -181,6 +185,8 @@ A table of tickers currently being evaluated, with a per-criterion breakdown rat
 | e.g. `WXYZ` | ❌ 0 today | ✅ +11% | ✅ 5.3x | Fails (no news) |
 
 Each cell shows both the pass/fail and the underlying value, not just a checkmark, so the numbers are visible without cross-referencing anything else.
+
+A ticker whose news catalyst passed carries a ★ beside its symbol once Claude has assessed that news as positive (`claude.assess_news_sentiment`, on by default) — a cosmetic flag only, never a reason the row qualifies or gets bought. It appears some time after the row itself, since the sentiment worker runs on its own ticker (`claude.sentiment_interval`, default 5m), not inline with the scan; a row with a news catalyst and no star yet just means Claude hasn't assessed it this sweep, is still logged out, or read the headlines as negative or neutral. The assessment happens at most once per ticker per session, to keep Claude usage to one call per symbol regardless of how many sweeps pass.
 
 The Action column carries the setup's verdict too, which is usually why a qualifying
 candidate was not bought: "no setup: close 9.93 has not cleared the 10.02 pullback
@@ -279,3 +285,7 @@ Details that follow from that goal:
 ## Refresh behavior
 
 Settled — see "Visual design" above: lightweight JS polling every ~10–15s, patching the page in place.
+
+## Claude card
+
+Sits below the main content block as its own section, polled independently every 2s rather than on the page's main poll — the login flow it drives benefits from feeling responsive, and polling it costs nothing upstream (no broker or store call, just whatever `claudelogin.Session` already holds in memory). Shows one of: not installed, not logged in (a **Login to Claude** button), waiting on the human half of the OAuth flow (the CLI's own URL as a real link, plus a box to paste back whatever it shows), or logged in (**Log in again** and **Log out** buttons — logout needs no pty or follow-up input, it is a plain one-shot command), or a failed attempt with why. This is also what gives the trade review worker and the news-sentiment worker an authenticated CLI session to use — nothing about the login flow is specific to either. The news-sentiment worker treats a logged-out CLI differently from trade review, though: it skips its sweep entirely rather than recording a failure, so a ticker is never left starred or unstarred on a stale answer — it is simply assessed once someone does log in.

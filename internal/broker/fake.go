@@ -20,6 +20,7 @@ type Fake struct {
 	assets    []string
 	snaps     map[string]domain.Snapshot
 	news      map[string]int
+	headlines map[string][]string
 	avgVolume map[string]float64
 	day       CalendarDay
 	nextDay   CalendarDay
@@ -72,6 +73,7 @@ func NewFake(acct domain.Account) *Fake {
 		acct:      acct,
 		snaps:     map[string]domain.Snapshot{},
 		news:      map[string]int{},
+		headlines: map[string][]string{},
 		avgVolume: map[string]float64{},
 		positions: map[string]BrokerPosition{},
 		bars:      map[string][]domain.Bar{},
@@ -228,6 +230,13 @@ func (f *Fake) SetNews(symbol string, count int) {
 	f.news[symbol] = count
 }
 
+// SetHeadlines sets what NewsHeadlines returns for symbol.
+func (f *Fake) SetHeadlines(symbol string, headlines []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headlines[symbol] = headlines
+}
+
 // Placed returns every order submitted so far.
 func (f *Fake) Placed() []OrderRequest {
 	f.mu.Lock()
@@ -377,6 +386,15 @@ func (f *Fake) NewsCounts(_ context.Context, symbols []string, since time.Time) 
 		out[s] = f.news[s]
 	}
 	return out, nil
+}
+
+func (f *Fake) NewsHeadlines(_ context.Context, symbol string, _ time.Time) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.headlines[symbol], nil
 }
 
 func (f *Fake) Account(context.Context) (domain.Account, error) {

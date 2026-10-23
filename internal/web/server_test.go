@@ -268,6 +268,49 @@ func TestScreeningTableShowsPerCriterionValues(t *testing.T) {
 	}
 }
 
+func TestScreeningTableStarsASymbolWithPositiveNewsSentiment(t *testing.T) {
+	f := newFixture(t)
+	if err := f.store.SaveScreenSnapshot(f.date, f.now, []domain.Evaluation{
+		{
+			Symbol: "GOOD", Qualifies: true, VolumeMultiple: 6.1,
+			Criteria: []domain.Criterion{
+				{Name: "News catalyst", Pass: true, Display: "2 today"},
+				{Name: "Intraday move", Pass: true, Display: "+14.0%"},
+				{Name: "Rel. volume", Pass: true, Display: "6.1x"},
+			},
+		},
+		{
+			Symbol: "MEH", Qualifies: true, VolumeMultiple: 5.3,
+			Criteria: []domain.Criterion{
+				{Name: "News catalyst", Pass: true, Display: "1 today"},
+				{Name: "Intraday move", Pass: true, Display: "+11.0%"},
+				{Name: "Rel. volume", Pass: true, Display: "5.3x"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.SaveNewsSentiment(f.date, "GOOD", "POSITIVE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.SaveNewsSentiment(f.date, "MEH", "NEUTRAL"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := f.get(t, "/")
+	goodIdx := strings.Index(body, "GOOD")
+	mehIdx := strings.Index(body, "MEH")
+	if goodIdx < 0 || mehIdx < 0 {
+		t.Fatalf("expected both symbols in the page; body:\n%s", body)
+	}
+	if !strings.Contains(body[goodIdx:goodIdx+200], "news-star") {
+		t.Error("GOOD was assessed positive and should carry the star span near its symbol")
+	}
+	if strings.Contains(body[mehIdx:mehIdx+200], "news-star") {
+		t.Error("MEH was assessed neutral and should not be starred")
+	}
+}
+
 func TestOpenPositionsShowLivePnL(t *testing.T) {
 	f := newFixture(t)
 	id, err := f.store.InsertPosition(domain.Position{

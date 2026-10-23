@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -236,5 +237,48 @@ func (s *Session) Cancel() error {
 		return errors.New("no login is in progress")
 	}
 	s.cancel()
+	return nil
+}
+
+// logoutTimeout bounds the logout command. Generous, but not unbounded: verified
+// live it returns immediately either way, and an operator clicking the button is
+// waiting on it synchronously.
+const logoutTimeout = 30 * time.Second
+
+// Logout clears the CLI's own stored session. Unlike Start, this needs no pty and
+// no human exchange — verified live, `claude auth logout` is a plain one-shot
+// command that completes immediately and succeeds even when already logged out, so
+// a plain exec is enough. Refused while a login attempt is in progress, so it
+// cannot race Start's pty.
+func (s *Session) Logout() error {
+	s.mu.Lock()
+	if s.state == StateRunning {
+		s.mu.Unlock()
+		return errors.New("a login is in progress")
+	}
+	command := s.Command
+	if command == "" {
+		command = "claude"
+	}
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), logoutTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, "auth", "logout")
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(errOut.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("could not log out: %s", msg)
+	}
+
+	s.mu.Lock()
+	s.state = StateIdle
+	s.output.Reset()
+	s.errMsg = ""
+	s.mu.Unlock()
 	return nil
 }

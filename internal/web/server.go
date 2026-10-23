@@ -65,6 +65,7 @@ type ClaudeLogin interface {
 	Start() error
 	SendLine(text string) error
 	Cancel() error
+	Logout() error
 }
 
 type Server struct {
@@ -105,10 +106,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/actions/screen", s.handleScreenNow)
 	mux.HandleFunc("/actions/close", s.handleClosePosition)
 	mux.HandleFunc("/actions/open", s.handleOpenPosition)
+	mux.HandleFunc("/actions/trade-review", s.handleTradeReview)
 	mux.HandleFunc("/claude/status", s.handleClaudeStatus)
 	mux.HandleFunc("/claude/start", s.handleClaudeStart)
 	mux.HandleFunc("/claude/input", s.handleClaudeInput)
 	mux.HandleFunc("/claude/cancel", s.handleClaudeCancel)
+	mux.HandleFunc("/claude/logout", s.handleClaudeLogout)
 	return mux
 }
 
@@ -401,6 +404,56 @@ func (s *Server) handleOpenPosition(w http.ResponseWriter, r *http.Request) {
 	s.renderModal(w, "openModal", m)
 }
 
+// TradeReviewModal is what the "why did this lose" popup renders.
+type TradeReviewModal struct {
+	Title   string
+	TakenAt string
+	Symbol  string
+	// Report is Claude's own analysis, or empty when Failed is set.
+	Report string
+	Failed bool
+	Error  string
+}
+
+// handleTradeReview shows a previously completed trade review. It never runs one
+// itself — that is the background worker's job, on its own schedule — so a row
+// with no review yet (ReviewState != "ready" in the view) has no button to click
+// in the first place, and this is read-only by construction: nothing here can
+// trigger a review or make a CLI call.
+func (s *Server) handleTradeReview(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if err != nil {
+		s.renderActionError(w, "That position id is not valid.", http.StatusOK)
+		return
+	}
+
+	pos, err := s.store.PositionByID(id)
+	if err != nil {
+		s.renderActionError(w, "That position could not be found.", http.StatusOK)
+		return
+	}
+	review, found, err := s.store.TradeReviewFor(id)
+	if err != nil {
+		s.log.Error("load trade review", "position", id, "err", err)
+		s.renderActionError(w, "The review could not be read.", http.StatusOK)
+		return
+	}
+	if !found {
+		s.renderActionError(w, "Claude has not reviewed this trade yet.", http.StatusOK)
+		return
+	}
+
+	m := &TradeReviewModal{
+		Title:   pos.Symbol + " — why it lost",
+		TakenAt: review.CreatedAt.In(scheduler.ET).Format("15:04:05 MST"),
+		Symbol:  pos.Symbol,
+		Report:  review.Report,
+		Failed:  review.Status == "FAILED",
+		Error:   review.Error,
+	}
+	s.renderModal(w, "tradeReviewModal", m)
+}
+
 // claudeCardView is what the Claude card renders. It is built straight from
 // claudelogin.Status on every request rather than cached, so the card always
 // reflects whatever the Session actually holds — including, via LoggedIn,
@@ -530,6 +583,23 @@ func (s *Server) handleClaudeCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.claude != nil {
 		_ = s.claude.Cancel()
+	}
+	s.renderClaudeCard(w)
+}
+
+// handleClaudeLogout clears the CLI's own stored session. Unlike the login
+// flow, this needs no pty and no follow-up input — a plain command that either
+// succeeds or reports why, and the card's next render reflects it via LoggedIn.
+func (s *Server) handleClaudeLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.claude != nil {
+		if err := s.claude.Logout(); err != nil {
+			s.log.Warn("claude logout failed", "err", err)
+		}
 	}
 	s.renderClaudeCard(w)
 }

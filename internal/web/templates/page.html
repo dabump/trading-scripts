@@ -612,15 +612,21 @@ function unlockAudio() {
 
 function playFireAlert() {
   if (!soundEnabled || !audioCtx) return;
+  const duration = 2;
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   osc.frequency.value = 880;
-  gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-  gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.25);
+  const now = audioCtx.currentTime;
+  // Sustained at full volume for almost the whole duration, with only the
+  // last 150ms ramped down -- a decay spread across the whole duration would
+  // have made most of it inaudible well before the end.
+  gain.gain.setValueAtTime(0.5, now);
+  gain.gain.setValueAtTime(0.5, now + duration - 0.15);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
   osc.connect(gain);
   gain.connect(audioCtx.destination);
   osc.start();
-  osc.stop(audioCtx.currentTime + 0.25);
+  osc.stop(now + duration);
 }
 
 // Checked against every row in the fragment regardless of the active screen
@@ -655,7 +661,12 @@ document.addEventListener('change', (e) => {
   if (e.target.id !== 'enable-momentum-sound') return;
   soundEnabled = e.target.checked;
   try { localStorage.setItem('momentumSound', String(soundEnabled)); } catch (e) { /* ignored */ }
-  if (soundEnabled) unlockAudio();
+  if (soundEnabled) {
+    // Played immediately, not on the next fire, so checking the box doubles
+    // as a "does this work, and what does it sound like" test.
+    unlockAudio();
+    playFireAlert();
+  }
 });
 document.addEventListener('click', unlockAudio, { once: true });
 document.addEventListener('keydown', unlockAudio, { once: true });

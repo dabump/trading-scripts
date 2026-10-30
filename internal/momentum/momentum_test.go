@@ -20,6 +20,61 @@ func lastBarNow(bars []domain.Bar) time.Time {
 	return bars[len(bars)-1].Time.Add(time.Minute)
 }
 
+func TestFillGapsSynthesizesFlatCandles(t *testing.T) {
+	base := time.Date(2026, 10, 30, 18, 0, 0, 0, time.UTC)
+	bars := []domain.Bar{
+		{Time: base, Open: 4, High: 6, Low: 3, Close: 5, Volume: 100},
+		{Time: base.Add(3 * time.Minute), Open: 7, High: 9, Low: 6, Close: 8, Volume: 50},
+	}
+	got := fillGaps(bars, time.Minute)
+	if len(got) != 4 {
+		t.Fatalf("got %d bars, want 4 (two real plus two synthesized)", len(got))
+	}
+	for i, want := range []struct {
+		offset time.Duration
+		close  float64
+		volume float64
+	}{
+		{0, 5, 100},
+		{time.Minute, 5, 0},
+		{2 * time.Minute, 5, 0},
+		{3 * time.Minute, 8, 50},
+	} {
+		if !got[i].Time.Equal(base.Add(want.offset)) {
+			t.Fatalf("bar %d: got time %s, want %s", i, got[i].Time, base.Add(want.offset))
+		}
+		if got[i].Close != want.close {
+			t.Fatalf("bar %d: got close %v, want %v", i, got[i].Close, want.close)
+		}
+		if got[i].Volume != want.volume {
+			t.Fatalf("bar %d: got volume %v, want %v", i, got[i].Volume, want.volume)
+		}
+	}
+	// A synthesized candle is flat at the prior close, not a copy of the next
+	// real bar's OHLC.
+	if got[1].Open != 5 || got[1].High != 5 || got[1].Low != 5 {
+		t.Fatalf("synthesized bar should be flat at the prior close, got %+v", got[1])
+	}
+}
+
+func TestFillGapsLeavesContiguousBarsUnchanged(t *testing.T) {
+	bars := barsFromCloses([]float64{1, 2, 3, 4})
+	got := fillGaps(bars, time.Minute)
+	if len(got) != len(bars) {
+		t.Fatalf("got %d bars, want %d (no gaps to fill)", len(got), len(bars))
+	}
+}
+
+func TestFillGapsLeavesTooFewBarsAlone(t *testing.T) {
+	if got := fillGaps(nil, time.Minute); len(got) != 0 {
+		t.Fatalf("got %d bars from nil input, want 0", len(got))
+	}
+	one := barsFromCloses([]float64{1})
+	if got := fillGaps(one, time.Minute); len(got) != 1 {
+		t.Fatalf("got %d bars from a single bar, want 1", len(got))
+	}
+}
+
 func TestClassifyPendingOnTooFewBars(t *testing.T) {
 	closes := make([]float64, 10)
 	for i := range closes {

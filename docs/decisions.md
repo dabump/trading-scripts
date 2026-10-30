@@ -1675,6 +1675,17 @@ Requested directly: scan every minute MACD (9 fast, 20 slow) and StochRSI (K 3, 
 | MACD(9,20,9): "anticipating" requires the signal-minus-MACD gap to narrow monotonically over the last 3 completed bars while still positive (no cross yet); StochRSI only gates the anticipating state, never the plain bullish/bearish read | The user's own refinement after the second interview. A perfectly linear price ramp produces an exactly flat MACD line and signal (verified while writing `internal/momentum`'s tests) — real moves have to accelerate to separate the two lines at all, which is why "anticipating" needs a multi-bar narrowing trend rather than a single-bar snapshot. |
 | Icons are monochrome Unicode glyphs (▲ ▼ ?) coloured via the existing `--good`/`--bad`/`--accent` CSS variables, except the fire emoji, which is left at its native colour | A colour-emoji glyph (❓, a coloured arrow emoji) ignores the CSS `color` property in every mainstream renderer, which is also why the news star uses the monochrome ★ rather than a star emoji. Fire's native orange/red rendering already matches the intended urgency, so no override is needed there. |
 
+## 2026-10-31 — Fixed: the fire icon could light while the real StochRSI was nowhere near the 20-80 band
+
+Reported directly: a fire notification showed MACD correctly anticipating a cross, but StochRSI was not between 20% and 80%.
+
+Verified live against NVA during post-market on 2026-10-30 (`momentum_signal` recorded `anticipating` at 22:30:03Z): `IntradayBars` only returns a bar for a minute that actually traded, and 73 of this symbol's 374 bars since the pre-market open had a gap above one minute, one gap over an hour. `internal/momentum` was feeding those sparse, irregularly-spaced closes into MACD's EMAs and StochRSI's RSI smoothing as if they were consecutive one-minute samples — both assume evenly spaced input. Replayed through the unmodified code, StochRSI read %K=33 (inside the 20-80 band, matching the false "anticipating" read); gap-filled with a flat, no-volume candle for every silent minute, the same window reads %K=0 — nowhere near it, and what a real evenly-sampled chart (e.g. the TradingView link on the page) would show.
+
+| Decision | Rationale |
+|---|---|
+| `Classify` now runs `fillGaps` first, synthesizing a flat candle (open=high=low=close=prior close, zero volume) for every missing one-minute interval between two real bars, before any indicator math | The direct fix: makes the series genuinely one bar per minute, which is what MACD's EMAs and RSI's gain/loss smoothing both assume. Only fills *between* real bars — a gap before the first or after the last is left alone, since there is no known price to fill it with. |
+| Scoped to `internal/momentum` only, not `internal/strategy`'s setup detector or `internal/engine`'s entry path, both of which also call `IntradayBars` and could carry the same assumption | This worker is purely cosmetic and was already exempt from the project's "measure in `cmd/backtest` before changing" rule; the entry/exit path is not, and changing how it reads bars is a real strategy change that needs its own measurement, not a side effect of a display bug fix. Worth a dedicated look, flagged here rather than fixed silently. |
+
 ## 2026-10-31 — An audible alert when a symbol turns to the fire icon
 
 Requested directly, as a follow-up to the momentum icon above: play a sound when a symbol changes to the fire icon, to draw attention to it.

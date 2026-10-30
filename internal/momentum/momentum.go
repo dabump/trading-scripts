@@ -65,6 +65,7 @@ const (
 // returns which of the four states the latest completed candle is in. now and
 // interval let it drop the candle still forming, which the feed includes.
 func Classify(bars []domain.Bar, now time.Time, interval time.Duration) State {
+	bars = fillGaps(bars, interval)
 	bars = completedBars(bars, now, interval)
 	closes := closesOf(bars)
 
@@ -82,6 +83,32 @@ func Classify(bars []domain.Bar, now time.Time, interval time.Duration) State {
 		return StateAnticipating
 	}
 	return StateBearish
+}
+
+// fillGaps synthesizes a flat, no-volume candle for every missing interval
+// between two real bars. Alpaca only returns a bar for a minute that actually
+// traded -- verified live on NVA during post-market, 73 of 374 bars had a gap
+// above the interval, one over an hour -- so a thinly traded symbol's "closes"
+// are not evenly spaced the way MACD's EMAs and RSI's smoothing both assume.
+// Left unfilled, a 14-minute silent gap is treated identically to a single
+// quiet minute, which is what let a fire light while the real, evenly-sampled
+// StochRSI (the number a chart would show) was nowhere near the 20-80 band.
+// Gaps before the first bar or after the last are left alone: there is no
+// known price to fill them with.
+func fillGaps(bars []domain.Bar, interval time.Duration) []domain.Bar {
+	if len(bars) < 2 {
+		return bars
+	}
+	out := make([]domain.Bar, 0, len(bars))
+	out = append(out, bars[0])
+	for i := 1; i < len(bars); i++ {
+		prev := out[len(out)-1]
+		for t := prev.Time.Add(interval); t.Before(bars[i].Time); t = t.Add(interval) {
+			out = append(out, domain.Bar{Time: t, Open: prev.Close, High: prev.Close, Low: prev.Close, Close: prev.Close})
+		}
+		out = append(out, bars[i])
+	}
+	return out
 }
 
 func completedBars(bars []domain.Bar, now time.Time, interval time.Duration) []domain.Bar {

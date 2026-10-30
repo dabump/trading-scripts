@@ -189,11 +189,19 @@ button.fold {
 button.fold:hover { color: var(--text); }
 button.fold[aria-expanded="true"] { transform: rotate(90deg); color: var(--text); }
 
-/* The Active strategy card's own fold button sits in the card's h2, not a table
-   cell, so it needs the same affordance at a size that fits an uppercase 13px
-   header instead of a 14px row. */
-.fold-head { display: inline-flex; align-items: center; }
-.card > h2 .fold-head button.fold { font-size: 18px; margin-right: 8px; vertical-align: -3px; }
+/* The Active strategy card's own fold control is the whole header bar, not just
+   the arrow, so clicking the title toggles it too — unlike a table row's fold
+   button, which sits beside text that does something else (a TradingView link). */
+button.fold-bar {
+  all: unset; display: inline-flex; align-items: center; gap: 10px;
+  cursor: pointer; color: inherit; font: inherit;
+}
+button.fold-bar .arrow {
+  display: inline-block; font-size: 27px; line-height: .5; color: var(--muted);
+  transition: transform .12s ease;
+}
+button.fold-bar:hover .arrow { color: var(--text); }
+button.fold-bar[aria-expanded="true"] .arrow { transform: rotate(90deg); color: var(--text); }
 tr.foldout td { background: var(--panel-2); padding: 8px 12px 10px 48px; font-size: 13px;
   font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 tr.foldout td > span { margin-right: 28px; white-space: nowrap; }
@@ -903,8 +911,9 @@ setInterval(claudeRefresh, 2000);
 
 
 <section class="card" style="margin-top:16px">
-  <h2><span class="fold-head"><button type="button" class="fold" data-fold="strategy" aria-expanded="false"
-          aria-controls="fold-strategy" title="Show strategy configuration">&#9656;</button>Active strategy</span>
+  <h2><button type="button" class="fold-bar" data-fold="strategy" aria-expanded="false"
+          aria-controls="fold-strategy" title="Show or hide the strategy configuration">
+        <span class="arrow">&#9656;</span>Active strategy</button>
     <span class="meta">as configured — restart to apply changes</span></h2>
   <div class="strategy" id="fold-strategy" hidden>
     {{range .Strategy}}

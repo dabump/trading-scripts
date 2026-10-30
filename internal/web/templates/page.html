@@ -262,6 +262,10 @@ dialog.modal .close:hover { color: var(--text); }
 .kv { color: var(--muted); font-size: 12px; margin: 0; }
 
 .strategy { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0; }
+/* An author rule setting `display` always beats the UA stylesheet's
+   `[hidden] { display: none }`, at equal specificity — so without this,
+   toggling the `hidden` attribute on this element would do nothing. */
+.strategy[hidden] { display: none; }
 @media (max-width: 860px) { .strategy { grid-template-columns: 1fr; } }
 .strategy .sect { padding: 16px 18px; border-top: 1px solid var(--line); }
 .strategy .sect:nth-child(odd) { border-right: 1px solid var(--line); }

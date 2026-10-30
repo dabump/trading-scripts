@@ -146,6 +146,18 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
 
 .news-star { color: var(--warn); font-size: 12px; cursor: default; }
 
+.screen-filters { display: flex; gap: 16px; padding: 10px 18px; border-bottom: 1px solid var(--line); }
+.screen-filters label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+.screen-filters label:hover { color: var(--text); }
+.screen-filters input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+.screen-filters .news-star { cursor: pointer; }
+
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
+th.sortable .arrow { display: inline-block; width: 9px; opacity: .55; }
+th.sort-asc .arrow::after { content: "▲"; opacity: 1; }
+th.sort-desc .arrow::after { content: "▼"; opacity: 1; }
+
 .tabs { display: inline-flex; gap: 4px; margin-left: 12px; vertical-align: middle; }
 .tab {
   font: inherit; font-size: 12px; cursor: pointer; padding: 4px 10px; border-radius: 6px;
@@ -485,6 +497,75 @@ function applyScrolls() {
   });
 }
 
+// Screening table filters and column sort. Both live out here with the tab and
+// fold state for the same reason: the fragment poll replaces the whole table with
+// a freshly rendered, unfiltered, unsorted one every cycle, so the choice has to
+// survive outside it and be re-applied after each swap. Sorting is done against
+// the already-rendered cell text rather than a server value, because the display
+// string ("+14.0%", "6.1x", "unknown") is the only copy of the number the client
+// has, and parsing it client-side avoids a second code path computing the same
+// figure. Deliberately not persisted across reloads, like closedDay.
+let screenFilters = { positiveNews: false, qualifies: false };
+let screenSort = { col: null, dir: 1 };
+
+function parseScreenCell(text) {
+  const m = text.match(/-?\d+(\.\d+)?/);
+  return m ? parseFloat(m[0]) : -Infinity;
+}
+
+function applyScreenTable() {
+  const table = document.getElementById('screen-table');
+  if (!table) return;
+
+  const headerRow = table.tHead.rows[0];
+  let sortIdx = -1;
+  Array.from(headerRow.cells).forEach((th, i) => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.sort && th.dataset.sort === screenSort.col) {
+      sortIdx = i;
+      th.classList.add(screenSort.dir === 1 ? 'sort-asc' : 'sort-desc');
+    }
+  });
+
+  const body = table.tBodies[0];
+  const rows = Array.from(body.rows);
+  if (sortIdx >= 0) {
+    rows.sort((a, b) =>
+      (parseScreenCell(a.cells[sortIdx].textContent) -
+       parseScreenCell(b.cells[sortIdx].textContent)) * screenSort.dir);
+    rows.forEach(r => body.appendChild(r));
+  }
+
+  rows.forEach(row => {
+    const show = (!screenFilters.positiveNews || row.dataset.positiveNews === 'true') &&
+                 (!screenFilters.qualifies || row.dataset.qualifies === 'true');
+    row.hidden = !show;
+  });
+
+  const pn = document.getElementById('filter-positive-news');
+  const q = document.getElementById('filter-qualifies');
+  if (pn) pn.checked = screenFilters.positiveNews;
+  if (q) q.checked = screenFilters.qualifies;
+}
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'filter-positive-news') {
+    screenFilters.positiveNews = e.target.checked;
+    applyScreenTable();
+  } else if (e.target.id === 'filter-qualifies') {
+    screenFilters.qualifies = e.target.checked;
+    applyScreenTable();
+  }
+});
+document.addEventListener('click', (e) => {
+  const th = e.target.closest('th[data-sort]');
+  if (!th) return;
+  const col = th.dataset.sort;
+  screenSort.dir = (screenSort.col === col) ? screenSort.dir * -1 : 1;
+  screenSort.col = col;
+  applyScreenTable();
+});
+applyScreenTable();
+
 // Re-fetches the rendered fragment and swaps it in, so the markup is produced in
 // exactly one place (the Go template) rather than duplicated in JS.
 const POLL_MS = {{.PollSeconds}} * 1000;
@@ -499,6 +580,7 @@ async function refresh() {
     applyTab();
     applyFolds();
     applyScrolls();
+    applyScreenTable();
   } catch (e) { /* a transient failure just leaves the last good render up */ }
 }
 setInterval(refresh, POLL_MS);
@@ -773,13 +855,17 @@ setInterval(claudeRefresh, 2000);
     <span class="meta">{{if .ScreenTakenAt}}last pass {{.ScreenTakenAt}} ET{{end}}</span>
   </h2>
   {{if .ScreenRows}}
-  <table>
+  <div class="screen-filters">
+    <label><input type="checkbox" id="filter-positive-news"> Positive news catalyst <span class="news-star">&#9733;</span></label>
+    <label><input type="checkbox" id="filter-qualifies"> Qualifies</label>
+  </div>
+  <table id="screen-table">
     <thead>
-      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num">{{.}}</th>{{end}}<th>Verdict</th><th>Action</th><th></th></tr>
+      <tr><th>Symbol</th>{{range .ScreenColumns}}<th class="num{{if or (eq . "Intraday move") (eq . "Rel. volume")}} sortable{{end}}"{{if eq . "Intraday move"}} data-sort="move"{{else if eq . "Rel. volume"}} data-sort="vol"{{end}}>{{.}}{{if or (eq . "Intraday move") (eq . "Rel. volume")}} <span class="arrow"></span>{{end}}</th>{{end}}<th>Verdict</th><th>Action</th><th></th></tr>
     </thead>
     <tbody>
       {{range .ScreenRows}}
-      <tr>
+      <tr data-qualifies="{{.Qualifies}}" data-positive-news="{{.PositiveNews}}">
         {{template "symbolCellStar" .}}
         {{range .Cells}}
         <td class="num">

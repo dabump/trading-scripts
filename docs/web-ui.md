@@ -188,6 +188,8 @@ Each cell shows both the pass/fail and the underlying value, not just a checkmar
 
 A ticker whose news catalyst passed carries a ★ beside its symbol once Claude has assessed that news as positive (`claude.assess_news_sentiment`, on by default) — a cosmetic flag only, never a reason the row qualifies or gets bought. It appears some time after the row itself, since the sentiment worker runs on its own ticker (`claude.sentiment_interval`, default 5m), not inline with the scan; a row with a news catalyst and no star yet just means Claude hasn't assessed it this sweep, is still logged out, or read the headlines as negative or neutral. The assessment happens at most once per ticker per session, to keep Claude usage to one call per symbol regardless of how many sweeps pass.
 
+Two checkboxes above the table — **Positive news catalyst ★** and **Qualifies** — narrow it to rows carrying the star or rows that passed all three criteria, respectively; both can be on at once. The **Intraday move** and **Rel. volume** headers sort the table ascending/descending on click. All of this is client-side only, against what the row already shows — no new server call, no change to which candidates get bought — and is re-applied after every fragment poll, the same way the positions tab and fold-out rows survive it, since the poll replaces the whole table with a freshly rendered, unfiltered, unsorted one. Neither choice is remembered across a reload.
+
 The Action column carries the setup's verdict too, which is usually why a qualifying
 candidate was not bought: "no setup: close 9.93 has not cleared the 10.02 pullback
 high" is the common case, and seeing it is what distinguishes a quiet screen from a

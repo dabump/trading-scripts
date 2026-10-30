@@ -106,6 +106,11 @@ type ScreenRow struct {
 	// has actually run — see internal/newssentiment — rather than defaulting to
 	// anything about the news itself.
 	PositiveNews bool
+	// MomentumIcon is one of momentum.StatePending/StateBullish/
+	// StateAnticipating/StateBearish (as a string, so view.go has no dependency
+	// on the momentum package), or empty before the momentum worker has read
+	// this symbol at all this session.
+	MomentumIcon string
 }
 
 type PositionRow struct {
@@ -491,6 +496,10 @@ func BuildView(
 	if err != nil {
 		return nil, err
 	}
+	momentumStates, err := st.MomentumStates(date)
+	if err != nil {
+		return nil, err
+	}
 	for i, e := range evals {
 		if i == 0 {
 			for _, c := range e.Criteria {
@@ -508,6 +517,7 @@ func BuildView(
 		}
 		row.CanOpen = !held[e.Symbol]
 		row.PositiveNews = positiveNews[e.Symbol]
+		row.MomentumIcon = momentumStates[e.Symbol]
 		row.Outcome = e.Outcome
 		row.OutcomeTone = "idle"
 		if strings.HasPrefix(e.Outcome, "bought") {

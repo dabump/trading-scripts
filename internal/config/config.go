@@ -27,6 +27,7 @@ type Config struct {
 	Storage    Storage    `yaml:"storage"`
 	Audit      Audit      `yaml:"audit"`
 	Claude     Claude     `yaml:"claude"`
+	Momentum   Momentum   `yaml:"momentum"`
 }
 
 // MarketData selects which Alpaca data feed to use.
@@ -433,6 +434,17 @@ type Claude struct {
 	SentimentTimeout time.Duration `yaml:"sentiment_timeout"`
 }
 
+// Momentum configures the watchlist's MACD(9,20,9)/StochRSI(14,14,3,3) arrow
+// and fire icon — purely a display annotation, never fed back into screening
+// or entry. See internal/momentum.
+type Momentum struct {
+	// Enabled turns the worker on. Off by default for the same reason the other
+	// background workers default off: it is a switch, not an assumption.
+	Enabled bool `yaml:"enabled"`
+	// Interval is how often every watchlist symbol's chart is re-read.
+	Interval time.Duration `yaml:"interval"`
+}
+
 // Secrets are the credentials loaded from the environment, never from YAML.
 type Secrets struct {
 	APIKey    string
@@ -709,6 +721,10 @@ func (c *Config) Validate() error {
 		if c.Claude.SentimentTimeout <= 0 {
 			add("claude.sentiment_timeout must be > 0")
 		}
+	}
+
+	if c.Momentum.Enabled && c.Momentum.Interval <= 0 {
+		add("momentum.interval must be > 0")
 	}
 
 	return errors.Join(errs...)

@@ -281,3 +281,11 @@ claude:
   sentiment_interval: 5m
   sentiment_batch_size: 5
   sentiment_timeout: 5m
+
+# Reads MACD(9,20,9) and StochRSI(14,14,3,3) off every watchlist symbol's
+# one-minute chart, purely to show an arrow or fire icon beside the symbol — a
+# display annotation only, never fed back into screening or entry. See
+# internal/momentum and decisions.md 2026-10-31.
+momentum:
+  enabled: true
+  interval: 1m

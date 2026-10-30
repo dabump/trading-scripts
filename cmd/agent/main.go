@@ -24,6 +24,7 @@ import (
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/engine"
+	"github.com/martincoetzee/trading-agent/internal/momentum"
 	"github.com/martincoetzee/trading-agent/internal/newssentiment"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
 	"github.com/martincoetzee/trading-agent/internal/store"
@@ -254,6 +255,22 @@ func run() error {
 		}
 	}
 
+	// Its own component for the same reasons the sentiment worker is: a bar
+	// fetch per watchlist symbol is not time-critical, and the icon it produces
+	// is purely cosmetic (internal/momentum), so it must not be able to affect
+	// trading even if a fetch is slow or fails.
+	var momentumWorker *momentum.Worker
+	if cfg.Momentum.Enabled {
+		momentumWorker = &momentum.Worker{
+			Store:    st,
+			Bars:     data,
+			Calendar: trading,
+			Cfg:      cfg,
+			Interval: cfg.Momentum.Interval,
+			Log:      logger,
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -264,6 +281,9 @@ func run() error {
 	if sentimentWorker != nil {
 		components++
 	}
+	if momentumWorker != nil {
+		components++
+	}
 	errs := make(chan error, components)
 	go func() { errs <- srv.Serve(ctx) }()
 	go func() { errs <- eng.Run(ctx) }()
@@ -272,6 +292,9 @@ func run() error {
 	}
 	if sentimentWorker != nil {
 		go func() { errs <- sentimentWorker.Run(ctx) }()
+	}
+	if momentumWorker != nil {
+		go func() { errs <- momentumWorker.Run(ctx) }()
 	}
 
 	logger.Info("agent started", "paper", paper, "offline", *offline,

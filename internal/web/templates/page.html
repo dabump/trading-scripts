@@ -146,6 +146,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
 
 .news-star { color: var(--warn); font-size: 12px; cursor: default; }
 
+.momentum-icon { font-size: 12px; cursor: default; }
+.momentum-icon.bullish { color: var(--good); }
+.momentum-icon.bearish { color: var(--bad); }
+.momentum-icon.pending { color: var(--accent); font-weight: 700; }
+
 .screen-filters { display: flex; gap: 16px; padding: 10px 18px; border-bottom: 1px solid var(--line); }
 .screen-filters label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
 .screen-filters label:hover { color: var(--text); }
@@ -584,6 +589,78 @@ document.addEventListener('click', (e) => {
 });
 applyScreenTable();
 
+// Audible alert when a symbol turns to the fire icon (anticipating a bullish
+// MACD cross) -- see web-ui.md and decisions.md 2026-10-31. Browsers block
+// audio until a user gesture unlocks it, so this stays off until the checkbox
+// is explicitly checked; that click is the gesture. Remembered per browser via
+// localStorage, same pattern as positionsTab, so it is not re-enabled every
+// reload -- though a fresh page load still needs one more interaction
+// somewhere on the page before the browser actually lets audio play, which is
+// why the unlock also runs on the very first click or keydown anywhere.
+let soundEnabled = false;
+try { soundEnabled = localStorage.getItem('momentumSound') === 'true'; } catch (e) { /* private window */ }
+let audioCtx = null;
+let momentumIconBySymbol = {};
+
+function unlockAudio() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) audioCtx = new Ctx();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playFireAlert() {
+  if (!soundEnabled || !audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.frequency.value = 880;
+  gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.25);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.25);
+}
+
+// Checked against every row in the fragment regardless of the active screen
+// filter -- a filtered-out row catching fire is exactly the case this exists
+// to catch. Exactly one alert per poll cycle no matter how many symbols
+// turned. A symbol never seen before in this browser (a brand-new row, or the
+// very first poll after enabling sound) counts as turning too, on request.
+function applyMomentumSound() {
+  // The checkbox lives inside #content, which refresh() replaces wholesale
+  // every poll, so its checked state has to be restored here each time, the
+  // same reason applyScreenTable() restores the filter checkboxes.
+  const toggle = document.getElementById('enable-momentum-sound');
+  if (toggle) toggle.checked = soundEnabled;
+
+  const table = document.getElementById('screen-table');
+  if (!table) return;
+  let fired = false;
+  Array.from(table.tBodies[0].rows).forEach(row => {
+    const symbol = row.dataset.symbol;
+    const icon = row.dataset.momentum;
+    if (!symbol) return;
+    if (icon === 'anticipating' && momentumIconBySymbol[symbol] !== 'anticipating') {
+      fired = true;
+    }
+    momentumIconBySymbol[symbol] = icon;
+  });
+  if (fired) playFireAlert();
+}
+
+if (soundEnabled) unlockAudio();
+document.addEventListener('change', (e) => {
+  if (e.target.id !== 'enable-momentum-sound') return;
+  soundEnabled = e.target.checked;
+  try { localStorage.setItem('momentumSound', String(soundEnabled)); } catch (e) { /* ignored */ }
+  if (soundEnabled) unlockAudio();
+});
+document.addEventListener('click', unlockAudio, { once: true });
+document.addEventListener('keydown', unlockAudio, { once: true });
+applyMomentumSound();
+
 // Re-fetches the rendered fragment and swaps it in, so the markup is produced in
 // exactly one place (the Go template) rather than duplicated in JS.
 const POLL_MS = {{.PollSeconds}} * 1000;
@@ -599,6 +676,7 @@ async function refresh() {
     applyFolds();
     applyScrolls();
     applyScreenTable();
+    applyMomentumSound();
   } catch (e) { /* a transient failure just leaves the last good render up */ }
 }
 setInterval(refresh, POLL_MS);
@@ -876,6 +954,7 @@ setInterval(claudeRefresh, 2000);
   <div class="screen-filters">
     <label><input type="checkbox" id="filter-positive-news"> Positive news catalyst <span class="news-star">&#9733;</span></label>
     <label><input type="checkbox" id="filter-qualifies"> Qualifies</label>
+    <label><input type="checkbox" id="enable-momentum-sound"> Sound on <span class="momentum-icon anticipating">&#128293;</span></label>
   </div>
   <table id="screen-table">
     <thead>
@@ -883,7 +962,7 @@ setInterval(claudeRefresh, 2000);
     </thead>
     <tbody>
       {{range .ScreenRows}}
-      <tr data-qualifies="{{.Qualifies}}" data-positive-news="{{.PositiveNews}}">
+      <tr data-qualifies="{{.Qualifies}}" data-positive-news="{{.PositiveNews}}" data-symbol="{{.Symbol}}" data-momentum="{{.MomentumIcon}}">
         {{template "symbolCellStar" .}}
         {{range .Cells}}
         <td class="num">
@@ -938,7 +1017,7 @@ setInterval(claudeRefresh, 2000);
      assessed this session's news catalyst as positive (.PositiveNews). Kept
      separate from symbolCell, which the Open/Closed position tables also use and
      which has no such field to pass. */}}
-{{define "symbolCellStar"}}<td class="sym"><a href="https://www.tradingview.com/chart/?symbol={{.Symbol}}" target="_blank" rel="noopener noreferrer" title="Open {{.Symbol}} on TradingView">{{.Symbol}}</a>{{if .PositiveNews}} <span class="news-star" title="Claude assessed today's news catalyst as positive">&#9733;</span>{{end}}</td>{{end}}
+{{define "symbolCellStar"}}<td class="sym"><a href="https://www.tradingview.com/chart/?symbol={{.Symbol}}" target="_blank" rel="noopener noreferrer" title="Open {{.Symbol}} on TradingView">{{.Symbol}}</a>{{if .PositiveNews}} <span class="news-star" title="Claude assessed today's news catalyst as positive">&#9733;</span>{{end}}{{if eq .MomentumIcon "bullish"}} <span class="momentum-icon bullish" title="MACD(9,20) line is above its signal line">&#9650;</span>{{else if eq .MomentumIcon "anticipating"}} <span class="momentum-icon anticipating" title="MACD(9,20) is narrowing toward a bullish crossover and StochRSI(14,14,3,3) agrees">&#128293;</span>{{else if eq .MomentumIcon "bearish"}} <span class="momentum-icon bearish" title="MACD(9,20) line is below its signal line">&#9660;</span>{{else if eq .MomentumIcon "pending"}} <span class="momentum-icon pending" title="Not enough one-minute bars yet to compute MACD(9,20)/StochRSI(14,14,3,3)">?</span>{{end}}</td>{{end}}
 
 {{define "modalHead"}}
 <div class="mhead">

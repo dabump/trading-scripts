@@ -94,6 +94,8 @@ Tunable strategy parameters live here, not hardcoded — distinct from secrets, 
 | `claude.sentiment_interval` | 5m | How often the worker looks at the latest screening pass for symbols not yet assessed today |
 | `claude.sentiment_batch_size` | 5 | How many symbols one sweep assesses before waiting for the next interval |
 | `claude.sentiment_timeout` | 5m | Bounds one Claude CLI call |
+| `momentum.enabled` | `true` | Turns on the momentum worker — reads MACD(9,20,9) and StochRSI(14,14,3,3) off every watchlist symbol's one-minute chart and shows an arrow or fire icon beside the symbol, purely cosmetic, never fed back into screening or entry |
+| `momentum.interval` | 1m | How often every watchlist symbol's chart is re-read; validated > 0 when enabled |
 
 Invalid configurations are rejected at startup rather than mid-session: unknown
 keys, a non-negative bearish threshold, a non-positive screening floor, a chart stop

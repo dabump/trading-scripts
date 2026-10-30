@@ -188,6 +188,19 @@ Each cell shows both the pass/fail and the underlying value, not just a checkmar
 
 A ticker whose news catalyst passed carries a ★ beside its symbol once Claude has assessed that news as positive (`claude.assess_news_sentiment`, on by default) — a cosmetic flag only, never a reason the row qualifies or gets bought. It appears some time after the row itself, since the sentiment worker runs on its own ticker (`claude.sentiment_interval`, default 5m), not inline with the scan; a row with a news catalyst and no star yet just means Claude hasn't assessed it this sweep, is still logged out, or read the headlines as negative or neutral. The assessment happens at most once per ticker per session, to keep Claude usage to one call per symbol regardless of how many sweeps pass.
 
+Every row also carries one of four momentum icons beside the symbol, read off MACD(9,20,9) and StochRSI(14,14,3,3) on the symbol's one-minute chart (`momentum.enabled`, on by default; `internal/momentum`) — another cosmetic flag, never a reason the row qualifies, gets bought, or sold:
+
+| Icon | Meaning |
+|---|---|
+| ▲ (green) | The MACD line is above its signal line |
+| 🔥 | The MACD line is still below its signal line, but the gap has narrowed for three straight one-minute bars, and StochRSI agrees (%K is in the 20–80 band, above %D, and rising) — a golden cross not yet reached but closing in on one |
+| ▼ (red) | Below the signal line, with no cross anticipated — the default bearish read |
+| ? (blue) | Not enough one-minute bars yet to compute either indicator |
+
+The icon is a direct read of where MACD sits right now, recomputed every `momentum.interval` (default 1m), not a one-time event: a position stays ▲ for as long as the line stays above the signal, and flips straight to ▼ the moment it crosses back, with no separate state tracked in between. The underlying one-minute chart is anchored to the start of the trading day (pre-market open when extended hours are on, otherwise the regular open) and does not reset at the pre-market/regular/post-market boundary the way the setup detector's chart does, so the read is continuous across all three screening windows.
+
+A **Sound on 🔥** checkbox beside the filters plays a short beep the moment any row turns to the fire icon — checked against every row regardless of the active filters, once per poll cycle no matter how many symbols turn at once. It is off by default (browsers block audio until a click unlocks it, and that click is the gesture that does so) and remembered per browser, the same way the positions tab is. A brand-new row, or the very first poll after switching it on, that is already on fire counts as turning too, so enabling it while several names are already anticipating a cross beeps immediately. The sound itself is a synthesized tone generated in the browser — no audio file ships with the daemon.
+
 Two checkboxes above the table — **Positive news catalyst ★** and **Qualifies** — narrow it to rows carrying the star or rows that passed all three criteria, respectively; both can be on at once. The **Intraday move** and **Rel. volume** headers sort the table ascending/descending on click. All of this is client-side only, against what the row already shows — no new server call, no change to which candidates get bought — and is re-applied after every fragment poll, the same way the positions tab and fold-out rows survive it, since the poll replaces the whole table with a freshly rendered, unfiltered, unsorted one. Neither choice is remembered across a reload.
 
 The Action column carries the setup's verdict too, which is usually why a qualifying

@@ -303,10 +303,10 @@ func TestScreeningTableStarsASymbolWithPositiveNewsSentiment(t *testing.T) {
 	if goodIdx < 0 || mehIdx < 0 {
 		t.Fatalf("expected both symbols in the page; body:\n%s", body)
 	}
-	if !strings.Contains(body[goodIdx:goodIdx+200], "news-star") {
+	if !strings.Contains(body[goodIdx:goodIdx+300], "news-star") {
 		t.Error("GOOD was assessed positive and should carry the star span near its symbol")
 	}
-	if strings.Contains(body[mehIdx:mehIdx+200], "news-star") {
+	if strings.Contains(body[mehIdx:mehIdx+300], "news-star") {
 		t.Error("MEH was assessed neutral and should not be starred")
 	}
 }

@@ -774,3 +774,38 @@ func (s *Store) PositiveNewsSentiment(date string) (map[string]bool, error) {
 	}
 	return out, rows.Err()
 }
+
+// SaveMomentumState upserts one symbol's latest MACD/StochRSI read for date — see
+// internal/momentum. Unlike SaveNewsSentiment this overwrites on every call: the
+// reading is recomputed every pass, not spent once per session.
+func (s *Store) SaveMomentumState(date, symbol, state string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO momentum_signal (session_date, symbol, state, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(session_date, symbol) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
+		date, symbol, state, nowUTC())
+	if err != nil {
+		return fmt.Errorf("save momentum state: %w", err)
+	}
+	return nil
+}
+
+// MomentumStates returns every symbol's latest momentum read for date, for the
+// watchlist's arrow/fire icon.
+func (s *Store) MomentumStates(date string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT symbol, state FROM momentum_signal WHERE session_date = ?`, date)
+	if err != nil {
+		return nil, fmt.Errorf("query momentum states: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var sym, state string
+		if err := rows.Scan(&sym, &state); err != nil {
+			return nil, err
+		}
+		out[sym] = state
+	}
+	return out, rows.Err()
+}

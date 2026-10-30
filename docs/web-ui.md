@@ -259,6 +259,14 @@ The exits section lists the chart stop, the gap backstop behind it and the scale
 target separately, because which of the two stops fired is the difference between a
 normal loss and a gap.
 
+**Folded shut by default**, behind the arrow in the section header, because the
+panel is the longest thing on the page and is read far less often than the state
+above it. Reusing the same fold mechanism as a closed position's detail row —
+`data-fold`/`id="fold-…"` — means opening it needs no new JavaScript. Like the
+positions tab, the choice lives in a JS variable outside the fragment poll's swap
+so it survives the poll; unlike the tab, it is not written to `localStorage`, so a
+reload lands folded shut again rather than remembering the last session's choice.
+
 **Every value is read from the loaded configuration**, never written into the
 template. That is the whole point of the section: a hardcoded panel would pass a
 "does it render" test and start lying the first time a threshold was tuned — the same

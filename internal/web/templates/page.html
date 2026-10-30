@@ -188,6 +188,12 @@ button.fold {
 }
 button.fold:hover { color: var(--text); }
 button.fold[aria-expanded="true"] { transform: rotate(90deg); color: var(--text); }
+
+/* The Active strategy card's own fold button sits in the card's h2, not a table
+   cell, so it needs the same affordance at a size that fits an uppercase 13px
+   header instead of a 14px row. */
+.fold-head { display: inline-flex; align-items: center; }
+.card > h2 .fold-head button.fold { font-size: 18px; margin-right: 8px; vertical-align: -3px; }
 tr.foldout td { background: var(--panel-2); padding: 8px 12px 10px 48px; font-size: 13px;
   font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 tr.foldout td > span { margin-right: 28px; white-space: nowrap; }
@@ -893,8 +899,10 @@ setInterval(claudeRefresh, 2000);
 
 
 <section class="card" style="margin-top:16px">
-  <h2>Active strategy <span class="meta">as configured — restart to apply changes</span></h2>
-  <div class="strategy">
+  <h2><span class="fold-head"><button type="button" class="fold" data-fold="strategy" aria-expanded="false"
+          aria-controls="fold-strategy" title="Show strategy configuration">&#9656;</button>Active strategy</span>
+    <span class="meta">as configured — restart to apply changes</span></h2>
+  <div class="strategy" id="fold-strategy" hidden>
     {{range .Strategy}}
     <div class="sect">
       <h3>{{.Title}}</h3>

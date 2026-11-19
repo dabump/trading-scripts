@@ -69,7 +69,7 @@ func Classify(bars []domain.Bar, now time.Time, interval time.Duration) State {
 	bars = completedBars(bars, now, interval)
 	closes := closesOf(bars)
 
-	line, sig := macdSeries(closes, fastPeriod, slowPeriod, signalPeriod)
+	line, sig := strategy.MACDSeries(closes, fastPeriod, slowPeriod, signalPeriod)
 	if len(line) == 0 {
 		return StatePending
 	}
@@ -125,28 +125,6 @@ func closesOf(bars []domain.Bar) []float64 {
 		closes[i] = b.Close
 	}
 	return closes
-}
-
-// macdSeries returns the MACD line and signal line, aligned to each other and
-// to the tail of closes, using strategy.EMA so the warm-up behaves identically
-// to the entry-side MACD filter.
-func macdSeries(closes []float64, fast, slow, signal int) (line, sig []float64) {
-	fastEMA := strategy.EMA(closes, fast)
-	slowEMA := strategy.EMA(closes, slow)
-	if len(slowEMA) == 0 {
-		return nil, nil
-	}
-	offset := len(fastEMA) - len(slowEMA)
-	diff := make([]float64, len(slowEMA))
-	for i := range slowEMA {
-		diff[i] = fastEMA[offset+i] - slowEMA[i]
-	}
-	sig = strategy.EMA(diff, signal)
-	if len(sig) == 0 {
-		return nil, nil
-	}
-	diffOffset := len(diff) - len(sig)
-	return diff[diffOffset:], sig
 }
 
 // anticipatingCross reports whether the gap between the signal and MACD lines

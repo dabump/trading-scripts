@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -23,6 +24,14 @@ import (
 
 //go:embed templates/*.html
 var templatesFS embed.FS
+
+// staticFS holds the live chart's vendored charting library. It is the only
+// third-party JS in this repo — see docs/decisions.md — checked in as a plain
+// file rather than pulled in by a build step, so the binary stays
+// single-source the way everything else here is.
+//
+//go:embed static/*.js
+var staticFS embed.FS
 
 // StateSource is the engine, from the page's point of view: something that can be
 // asked what it is currently doing. Keeping it an interface means the web package
@@ -69,19 +78,25 @@ type ClaudeLogin interface {
 }
 
 type Server struct {
-	cfg     *config.Config
-	store   *store.Store
-	engine  StateSource
-	tmpl    *template.Template
-	log     *slog.Logger
-	actions Actions
-	claude  ClaudeLogin
-	now     func() time.Time
-	paper   bool
+	cfg         *config.Config
+	store       *store.Store
+	engine      StateSource
+	tmpl        *template.Template
+	log         *slog.Logger
+	actions     Actions
+	chart       ChartFeed
+	claude      ClaudeLogin
+	now         func() time.Time
+	paper       bool
+	staticFiles http.Handler
 }
 
-func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Actions, claude ClaudeLogin, logger *slog.Logger, now func() time.Time, paper bool) (*Server, error) {
+func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Actions, chart ChartFeed, claude ClaudeLogin, logger *slog.Logger, now func() time.Time, paper bool) (*Server, error) {
 	tmpl, err := template.ParseFS(templatesFS, "templates/*.html")
+	if err != nil {
+		return nil, err
+	}
+	static, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		return nil, err
 	}
@@ -91,8 +106,8 @@ func NewServer(cfg *config.Config, st *store.Store, eng StateSource, actions Act
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, store: st, engine: eng, actions: actions, claude: claude, tmpl: tmpl,
-		log: logger, now: now, paper: paper}, nil
+	return &Server{cfg: cfg, store: st, engine: eng, actions: actions, chart: chart, claude: claude, tmpl: tmpl,
+		log: logger, now: now, paper: paper, staticFiles: http.StripPrefix("/static/", http.FileServer(http.FS(static)))}, nil
 }
 
 // Handler builds the router.
@@ -107,6 +122,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/actions/close", s.handleClosePosition)
 	mux.HandleFunc("/actions/open", s.handleOpenPosition)
 	mux.HandleFunc("/actions/trade-review", s.handleTradeReview)
+	mux.HandleFunc("/actions/chart", s.handleChart)
+	mux.HandleFunc("/actions/chart/data", s.handleChartData)
+	mux.HandleFunc("/actions/chart/stop", s.handleChartStop)
+	mux.Handle("/static/", s.staticFiles)
 	mux.HandleFunc("/claude/status", s.handleClaudeStatus)
 	mux.HandleFunc("/claude/start", s.handleClaudeStart)
 	mux.HandleFunc("/claude/input", s.handleClaudeInput)

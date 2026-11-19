@@ -324,6 +324,54 @@ func TestVWAPWeightsByVolume(t *testing.T) {
 	}
 }
 
+func TestVWAPSeriesIsCumulative(t *testing.T) {
+	bars := []domain.Bar{
+		{High: 10, Low: 10, Close: 10, Volume: 1},
+		{High: 20, Low: 20, Close: 20, Volume: 99},
+	}
+	got := VWAPSeries(bars)
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	// The first bar's cumulative VWAP is just its own typical price.
+	if math.Abs(got[0]-10) > 1e-9 {
+		t.Errorf("VWAPSeries[0] = %v, want 10", got[0])
+	}
+	// The second point folds in both bars, so it must match VWAP's own answer
+	// over the same range.
+	if want := VWAP(bars); math.Abs(got[1]-want) > 1e-9 {
+		t.Errorf("VWAPSeries[1] = %v, want %v (VWAP over the whole range)", got[1], want)
+	}
+	// A bar before any volume has traded gets 0, VWAP's own "no opinion" value.
+	noVolume := VWAPSeries([]domain.Bar{{High: 5, Low: 5, Close: 5}})
+	if noVolume[0] != 0 {
+		t.Errorf("VWAPSeries with no volume = %v, want 0", noVolume[0])
+	}
+}
+
+func TestMACDSeriesMatchesLatestMACD(t *testing.T) {
+	closes := make([]float64, 60)
+	for i := range closes {
+		closes[i] = 10 * math.Pow(1.01, float64(i))
+	}
+	line, sig := MACDSeries(closes, macdFast, macdSlow, macdSignal)
+	if len(line) == 0 || len(line) != len(sig) {
+		t.Fatalf("len(line) = %d, len(sig) = %d, want equal and non-zero", len(line), len(sig))
+	}
+	// The latest point of the full series must agree with MACD's own
+	// single-value answer over the same closes and periods.
+	wantLine, wantSig, ok := MACD(closes)
+	if !ok {
+		t.Fatal("MACD(closes) reported not ok")
+	}
+	if math.Abs(line[len(line)-1]-wantLine) > 1e-9 || math.Abs(sig[len(sig)-1]-wantSig) > 1e-9 {
+		t.Errorf("MACDSeries tail = (%v, %v), want (%v, %v) to match MACD", line[len(line)-1], sig[len(sig)-1], wantLine, wantSig)
+	}
+	if line, sig := MACDSeries(make([]float64, 5), macdFast, macdSlow, macdSignal); line != nil || sig != nil {
+		t.Error("too few closes must report no series rather than guess")
+	}
+}
+
 // The three automated entries of 2026-10-02, replayed: the setup as read on the closed
 // candle, against the price the order actually got. Each would have been refused.
 func TestCheckEntryPriceRefusesTheTradesOf20261002(t *testing.T) {

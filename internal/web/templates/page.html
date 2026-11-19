@@ -271,6 +271,22 @@ dialog.modal .close {
   color: var(--muted); border-radius: 6px; padding: 4px 10px;
 }
 dialog.modal .close:hover { color: var(--text); }
+dialog.modal.chart-modal { width: min(1040px, calc(100vw - 32px)); }
+.chart-wrap { display: flex; flex-direction: column; gap: 10px; }
+.chart-pane { width: 100%; height: 360px; }
+.chart-pane-small { width: 100%; height: 140px; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); align-items: center; }
+.legend-swatch {
+  display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  margin-right: 4px; vertical-align: middle;
+}
+.legend-swatch.price { background: var(--good); }
+.legend-swatch.ema9 { background: var(--warn); }
+.legend-swatch.ema20 { background: var(--accent); }
+.legend-swatch.vwap { background: #c792ea; }
+.legend-swatch.volume { background: var(--muted); }
+.legend-swatch.macd { background: var(--accent); }
+.legend-swatch.signal { background: var(--pre); }
 .verdict-line { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
 .kv { color: var(--muted); font-size: 12px; margin: 0; }
 
@@ -332,13 +348,17 @@ footer.foot { margin-top: 26px; color: var(--muted); font-size: 12px;
     <div id="modal-content"></div>
   </dialog>
 </div>
+<script src="/static/lightweight-charts.js"></script>
 <script>
 // Manual checks. Both endpoints return rendered HTML, so the modal's markup lives
 // in the Go template like everything else rather than being rebuilt here.
 const modal = document.getElementById('modal');
 const modalContent = document.getElementById('modal-content');
 
-function closeModal() { if (modal.open) modal.close(); }
+function closeModal() {
+  stopChart();
+  if (modal.open) modal.close();
+}
 modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
 document.addEventListener('click', (e) => {
   if (e.target.closest('[data-close-modal]')) closeModal();
@@ -446,6 +466,151 @@ document.addEventListener('click', async (e) => {
     modalContent.innerHTML = await res.text();
   } catch (err) {
     modalContent.innerHTML = '<div class="mhead"><h3>Could not load</h3></div>' +
+      '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
+  }
+});
+
+// Live chart popup. Only one can be open at a time, matching the single
+// shared #modal every other popup uses: opening a new chart tears down
+// whatever one was running first, same as the dialog itself only ever shows
+// one thing. Drawing uses the vendored lightweight-charts (the one
+// third-party JS file in this repo — see docs/decisions.md); the data comes
+// from the chart feed worker's own poll endpoint, never straight from a
+// chart library's own network layer, so there is exactly one thing talking
+// to the server.
+const CHART_POLL_MS = 3000;
+let chartPoll = null;
+let chartInstances = null;
+let chartSymbol = null;
+
+// stopChart tears down whatever chart is running and tells the server to stop
+// fetching it. Called on every modal close, and before a new chart replaces
+// the one showing — chartfeed's own watchTTL is the backstop for when this
+// never runs at all (a closed tab, a lost network).
+function stopChart() {
+  if (chartPoll) { clearInterval(chartPoll); chartPoll = null; }
+  if (chartInstances) {
+    chartInstances.price.remove();
+    chartInstances.macd.remove();
+    chartInstances = null;
+  }
+  modal.classList.remove('chart-modal');
+  if (chartSymbol) {
+    const symbol = chartSymbol;
+    chartSymbol = null;
+    fetch('actions/chart/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'symbol=' + encodeURIComponent(symbol),
+    }).catch(() => {});
+  }
+}
+
+// initChart builds the two chart panes inside the modal shell the server just
+// rendered, then starts polling actions/chart/data for the series to draw.
+// Candles only advance on load and on each poll — the forming candle moves
+// live because the server keeps updating it, not because of anything here.
+function initChart(symbol) {
+  const wrap = modalContent.querySelector('.chart-wrap');
+  if (!wrap || typeof LightweightCharts === 'undefined') return;
+  chartSymbol = symbol;
+  modal.classList.add('chart-modal');
+
+  const dark = {
+    layout: { background: { color: '#121820' }, textColor: '#8b9cad' },
+    grid: { vertLines: { color: '#22303c' }, horzLines: { color: '#22303c' } },
+    timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#22303c' },
+    rightPriceScale: { borderColor: '#22303c' },
+  };
+
+  const priceChart = LightweightCharts.createChart(wrap.querySelector('#chart-price-pane'),
+    Object.assign({ height: 360 }, dark));
+  const candles = priceChart.addCandlestickSeries({
+    upColor: '#3fd08a', downColor: '#ff6b6b', borderVisible: false,
+    wickUpColor: '#3fd08a', wickDownColor: '#ff6b6b',
+  });
+  const ema9 = priceChart.addLineSeries({ color: '#f5b942', lineWidth: 1 });
+  const ema20 = priceChart.addLineSeries({ color: '#5ab0ff', lineWidth: 1 });
+  const vwap = priceChart.addLineSeries({ color: '#c792ea', lineWidth: 1 });
+  const volume = priceChart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
+  priceChart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+  const macdChart = LightweightCharts.createChart(wrap.querySelector('#chart-macd-pane'),
+    Object.assign({ height: 140 }, dark));
+  const macdHist = macdChart.addHistogramSeries({ color: '#39465a' });
+  const macdLine = macdChart.addLineSeries({ color: '#5ab0ff', lineWidth: 1 });
+  const macdSignal = macdChart.addLineSeries({ color: '#ff8c32', lineWidth: 1 });
+
+  // The two panes share one conceptual time axis, so panning or zooming either
+  // has to move the other with it.
+  priceChart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+    if (r) macdChart.timeScale().setVisibleLogicalRange(r);
+  });
+  macdChart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+    if (r) priceChart.timeScale().setVisibleLogicalRange(r);
+  });
+
+  chartInstances = { price: priceChart, macd: macdChart };
+  const status = modalContent.querySelector('#chart-status');
+
+  async function poll() {
+    try {
+      const res = await fetch('actions/chart/data?symbol=' + encodeURIComponent(symbol),
+        { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+
+      candles.setData(d.bars.map((b) => ({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close })));
+      volume.setData(d.bars.map((b) => ({
+        time: b.time, value: b.volume,
+        color: b.close >= b.open ? 'rgba(63,208,138,.5)' : 'rgba(255,107,107,.5)',
+      })));
+      ema9.setData(d.ema9.map((p) => ({ time: p.time, value: p.value })));
+      ema20.setData(d.ema20.map((p) => ({ time: p.time, value: p.value })));
+      vwap.setData(d.vwap.map((p) => ({ time: p.time, value: p.value })));
+      // macdLine and macdSignal are always the same length, aligned index for
+      // index — strategy.MACD warms both up together — so zipping them by
+      // index for the histogram is safe.
+      macdHist.setData(d.macdLine.map((p, i) => {
+        const diff = p.value - d.macdSignal[i].value;
+        return { time: p.time, value: diff, color: diff >= 0 ? 'rgba(63,208,138,.6)' : 'rgba(255,107,107,.6)' };
+      }));
+      macdLine.setData(d.macdLine.map((p) => ({ time: p.time, value: p.value })));
+      macdSignal.setData(d.macdSignal.map((p) => ({ time: p.time, value: p.value })));
+
+      if (status) {
+        status.textContent = d.err
+          ? ('stale — ' + d.err)
+          : ('updated ' + new Date(d.updatedAt).toLocaleTimeString());
+      }
+    } catch (err) {
+      if (status) status.textContent = 'could not reach the agent';
+    }
+  }
+  poll();
+  chartPoll = setInterval(poll, CHART_POLL_MS);
+}
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-chart]');
+  if (!btn) return;
+  const symbol = btn.dataset.chart;
+
+  stopChart();
+  modalContent.innerHTML = '<div class="mhead"><h3>' + symbol + '</h3></div>' +
+    '<div class="mbody"><p class="note">Loading the chart.</p></div>';
+  if (!modal.open) modal.showModal();
+
+  try {
+    const res = await fetch('actions/chart', {
+      method: 'POST',
+      headers: { 'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'symbol=' + encodeURIComponent(symbol),
+    });
+    modalContent.innerHTML = await res.text();
+    initChart(symbol);
+  } catch (err) {
+    modalContent.innerHTML = '<div class="mhead"><h3>Chart failed</h3></div>' +
       '<div class="mbody"><div class="alert">Could not reach the agent.</div></div>';
   }
 });
@@ -887,6 +1052,7 @@ setInterval(claudeRefresh, 2000);
         <td class="num {{.Tone}}">{{.PnLDollars}}</td>
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
         <td class="num">
+          <button type="button" class="mini ghost" data-chart="{{.Symbol}}" title="View {{.Symbol}}'s live 1-minute chart">Chart</button>
           <button type="button" class="mini danger" data-close="{{.ID}}" data-symbol="{{.Symbol}}"
                   title="Sell the {{.Shares}} shares still held, now">Close</button>
         </td>
@@ -928,6 +1094,7 @@ setInterval(claudeRefresh, 2000);
         <td class="num {{.Tone}}">{{.PnLPct}}</td>
         <td class="muted">{{.Reason}}</td>
         <td class="num">
+          <button type="button" class="mini ghost" data-chart="{{.Symbol}}" title="View {{.Symbol}}'s live 1-minute chart">Chart</button>
           {{if eq .ReviewState "ready"}}
           <button type="button" class="mini" data-review="{{.ID}}" title="Ask Claude why this trade lost">Why?</button>
           {{else if eq .ReviewState "pending"}}
@@ -986,6 +1153,7 @@ setInterval(claudeRefresh, 2000);
         <td>{{if .Qualifies}}<span class="pill good">Qualifies</span>{{else}}<span class="muted">{{.Verdict}}</span>{{end}}</td>
         <td>{{if .Outcome}}<span class="{{.OutcomeTone}}">{{.Outcome}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
         <td class="num">
+          <button type="button" class="mini ghost" data-chart="{{.Symbol}}" title="View {{.Symbol}}'s live 1-minute chart">Chart</button>
           {{if .CanOpen}}
           <button type="button" class="mini{{if not .Qualifies}} ghost{{end}}" data-open="{{.Symbol}}" data-qualifies="{{.Qualifies}}"
                   title="Buy {{.Symbol}} now, overriding {{if .Qualifies}}the setup gate{{else}}the screen and the setup gate{{end}}">Open</button>
@@ -1036,6 +1204,32 @@ setInterval(claudeRefresh, 2000);
   <h3>{{.Title}}</h3>
   <span class="meta">{{.TakenAt}}</span>
   <button class="close" type="button" data-close-modal>Close</button>
+</div>
+{{end}}
+
+{{/* chartModal is the shell the "Chart" button's popup renders. It carries no
+     data of its own -- the page's JS (initChart) fills the panes in by
+     polling actions/chart/data, the same way every other modal here is
+     server-rendered markup rather than something JS builds. */}}
+{{define "chartModal"}}
+<div class="mhead">
+  <h3>{{.Title}}</h3>
+  <span class="meta" id="chart-status">loading…</span>
+  <button class="close" type="button" data-close-modal>Close</button>
+</div>
+<div class="mbody">
+  <div class="chart-wrap">
+    <div class="chart-legend">
+      <span><span class="legend-swatch ema9"></span>EMA9</span>
+      <span><span class="legend-swatch ema20"></span>EMA20</span>
+      <span><span class="legend-swatch vwap"></span>VWAP</span>
+      <span><span class="legend-swatch volume"></span>Volume</span>
+      <span><span class="legend-swatch macd"></span>MACD(9,20)</span>
+      <span><span class="legend-swatch signal"></span>Signal(9)</span>
+    </div>
+    <div id="chart-price-pane" class="chart-pane"></div>
+    <div id="chart-macd-pane" class="chart-pane-small"></div>
+  </div>
 </div>
 {{end}}
 

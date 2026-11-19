@@ -20,6 +20,7 @@ import (
 
 	"github.com/martincoetzee/trading-agent/internal/audit"
 	"github.com/martincoetzee/trading-agent/internal/broker"
+	"github.com/martincoetzee/trading-agent/internal/chartfeed"
 	"github.com/martincoetzee/trading-agent/internal/claudelogin"
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
@@ -215,7 +216,17 @@ func run() error {
 	// unconditionally here rather than inside either branch above.
 	claude := claudelogin.New()
 
-	srv, err := web.NewServer(cfg, st, eng, eng, claude, logger, time.Now, paper)
+	// Its own component for the same reason the momentum worker is: fetching a
+	// symbol's live price and bars is not time-critical, and the chart it feeds
+	// is purely a display (internal/chartfeed), so it must not be able to affect
+	// trading even if a fetch is slow or fails. Unlike momentum/sentiment/review
+	// it has no enabled flag — it only ever fetches symbols with a chart
+	// actually open, so idle cost is already zero.
+	chartWorker := &chartfeed.Worker{
+		Bars: data, Snapshots: data, Calendar: trading, Cfg: cfg, Log: logger,
+	}
+
+	srv, err := web.NewServer(cfg, st, eng, eng, chartWorker, claude, logger, time.Now, paper)
 	if err != nil {
 		return err
 	}
@@ -274,7 +285,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	components := 2
+	components := 3
 	if reviewWorker != nil {
 		components++
 	}
@@ -287,6 +298,7 @@ func run() error {
 	errs := make(chan error, components)
 	go func() { errs <- srv.Serve(ctx) }()
 	go func() { errs <- eng.Run(ctx) }()
+	go func() { errs <- chartWorker.Run(ctx) }()
 	if reviewWorker != nil {
 		go func() { errs <- reviewWorker.Run(ctx) }()
 	}

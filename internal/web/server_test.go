@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/martincoetzee/trading-agent/internal/chartfeed"
 	"github.com/martincoetzee/trading-agent/internal/config"
 	"github.com/martincoetzee/trading-agent/internal/domain"
 	"github.com/martincoetzee/trading-agent/internal/scheduler"
@@ -80,6 +81,22 @@ func (a *stubActions) ScreenNow(context.Context) (domain.ScreenPreview, error) {
 	return a.preview, a.err
 }
 
+// stubChart stands in for the chart feed worker. watched records every
+// symbol a test asked it to watch (duplicates included, so a test can tell a
+// re-open from a first open), and unwatched the same for stops.
+type stubChart struct {
+	watched   []string
+	unwatched []string
+	data      map[string]chartfeed.Data
+}
+
+func (c *stubChart) Watch(_ context.Context, symbol string) { c.watched = append(c.watched, symbol) }
+func (c *stubChart) Unwatch(symbol string)                  { c.unwatched = append(c.unwatched, symbol) }
+func (c *stubChart) Poll(symbol string) (chartfeed.Data, bool) {
+	d, ok := c.data[symbol]
+	return d, ok
+}
+
 func testConfig() *config.Config {
 	c := &config.Config{}
 	c.MarketData = config.MarketData{Feed: "sip"}
@@ -110,6 +127,7 @@ type fixture struct {
 	now     time.Time
 	date    string
 	actions *stubActions
+	chart   *stubChart
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -124,6 +142,7 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{
 		store: st, cfg: testConfig(), date: "2026-09-28",
 		actions: &stubActions{},
+		chart:   &stubChart{data: map[string]chartfeed.Data{}},
 		now:     time.Date(2026, 9, 28, 11, 0, 0, 0, scheduler.ET),
 		eng: &stubEngine{
 			state:      domain.StateScreening,
@@ -142,7 +161,7 @@ func newFixture(t *testing.T) *fixture {
 		},
 	}
 
-	srv, err := NewServer(f.cfg, st, f.eng, f.actions, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+	srv, err := NewServer(f.cfg, st, f.eng, f.actions, f.chart, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		func() time.Time { return f.now }, true)
 	if err != nil {
 		t.Fatal(err)

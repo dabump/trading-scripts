@@ -13,6 +13,18 @@ The rule that replaced "the page cannot trade" is narrower and more useful: **a 
 - **Live updates:** lightweight JS polling every ~10–15s that patches the page in place (not a full reload, not a WebSocket). This resolves the "refresh behavior" question below — it's no longer open.
 - **Every symbol is a link to its TradingView chart**, opened in a new tab (`tradingview.com/chart/?symbol=…`). The page shows why the agent acted but no chart, and reading the tape is the first thing an operator does with a ticker they have just seen. It is one shared template (`symbolCell`), so positions, the screening table and both modals link identically; a plain anchor rather than JS, so the existing click handlers — which all match on `button` — cannot swallow it, and so it survives the fragment swap.
 
+## Live chart (the "Chart" button)
+
+A **Chart** button sits to the left of Open on every screening row, and to the left of Close/Why? on positions — any row that carries a symbol. Unlike the TradingView link, this opens inside the page's own modal and draws the exact signals the strategy reads, on the same 1-minute interval `checkSetups` uses: a candlestick chart with EMA9, EMA20 and a running VWAP overlaid, a MACD(9,20,9) line/signal/histogram pane underneath, and volume as its own histogram — see `internal/chartfeed`.
+
+It reuses `internal/momentum`'s MACD math (`strategy.MACDSeries`, factored out so the two never drift) and `strategy.VWAPSeries`, extended from the entry-side `strategy.VWAP` to a running line. Only one chart is ever open at a time — it's the same shared `<dialog id="modal">` every other popup uses, so opening a second symbol's chart replaces the first.
+
+Drawing is done by [TradingView's lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache-2.0), vendored as a static file at `internal/web/static/lightweight-charts.js` — the only third-party JS in this repo, and why; see [`decisions.md`](./decisions.md).
+
+**The web layer still never calls the broker for this.** Clicking Chart registers the symbol with `chartfeed.Worker`, a background component (modeled on `momentum.Worker`) that fetches a live price every 3s and closed bars once each minute completes, for symbols a chart is actually open on — nothing else. The dialog's own JS polls a small JSON endpoint that only reads the worker's in-memory cache, so the "web layer never calls the broker" rule in `CLAUDE.md` holds here too. A watch is dropped the moment the dialog closes, or after ~20s unpolled if it doesn't (a crashed tab, a lost network) — whichever comes first.
+
+The forming (still-open) candle updates live from that price feed; its volume reads 0 until the bar closes and the real one is read off `IntradayBars` — a live quote has no way to say how much of today's cumulative volume happened in the last few seconds, so this shows nothing rather than a guess. A stale chart (the last fetch failed) says so rather than going blank, the same "stale rather than dropped" rule the page's account balance follows.
+
 ## Manual checks (two buttons)
 
 Two header buttons run a check on demand and show the result in an in-page modal

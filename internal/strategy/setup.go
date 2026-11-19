@@ -406,16 +406,63 @@ func EMA(values []float64, period int) []float64 {
 // candle's typical price. It returns 0 when there is no volume to weight by, which
 // callers treat as "no opinion" rather than as a price of zero.
 func VWAP(bars []domain.Bar) float64 {
+	pv, vol := vwapSums(bars)
+	if vol <= 0 {
+		return 0
+	}
+	return pv / vol
+}
+
+// VWAPSeries is VWAP evaluated cumulatively at every bar, for plotting as a running
+// line rather than reading off a single end-of-range number. A bar before any
+// volume has traded gets 0, the same "no opinion" convention VWAP uses.
+func VWAPSeries(bars []domain.Bar) []float64 {
+	out := make([]float64, len(bars))
 	var pv, vol float64
+	for i, b := range bars {
+		typical := (b.High + b.Low + b.Close) / 3
+		pv += typical * b.Volume
+		vol += b.Volume
+		if vol > 0 {
+			out[i] = pv / vol
+		}
+	}
+	return out
+}
+
+func vwapSums(bars []domain.Bar) (pv, vol float64) {
 	for _, b := range bars {
 		typical := (b.High + b.Low + b.Close) / 3
 		pv += typical * b.Volume
 		vol += b.Volume
 	}
-	if vol <= 0 {
-		return 0
+	return pv, vol
+}
+
+// MACDSeries returns the whole MACD line and signal line off a series of
+// closes, for callers that need every point rather than just the latest —
+// the watchlist's momentum icon (internal/momentum) and the live chart
+// (internal/chartfeed). It uses EMA, the same as MACD above, so arbitrary
+// periods behave identically to the entry-side filter's fixed 12/26/9; both
+// results are aligned to each other and to the tail of closes, shorter than
+// closes by fast/slow/signal's combined warm-up.
+func MACDSeries(closes []float64, fast, slow, signal int) (line, sig []float64) {
+	fastEMA := EMA(closes, fast)
+	slowEMA := EMA(closes, slow)
+	if len(slowEMA) == 0 {
+		return nil, nil
 	}
-	return pv / vol
+	offset := len(fastEMA) - len(slowEMA)
+	diff := make([]float64, len(slowEMA))
+	for i := range slowEMA {
+		diff[i] = fastEMA[offset+i] - slowEMA[i]
+	}
+	sig = EMA(diff, signal)
+	if len(sig) == 0 {
+		return nil, nil
+	}
+	diffOffset := len(diff) - len(sig)
+	return diff[diffOffset:], sig
 }
 
 // WarmupDuration is how long after the open the first setup can possibly appear,

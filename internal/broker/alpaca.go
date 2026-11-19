@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,14 @@ func NewAlpaca(s *config.Secrets, feed string) *Alpaca {
 // by any proxy in between.
 const snapshotBatchSize = 500
 
+// validTickerSymbol matches the shapes a real US equity ticker takes (letters,
+// optionally a class/warrant/rights suffix after a "." or "-"). Alpaca's asset
+// list has been seen listing a stray non-equity record — e.g. "037ESC019", a
+// CUSIP rather than a ticker — as tradable on an allowed exchange. That one
+// symbol fails the entire batch it rides in on `/v2/stocks/snapshots`, which
+// takes down every scan for the day, so it must never reach the universe.
+var validTickerSymbol = regexp.MustCompile(`^[A-Z]{1,6}([.-][A-Z]{1,4})?$`)
+
 // TradableAssets lists active, tradable US equities on the main exchanges.
 //
 // OTC venues are excluded: the strategy screens for liquid intraday momentum, and
@@ -71,7 +80,7 @@ func (a *Alpaca) TradableAssets(ctx context.Context) ([]string, error) {
 	allowed := map[string]bool{"NYSE": true, "NASDAQ": true, "AMEX": true, "ARCA": true, "BATS": true}
 	out := make([]string, 0, len(resp))
 	for _, asset := range resp {
-		if asset.Tradable && allowed[asset.Exchange] {
+		if asset.Tradable && allowed[asset.Exchange] && validTickerSymbol.MatchString(asset.Symbol) {
 			out = append(out, asset.Symbol)
 		}
 	}

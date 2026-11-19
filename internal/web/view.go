@@ -161,6 +161,9 @@ type EODRow struct {
 	OpenedAt string
 	ClosedAt string
 	Held     string
+	// Manual marks a position opened from the page rather than by the signal, same
+	// meaning as PositionRow.Manual.
+	Manual bool
 	// ReviewState is "" for a winning trade (no review ever runs for one), "pending"
 	// for a loss the review worker has not gotten to yet, or "ready" once Claude's
 	// report is stored — only "ready" shows the button, so a click can never race
@@ -645,7 +648,7 @@ func BuildView(
 			PnLDollars: signedMoney(realized), PnLPct: pct(p.RealizedPct()),
 			Reason: string(p.ExitReason), Tone: toneForPnL(realized),
 			OpenedAt: tradeTime(p.EntryTime), ClosedAt: tradeTime(p.ExitTime),
-			Held: heldText(p.EntryTime, p.ExitTime),
+			Held: heldText(p.EntryTime, p.ExitTime), Manual: p.Manual,
 		}
 		if realized < 0 {
 			row.ReviewState = "pending"

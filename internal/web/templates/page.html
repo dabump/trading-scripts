@@ -940,6 +940,7 @@ setInterval(claudeRefresh, 2000);
           <span><span class="label">Opened</span>{{.OpenedAt}}</span>
           <span><span class="label">Closed</span>{{.ClosedAt}}</span>
           <span><span class="label">Held</span>{{.Held}}</span>
+          <span><span class="label">Entry</span>{{if .Manual}}<span title="Opened by hand from the status page: its own stop and the forced end-of-day exit applied, nothing else.">Manual</span>{{else}}Automated{{end}}</span>
         </td>
       </tr>
       {{end}}

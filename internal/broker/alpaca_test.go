@@ -103,14 +103,18 @@ func TestSnapshotsEmptyInputSkipsRequest(t *testing.T) {
 }
 
 // The tradable universe drives the whole scan, so the filtering matters: OTC and
-// untradable assets must not reach the screener.
+// untradable assets must not reach the screener. Nor must a malformed symbol —
+// Alpaca has listed a CUSIP as a tradable asset on an allowed exchange, and that
+// one entry fails the entire snapshots batch it rides in on.
 func TestTradableAssetsFiltersVenueAndTradability(t *testing.T) {
 	a := stubAlpaca(t, map[string]string{
 		"/v2/assets": `[
 			{"symbol":"GOOD","tradable":true,"exchange":"NASDAQ"},
-			{"symbol":"ALSOGOOD","tradable":true,"exchange":"NYSE"},
+			{"symbol":"ALSO","tradable":true,"exchange":"NYSE"},
+			{"symbol":"BRK.B","tradable":true,"exchange":"NYSE"},
 			{"symbol":"UNTRADABLE","tradable":false,"exchange":"NASDAQ"},
-			{"symbol":"PINKSHEET","tradable":true,"exchange":"OTC"}
+			{"symbol":"PINKSHEET","tradable":true,"exchange":"OTC"},
+			{"symbol":"037ESC019","tradable":true,"exchange":"NASDAQ"}
 		]`,
 	})
 
@@ -118,7 +122,7 @@ func TestTradableAssetsFiltersVenueAndTradability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"GOOD", "ALSOGOOD"}
+	want := []string{"GOOD", "ALSO", "BRK.B"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}

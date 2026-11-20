@@ -22,13 +22,57 @@ type ChartFeed interface {
 	Poll(symbol string) (chartfeed.Data, bool)
 }
 
-// ChartModal is the shell the "Chart" button's popup renders. It carries no
-// data of its own — the dialog's JS loads that separately, by polling
-// handleChartData — it only needs to exist long enough for that JS to find
-// the chart containers it draws into.
+// chartPosition is the open-position context the chart modal's header shows
+// alongside the chart: whether the symbol is held, and if so its id, shares
+// and unrealized P&L. Looked up fresh both when the chart opens
+// (handleChart) and on every subsequent poll (handleChartData) — the
+// trading button and the P&L next to it are "live" in the same sense the
+// candles are, not a one-time snapshot taken at open.
+type chartPosition struct {
+	Held       bool   `json:"held"`
+	PositionID int64  `json:"positionId"`
+	Shares     int    `json:"shares"`
+	PnLDollars string `json:"pnlDollars"`
+	PnLPct     string `json:"pnlPct"`
+	Tone       string `json:"tone"`
+}
+
+// lookupChartPosition finds symbol among the open positions and computes its
+// unrealized P&L the same way the Open positions table does
+// (domain.Position.UnrealizedDollars/UnrealizedPct off the trading loop's
+// last mark, falling back to entry price before the first mark lands).
+func (s *Server) lookupChartPosition(symbol string) chartPosition {
+	var info chartPosition
+	open, err := s.store.OpenPositions()
+	if err != nil {
+		s.log.Error("load open positions for chart", "err", err)
+		return info
+	}
+	for _, p := range open {
+		if p.Symbol != symbol {
+			continue
+		}
+		info.Held, info.PositionID, info.Shares = true, p.ID, p.SharesOpen
+		current := p.LastPrice
+		if current <= 0 {
+			current = p.EntryPrice
+		}
+		pnl := p.UnrealizedDollars(current)
+		info.PnLDollars, info.PnLPct, info.Tone = signedMoney(pnl), pct(p.UnrealizedPct(current)), toneForPnL(pnl)
+		break
+	}
+	return info
+}
+
+// ChartModal is the shell the "Chart" button's popup renders. The chart data
+// itself is loaded separately, by the dialog's own JS polling
+// handleChartData — this only needs to exist long enough for that JS to find
+// the chart containers it draws into, plus whichever one trading action
+// (Open or Close) applies to the symbol right now.
 type ChartModal struct {
 	Title  string
 	Symbol string
+	chartPosition
 }
 
 // handleChart opens a symbol's live chart: registers it with the chart feed
@@ -56,7 +100,8 @@ func (s *Server) handleChart(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	s.chart.Watch(ctx, symbol)
 
-	s.renderModal(w, "chartModal", &ChartModal{Title: symbol + " — live chart", Symbol: symbol})
+	m := &ChartModal{Title: symbol + " — live chart", Symbol: symbol, chartPosition: s.lookupChartPosition(symbol)}
+	s.renderModal(w, "chartModal", m)
 }
 
 // chartPoint is one candle, shaped for the vendored charting library: a UNIX
@@ -87,6 +132,11 @@ type chartResponse struct {
 	MACDSignal []linePoint  `json:"macdSignal"`
 	UpdatedAt  string       `json:"updatedAt"`
 	Err        string       `json:"err,omitempty"`
+	// chartPosition is re-looked-up on every poll, not just when the chart
+	// opens, so the header's trading button and its P&L stay live exactly
+	// like the candles do — a position closed, opened or simply marked since
+	// the last poll shows up on the next one.
+	chartPosition
 }
 
 // handleChartData is polled by an open chart's own JS every few seconds. It
@@ -111,7 +161,10 @@ func (s *Server) handleChartData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := chartResponse{Symbol: data.Symbol, UpdatedAt: data.UpdatedAt.Format(time.RFC3339), Err: data.Err}
+	resp := chartResponse{
+		Symbol: data.Symbol, UpdatedAt: data.UpdatedAt.Format(time.RFC3339), Err: data.Err,
+		chartPosition: s.lookupChartPosition(symbol),
+	}
 	for _, b := range data.Bars {
 		resp.Bars = append(resp.Bars, chartPoint{
 			Time: b.Time.Unix(), Open: b.Open, High: b.High, Low: b.Low, Close: b.Close,

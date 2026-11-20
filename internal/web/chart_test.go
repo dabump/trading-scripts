@@ -1,12 +1,14 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/martincoetzee/trading-agent/internal/chartfeed"
+	"github.com/martincoetzee/trading-agent/internal/domain"
 )
 
 func TestChartScriptLoadsOnThePage(t *testing.T) {
@@ -58,6 +60,73 @@ func TestHandleChartRegistersAWatchAndRendersTheShell(t *testing.T) {
 			t.Errorf("chart modal missing %q", want)
 		}
 	}
+	// The dismiss button closes the chart, not the agent's position — it must
+	// never read as a trading action now that one sits right beside it.
+	if !strings.Contains(body, `data-close-modal title="Close this chart"`) {
+		t.Error("chart modal missing the dismiss button, or it no longer says what it closes")
+	}
+}
+
+// A symbol with no open position shows Open, never Close — the same choice
+// the screening table's CanOpen already makes, just read fresh here.
+func TestHandleChartShowsOpenWhenNotHeld(t *testing.T) {
+	f := newFixture(t)
+	_, body := f.postForm(t, "/actions/chart", "symbol=demo")
+	// Both buttons are always in the DOM so a later poll can toggle `hidden`
+	// without tearing the chart down — so the assertion is on which one is
+	// visible, not on which one exists.
+	if !strings.Contains(body, `id="chart-open-btn" data-open="DEMO" title="Buy DEMO now">Open position`) {
+		t.Errorf("chart modal's Open action is not visible for an unheld symbol, got %s", body)
+	}
+	if !strings.Contains(body, `title="Sell the 0 shares still held, now" hidden>Close position`) {
+		t.Errorf("chart modal's Close action is not hidden for a symbol with no open position, got %s", body)
+	}
+	if !strings.Contains(body, `id="chart-pnl" title="Unrealized P&L on the shares still held" hidden>`) {
+		t.Errorf("chart modal's P&L is not hidden for a symbol with no open position, got %s", body)
+	}
+}
+
+// A symbol with an open position shows Close, sized and keyed off that
+// position — not Open, which would let the page buy a second lot of
+// something already held straight from the chart.
+func TestHandleChartShowsCloseWhenHeld(t *testing.T) {
+	f := newFixture(t)
+	id, err := f.store.InsertPosition(domain.Position{
+		SessionDate: f.date, Symbol: "DEMO", Shares: 200,
+		EntryPrice: 4.50, EntryTime: f.now, StopPrice: 4.00,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A mark above entry, so the P&L shown is a real computation off the
+	// trading loop's last price rather than the breakeven InsertPosition seeds.
+	if err := f.store.UpdateMark(id, 5.00, 5.00); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := f.postForm(t, "/actions/chart", "symbol=demo")
+	want := fmt.Sprintf(`data-close="%d"`, id)
+	if !strings.Contains(body, want) {
+		t.Errorf("chart modal missing %q for the held position, got %s", want, body)
+	}
+	if !strings.Contains(body, `title="Sell the 200 shares still held, now">Close position`) {
+		t.Error("chart modal's Close action is not visible, or does not report the shares still held")
+	}
+	if !strings.Contains(body, `id="chart-open-btn" data-open="DEMO" title="Buy DEMO now" hidden>Open position`) {
+		t.Errorf("chart modal's Open action is not hidden for a symbol already held, got %s", body)
+	}
+	// (5.00 - 4.50) * 200 shares = +100.00, 11.11% move from entry — the same
+	// domain.Position.UnrealizedDollars/UnrealizedPct the positions table uses.
+	// Colored good/bad (green/red), never left at the dismiss button's neutral
+	// styling, so a glance at the header says whether closing now is a gain.
+	for _, want := range []string{"+100.00", "+11.11%", `id="chart-pnl" title="Unrealized P&L on the shares still held">+100.00 (+11.11%)`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("chart modal missing %q (unrealized P&L), got %s", want, body)
+		}
+	}
+	if !strings.Contains(body, `class="meta good" id="chart-pnl"`) {
+		t.Error("chart modal's P&L is not colored good (green) for a gain")
+	}
 }
 
 func TestHandleChartRejectsAnEmptySymbol(t *testing.T) {
@@ -68,6 +137,44 @@ func TestHandleChartRejectsAnEmptySymbol(t *testing.T) {
 	}
 	if !strings.Contains(body, "No symbol was given") {
 		t.Errorf("body = %q, want the no-symbol error", body)
+	}
+}
+
+// The chart's own poll endpoint carries the same live position/P&L info the
+// modal's header shows, re-computed on every call rather than only at the
+// moment the chart opened — that is what lets the page's JS keep the header
+// current without a full re-render.
+func TestHandleChartDataIncludesLivePositionInfo(t *testing.T) {
+	f := newFixture(t)
+	f.chart.data["DEMO"] = chartfeed.Data{Symbol: "DEMO"}
+
+	code, body := f.get(t, "/actions/chart/data?symbol=demo")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if !strings.Contains(body, `"held":false`) {
+		t.Errorf("chart data for an unheld symbol = %s, want held:false", body)
+	}
+
+	id, err := f.store.InsertPosition(domain.Position{
+		SessionDate: f.date, Symbol: "DEMO", Shares: 200,
+		EntryPrice: 4.50, EntryTime: f.now, StopPrice: 4.00,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.UpdateMark(id, 5.00, 5.00); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body = f.get(t, "/actions/chart/data?symbol=demo")
+	for _, want := range []string{
+		`"held":true`, fmt.Sprintf(`"positionId":%d`, id), `"shares":200`,
+		`"pnlDollars":"+100.00"`, `"pnlPct":"+11.11%"`, `"tone":"good"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("chart data after opening a position missing %q, got %s", want, body)
+		}
 	}
 }
 

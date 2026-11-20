@@ -400,6 +400,11 @@ document.addEventListener('click', async (e) => {
   if (!btn) return;
   const symbol = btn.dataset.open;
 
+  // The button may be the chart modal's own Open action, replacing a live
+  // chart rather than a static confirmation — tear it down first so its
+  // poll loop doesn't keep running against DOM this is about to remove, and
+  // so the watch is dropped immediately rather than left for its TTL.
+  stopChart();
   btn.disabled = true;
   modalContent.innerHTML = '<div class="mhead"><h3>Opening…</h3></div>' +
     '<div class="mbody"><p class="note">Sizing and submitting the buy order.</p></div>';
@@ -428,6 +433,9 @@ document.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-close]');
   if (!btn) return;
 
+  // Same reason as the Open handler above: this may be the chart modal's own
+  // Close action.
+  stopChart();
   btn.disabled = true;
   modalContent.innerHTML = '<div class="mhead"><h3>Closing…</h3></div>' +
     '<div class="mbody"><p class="note">Submitting the sell order.</p></div>';
@@ -552,6 +560,9 @@ function initChart(symbol) {
 
   chartInstances = { price: priceChart, macd: macdChart };
   const status = modalContent.querySelector('#chart-status');
+  const pnlEl = modalContent.querySelector('#chart-pnl');
+  const closeBtn = modalContent.querySelector('#chart-close-btn');
+  const openBtn = modalContent.querySelector('#chart-open-btn');
 
   async function poll() {
     try {
@@ -582,6 +593,26 @@ function initChart(symbol) {
         status.textContent = d.err
           ? ('stale — ' + d.err)
           : ('updated ' + new Date(d.updatedAt).toLocaleTimeString());
+      }
+
+      // The header's trading button and P&L are re-looked-up by the server on
+      // every poll (see lookupChartPosition), so they stay live the same way
+      // the candles do -- opened, closed or simply marked since the last
+      // poll shows up on this one, with no full re-render of the modal that
+      // would tear the chart down.
+      if (openBtn) openBtn.hidden = d.held;
+      if (closeBtn) closeBtn.hidden = !d.held;
+      if (pnlEl) pnlEl.hidden = !d.held;
+      if (d.held) {
+        if (pnlEl) {
+          pnlEl.textContent = d.pnlDollars + ' (' + d.pnlPct + ')';
+          pnlEl.classList.remove('good', 'bad', 'idle');
+          if (d.tone) pnlEl.classList.add(d.tone);
+        }
+        if (closeBtn) {
+          closeBtn.dataset.close = d.positionId;
+          closeBtn.title = 'Sell the ' + d.shares + ' shares still held, now';
+        }
       }
     } catch (err) {
       if (status) status.textContent = 'could not reach the agent';
@@ -1208,14 +1239,26 @@ setInterval(claudeRefresh, 2000);
 {{end}}
 
 {{/* chartModal is the shell the "Chart" button's popup renders. It carries no
-     data of its own -- the page's JS (initChart) fills the panes in by
+     chart data of its own -- the page's JS (initChart) fills the panes in by
      polling actions/chart/data, the same way every other modal here is
-     server-rendered markup rather than something JS builds. */}}
+     server-rendered markup rather than something JS builds. Held/PositionID/
+     Shares/PnL seed the header from this first load; after that, every poll
+     (the same one the chart itself uses) refreshes them in place via stable
+     ids, rather than this markup only ever reflecting the moment the chart
+     was opened. Both the Open and Close buttons are always in the DOM, one
+     hidden -- toggling `hidden` is what a poll can do without tearing the
+     chart down, which replacing this block with freshly rendered HTML would. */}}
 {{define "chartModal"}}
 <div class="mhead">
   <h3>{{.Title}}</h3>
-  <span class="meta" id="chart-status">loading…</span>
-  <button class="close" type="button" data-close-modal>Close</button>
+  <div style="display:flex; align-items:center; gap:10px;">
+    <span class="meta" id="chart-status">loading…</span>
+    <span class="meta {{.Tone}}" id="chart-pnl" title="Unrealized P&amp;L on the shares still held"{{if not .Held}} hidden{{end}}>{{.PnLDollars}} ({{.PnLPct}})</span>
+    <button type="button" class="mini danger" id="chart-close-btn" data-close="{{.PositionID}}" data-symbol="{{.Symbol}}"
+            title="Sell the {{.Shares}} shares still held, now"{{if not .Held}} hidden{{end}}>Close position</button>
+    <button type="button" class="mini" id="chart-open-btn" data-open="{{.Symbol}}" title="Buy {{.Symbol}} now"{{if .Held}} hidden{{end}}>Open position</button>
+    <button class="close" type="button" data-close-modal title="Close this chart" aria-label="Close this chart">&times;</button>
+  </div>
 </div>
 <div class="mbody">
   <div class="chart-wrap">
